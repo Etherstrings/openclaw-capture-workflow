@@ -1,0 +1,29 @@
+[
+  {
+    "id": "xhs_skill_share_paid",
+    "source_kind": "url",
+    "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+    "expect": {
+      "required_keywords": [
+        "美股财报深度分析",
+        "tech-earnings-deepdive"
+      ],
+      "required_links": [
+        "https://github.com/star23/Day1Global-Skills"
+      ],
+      "required_projects": [
+        "star23/Day1Global-Skills"
+      ],
+      "required_skill_ids": [
+        "tech-earnings-deepdive"
+      ],
+      "forbidden_phrases": [
+        "模型不可用",
+        "给不熟悉的人",
+        "对你最有用的是"
+      ],
+      "min_evidence_chars": 80
+    }
+  }
+]
+

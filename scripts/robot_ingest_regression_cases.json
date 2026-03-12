@@ -1,0 +1,199 @@
+[
+  {
+    "case_id": "group_xhs_skill_url",
+    "entry_context": {
+      "chat_target": "group_chat",
+      "entry_mode": "mention"
+    },
+    "payload": {
+      "chat_id": "-10010001",
+      "reply_to_message_id": "301",
+      "request_id": "robot-group-xhs-skill-url",
+      "source_kind": "url",
+      "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+      "raw_text": null,
+      "image_refs": [],
+      "platform_hint": "xiaohongshu",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["美股财报深度分析", "tech-earnings-deepdive", "安装方法"],
+      "required_links": ["https://github.com/star23/Day1Global-Skills"],
+      "required_projects": ["star23/Day1Global-Skills"],
+      "required_skill_ids": ["tech-earnings-deepdive"],
+      "required_actions": ["/install-skill"],
+      "require_action_checklist": true
+    }
+  },
+  {
+    "case_id": "direct_xhs_install_text",
+    "entry_context": {
+      "chat_target": "direct_chat",
+      "entry_mode": "direct_message"
+    },
+    "payload": {
+      "chat_id": "20001",
+      "reply_to_message_id": null,
+      "request_id": "robot-direct-xhs-install-text",
+      "source_kind": "pasted_text",
+      "source_url": null,
+      "raw_text": "推荐一个美股财报深度分析 Skill。安装方法：在 Claude 对话中执行 /install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill。项目地址：https://github.com/star23/Day1Global-Skills。安装后可直接问 NVDA、TSLA、MSFT 财报分析问题。",
+      "image_refs": [],
+      "platform_hint": null,
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["美股财报深度分析", "安装方法"],
+      "required_links": ["https://github.com/star23/Day1Global-Skills"],
+      "required_projects": ["star23/Day1Global-Skills"],
+      "required_skill_ids": ["tech-earnings-deepdive"],
+      "required_actions": ["/install-skill"],
+      "require_action_checklist": true
+    }
+  },
+  {
+    "case_id": "group_xhs_mixed_text_image",
+    "entry_context": {
+      "chat_target": "group_chat",
+      "entry_mode": "mention"
+    },
+    "payload": {
+      "chat_id": "-10010002",
+      "reply_to_message_id": "302",
+      "request_id": "robot-group-xhs-mixed",
+      "source_kind": "mixed",
+      "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+      "raw_text": "帮我把这条内容归档，重点看 Skill 名、安装方式和仓库链接。",
+      "image_refs": ["/tmp/sample-xhs-skill.png"],
+      "platform_hint": "xiaohongshu",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["Skill", "安装方式"],
+      "required_links": ["https://github.com/star23/Day1Global-Skills"],
+      "required_skill_ids": ["tech-earnings-deepdive"]
+    }
+  },
+  {
+    "case_id": "direct_github_repo",
+    "entry_context": {
+      "chat_target": "direct_chat",
+      "entry_mode": "direct_message"
+    },
+    "payload": {
+      "chat_id": "20002",
+      "reply_to_message_id": null,
+      "request_id": "robot-direct-github-repo",
+      "source_kind": "url",
+      "source_url": "https://github.com/star23/Day1Global-Skills",
+      "raw_text": null,
+      "image_refs": [],
+      "platform_hint": "github",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["Day1Global-Skills"],
+      "required_links": ["https://github.com/star23/Day1Global-Skills"],
+      "required_projects": ["star23/Day1Global-Skills"]
+    }
+  },
+  {
+    "case_id": "direct_github_mixed_install",
+    "entry_context": {
+      "chat_target": "direct_chat",
+      "entry_mode": "direct_message"
+    },
+    "payload": {
+      "chat_id": "20003",
+      "reply_to_message_id": null,
+      "request_id": "robot-direct-github-mixed",
+      "source_kind": "mixed",
+      "source_url": "https://github.com/star23/Day1Global-Skills",
+      "raw_text": "重点提炼安装命令、验证动作和这个仓库是干什么的。",
+      "image_refs": [],
+      "platform_hint": "github",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["安装命令", "验证"],
+      "required_links": ["https://github.com/star23/Day1Global-Skills"],
+      "required_projects": ["star23/Day1Global-Skills"],
+      "require_action_checklist": true
+    }
+  },
+  {
+    "case_id": "group_bilibili_video",
+    "entry_context": {
+      "chat_target": "group_chat",
+      "entry_mode": "mention"
+    },
+    "payload": {
+      "chat_id": "-10010003",
+      "reply_to_message_id": "303",
+      "request_id": "robot-group-bilibili-video",
+      "source_kind": "video_url",
+      "source_url": "https://www.bilibili.com/video/BV1HpP5zBEEp",
+      "raw_text": "重点看视频里提到的项目和部署方式。",
+      "image_refs": [],
+      "platform_hint": "bilibili",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_links": ["https://www.bilibili.com/video/BV1HpP5zBEEp"],
+      "required_keywords": ["OpenStock", "全球热点"]
+    }
+  },
+  {
+    "case_id": "group_youtube_video",
+    "entry_context": {
+      "chat_target": "group_chat",
+      "entry_mode": "mention"
+    },
+    "payload": {
+      "chat_id": "-10010004",
+      "reply_to_message_id": "304",
+      "request_id": "robot-group-youtube-video",
+      "source_kind": "video_url",
+      "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "raw_text": null,
+      "image_refs": [],
+      "platform_hint": "youtube",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_links": ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+      "required_keywords": ["Rick Astley"]
+    }
+  },
+  {
+    "case_id": "direct_reference_doc",
+    "entry_context": {
+      "chat_target": "direct_chat",
+      "entry_mode": "direct_message"
+    },
+    "payload": {
+      "chat_id": "20004",
+      "reply_to_message_id": null,
+      "request_id": "robot-direct-reference-doc",
+      "source_kind": "url",
+      "source_url": "https://github.com/kubernetes/website/blob/main/content/en/docs/setup/production-environment/container-runtimes.md",
+      "raw_text": null,
+      "image_refs": [],
+      "platform_hint": "github",
+      "requested_output_lang": "zh-CN",
+      "dry_run": true
+    },
+    "expect": {
+      "required_keywords": ["container runtime", "kubelet"],
+      "required_links": ["https://github.com/kubernetes/website/blob/main/content/en/docs/setup/production-environment/container-runtimes.md"],
+      "required_projects": ["kubernetes/website"]
+    }
+  }
+]

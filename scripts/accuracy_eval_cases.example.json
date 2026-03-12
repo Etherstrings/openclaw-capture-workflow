@@ -1,0 +1,91 @@
+[
+  {
+    "id": "github_day1global",
+    "source_kind": "url",
+    "source_url": "https://github.com/star23/Day1Global-Skills",
+    "platform_hint": "github",
+    "expect": {
+      "required_keywords": [
+        "tech-earnings-deepdive",
+        "install-skill"
+      ],
+      "required_links": [
+        "https://github.com/star23/Day1Global-Skills"
+      ],
+      "required_projects": [
+        "star23/Day1Global-Skills"
+      ],
+      "required_skill_ids": [
+        "tech-earnings-deepdive"
+      ],
+      "forbidden_phrases": [
+        "模型不可用",
+        "步骤细节",
+        "图片与帧（后置）"
+      ],
+      "min_evidence_chars": 140
+    }
+  },
+  {
+    "id": "xhs_skill_share",
+    "source_kind": "url",
+    "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+    "expect": {
+      "required_keywords": [
+        "美股财报深度分析",
+        "tech-earnings-deepdive"
+      ],
+      "required_links": [
+        "https://github.com/star23/Day1Global-Skills"
+      ],
+      "required_projects": [
+        "star23/Day1Global-Skills"
+      ],
+      "required_skill_ids": [
+        "tech-earnings-deepdive"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 80
+    }
+  },
+  {
+    "id": "docs_openclaw",
+    "source_kind": "url",
+    "source_url": "https://docs.openclaw.ai/",
+    "expect": {
+      "required_keywords": [
+        "OpenClaw",
+        "Telegram"
+      ],
+      "required_links": [
+        "https://docs.openclaw.ai/"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 60
+    }
+  },
+  {
+    "id": "bilibili_story",
+    "source_kind": "video_url",
+    "source_url": "https://www.bilibili.com/video/BV1HpP5zBEEp",
+    "video_probe_seconds": 180,
+    "expect": {
+      "required_keywords": [
+        "GitHub",
+        "热点"
+      ],
+      "required_links": [
+        "https://www.bilibili.com/video/BV1HpP5zBEEp"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 100
+    }
+  }
+]
+

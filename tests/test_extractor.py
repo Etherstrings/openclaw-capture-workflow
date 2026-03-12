@@ -1,0 +1,619 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, ObsidianConfig, SummarizerConfig, TelegramConfig
+from openclaw_capture_workflow.extractor import (
+    _canonicalize_video_source_url,
+    _extract_high_value_ocr_lines,
+    _extract_article_blocks,
+    _extract_meta_description,
+    _extract_skill_signals,
+    _extract_text_from_browser_snapshot,
+    _extract_steps_from_tencent_snapshot,
+    _extract_text_from_tencent_snapshot,
+    _normalize_structured_ocr_output,
+    _parse_video_text_output,
+    _extract_wechat_article,
+    _find_browser_tab_for_url,
+    _looks_like_legal_footer,
+    _looks_like_command_line,
+    _should_try_browser_ocr,
+    _sanitize_video_page_snapshot_text,
+    _github_blob_from_url,
+)
+from openclaw_capture_workflow.models import IngestRequest
+from openclaw_capture_workflow.extractor import EvidenceExtractor
+
+
+def _config(tmp: str) -> AppConfig:
+    return AppConfig(
+        listen_host="127.0.0.1",
+        listen_port=8765,
+        state_dir="state",
+        obsidian=ObsidianConfig(
+            vault_path=tmp,
+            inbox_root="Inbox",
+            topics_root="Topics",
+            entities_root="Entities",
+            auto_topic_whitelist=["AI", "股票", "GitHub"],
+            auto_topic_blocklist=["测试", "路径"],
+        ),
+        telegram=TelegramConfig(result_bot_token="token"),
+        summarizer=SummarizerConfig(api_base_url="https://example.com", api_key="k", model="m", timeout_seconds=30),
+        extractors=ExtractorConfig(),
+    )
+
+
+class ExtractorTest(unittest.TestCase):
+    def test_github_blob_from_url_parses_markdown_path(self) -> None:
+        parsed = _github_blob_from_url("https://github.com/openai/openai-cookbook/blob/main/README.md")
+        self.assertEqual(parsed, ("openai", "openai-cookbook", "main", "README.md"))
+
+    def test_extract_wechat_article(self) -> None:
+        html = """
+        <html><head><title>ignored</title></head><body>
+        <div id="js_content">
+          <p>第一段正文内容，长度足够长，可以视为真正的文章内容。</p>
+          <p>第二段正文内容，也应该被提取出来，而不是导航文字。</p>
+        </div>
+        </body></html>
+        """
+        text = _extract_wechat_article(html)
+        self.assertIsNotNone(text)
+        self.assertIn("第一段正文内容", text)
+        self.assertIn("第二段正文内容", text)
+
+    def test_parse_video_text_output_ignores_empty_structured_payload(self) -> None:
+        text, meta = _parse_video_text_output('{"text":"","language":"zh","segments":[]}')
+        self.assertEqual(text, "")
+        self.assertEqual(meta.get("language"), "zh")
+
+    def test_normalize_structured_ocr_output_prefers_text_field(self) -> None:
+        parsed = _normalize_structured_ocr_output('{"text":"Hello OCR","language":"en"}')
+        self.assertEqual(parsed, "Hello OCR")
+
+    def test_normalize_structured_ocr_output_drops_empty_payload(self) -> None:
+        parsed = _normalize_structured_ocr_output('{"text":"","segments":[]}')
+        self.assertEqual(parsed, "")
+
+    def test_extract_article_blocks_prefers_main_content(self) -> None:
+        html = """
+        <div class="header">首页 导航</div>
+        <article>
+          <h1>标题</h1>
+          <p>这里是一篇较长的正文内容，包含真实的信息，而不是菜单项。</p>
+          <p>第二段继续补充文章内容，用于验证正文块提取。</p>
+        </article>
+        """
+        text = _extract_article_blocks(html)
+        self.assertIsNotNone(text)
+        self.assertIn("这里是一篇较长的正文内容", text)
+        self.assertNotIn("首页 导航", text)
+
+    def test_text_request_stays_raw(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="job-1",
+                    source_kind="pasted_text",
+                    raw_text="直接粘贴的正文",
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "raw_text")
+            self.assertEqual(evidence.text, "直接粘贴的正文")
+
+    def test_text_request_extracts_signal_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="job-1b",
+                    source_kind="pasted_text",
+                    raw_text=(
+                        "安装方法：/install-skill "
+                        "https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill "
+                        "项目地址：https://github.com/star23/Day1Global-Skills"
+                    ),
+                )
+            )
+            signals = evidence.metadata.get("signals", {})
+            self.assertIn("https://github.com/star23/Day1Global-Skills", signals.get("links", []))
+            self.assertIn("tech-earnings-deepdive", signals.get("skill_ids", []))
+
+    def test_url_raw_text_same_as_url_does_not_block_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.webpage_text_command = "python3 -c 'import json; print(json.dumps({{\"title\":\"t\",\"text\":\"正文内容足够长，用来验证不会把 URL 本身误当成正文。正文继续补充一些文字。\"}}, ensure_ascii=False))'"
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="job-2",
+                    source_kind="url",
+                    source_url="https://example.com/article",
+                    raw_text="https://example.com/article",
+                )
+            )
+            self.assertEqual(evidence.title, "t")
+            self.assertIn("正文内容足够长", evidence.text)
+
+    def test_legal_footer_detected(self) -> None:
+        footer = "沪ICP备13030189号 | 营业执照 | 增值电信业务经营许可证：沪B2-20150021 | 互联网药品信息服务资格证书 | 违法不良信息举报电话：4006676810"
+        self.assertTrue(_looks_like_legal_footer(footer))
+
+    def test_extract_meta_description(self) -> None:
+        html = '<meta name="description" content="最近在X上看到有人分享的一个美股财报分析 Skill，很适合对美股财报进行初步分析。">'
+        self.assertIn("美股财报分析", _extract_meta_description(html))
+
+    def test_extract_text_from_browser_snapshot_prefers_real_body(self) -> None:
+        snapshot = """
+        - generic [ref=e60]:
+          - paragraph [ref=e61]:
+            - link "沪ICP备13030189号" [ref=e62]
+            - /url: https://creator.xiaohongshu.com/publish/publish?source=official
+        - generic [ref=e174]: 推荐一个「美股财报深度分析」Skill
+        - generic [ref=e176]:
+          - text: 最近在X上看到有人分享的一个美股财报分析 Skill 我安装在OpenClaw里试用了一下 确实挺实用
+          - /url: https://github.com/VoltAgent/awesome-openclaw-skills
+          - link "#openclaw" [ref=e177]
+        - generic [ref=e209]: 你这个open claw 是手机app吗？
+        """
+        text = _extract_text_from_browser_snapshot(snapshot)
+        self.assertIn("美股财报分析 Skill", text)
+        self.assertNotIn("沪ICP备13030189号", text)
+        self.assertIn("github.com/VoltAgent/awesome-openclaw-skills", text)
+        self.assertNotIn("creator.xiaohongshu.com", text)
+
+    def test_extract_skill_signals_prefers_high_value_links(self) -> None:
+        text = """
+        推荐一个「美股财报深度分析」Skill
+        最近在X上看到有人分享，直接把github链接丢给OpenClaw就行：
+        https://github.com/VoltAgent/awesome-openclaw-skills
+        https://creator.xiaohongshu.com/publish/publish?source=official
+        tech-earnings-deepdive
+        #openclaw #skill #美股
+        """
+        signals = _extract_skill_signals(text, "https://www.xiaohongshu.com/explore/abc")
+        self.assertIn("美股财报深度分析Skill", [item.replace(" ", "") for item in signals.get("skills", [])])
+        self.assertIn("https://github.com/VoltAgent/awesome-openclaw-skills", signals.get("links", []))
+        self.assertNotIn("https://creator.xiaohongshu.com/publish/publish?source=official", signals.get("links", []))
+        self.assertIn("tech-earnings-deepdive", signals.get("skill_ids", []))
+
+    def test_extract_skill_signals_splits_adjacent_chinese_punctuation_urls(self) -> None:
+        text = (
+            "安装命令 /install-skill "
+            "https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill。"
+            "项目地址：https://github.com/star23/Day1Global-Skills。"
+        )
+        signals = _extract_skill_signals(text)
+        links = signals.get("links", [])
+        self.assertIn(
+            "https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill",
+            links,
+        )
+        self.assertIn("https://github.com/star23/Day1Global-Skills", links)
+        self.assertFalse(any("项目地址" in link for link in links))
+
+    def test_extract_skill_signals_filters_noisy_skill_names(self) -> None:
+        text = (
+            "推荐一个美股财报深度分析 Skill\n"
+            "/install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill\n"
+            "Day1Global-Skill\n"
+        )
+        signals = _extract_skill_signals(text)
+        skills = [item.lower() for item in signals.get("skills", [])]
+        self.assertTrue(any("美股财报深度分析" in item for item in signals.get("skills", [])))
+        self.assertFalse(any(item.startswith("install") for item in skills))
+
+    def test_extract_skill_signals_infers_repo_from_ocr_owner_repo_line(self) -> None:
+        text = """
+        github.com
+        star23/ Day1Global-Skills Public
+        推荐一个「美股财报深度分析」Skill
+        """
+        signals = _extract_skill_signals(text, "https://www.xiaohongshu.com/explore/abc")
+        self.assertIn("star23/Day1Global-Skills", signals.get("projects", []))
+        self.assertIn("https://github.com/star23/Day1Global-Skills", signals.get("links", []))
+
+    def test_extract_skill_signals_ignores_timestamp_owner_repo_false_positive(self) -> None:
+        text = """
+        github.com
+        00:00 / 01:43
+        本视频讲解 OpenClaw 的使用流程
+        """
+        signals = _extract_skill_signals(text, "https://www.bilibili.com/video/BV1HpP5zBEEp")
+        self.assertNotIn("00/01", signals.get("projects", []))
+        self.assertNotIn("https://github.com/00/01", signals.get("links", []))
+
+    def test_extract_skill_signals_ignores_non_repo_owner_repo_phrases(self) -> None:
+        text = """
+        Day1Global/Day1Global-Skills
+        Baillie Gifford/ARK
+        https://github.com/star23/Day1Global-Skills
+        """
+        signals = _extract_skill_signals(text, "https://github.com/star23/Day1Global-Skills")
+        self.assertIn("star23/Day1Global-Skills", signals.get("projects", []))
+        self.assertNotIn("Gifford/ARK", signals.get("projects", []))
+        self.assertNotIn("github.com/star23", signals.get("projects", []))
+
+    def test_extract_skill_signals_skill_id_ignores_generic_slug_from_sentence(self) -> None:
+        text = """
+        This Skill automatically generates an institutional-grade deep analysis report.
+        skill id: tech-earnings-deepdive
+        """
+        signals = _extract_skill_signals(text, "https://github.com/star23/Day1Global-Skills")
+        self.assertIn("tech-earnings-deepdive", signals.get("skill_ids", []))
+        self.assertNotIn("institutional-grade", signals.get("skill_ids", []))
+
+    def test_extract_skill_signals_keeps_video_source_url_link(self) -> None:
+        text = "视频介绍了全球热点监控和项目能力。"
+        signals = _extract_skill_signals(text, "https://www.bilibili.com/video/BV1HpP5zBEEp")
+        self.assertIn("https://www.bilibili.com/video/BV1HpP5zBEEp", signals.get("links", []))
+
+    def test_extract_skill_signals_keeps_xiaohongshu_video_source_url_link(self) -> None:
+        text = "这是一个小红书视频总结。"
+        signals = _extract_skill_signals(text, "https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7")
+        self.assertIn("https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7", signals.get("links", []))
+
+    def test_github_blob_markdown_uses_raw_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_text",
+                return_value=(
+                    "# Install Guide\n\n"
+                    "Step 1: Install dependencies\n"
+                    "Step 2: Run `openclaw`\n"
+                    "/install-skill https://example.com/demo.skill\n"
+                ),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="github-blob-1",
+                        source_kind="url",
+                        source_url="https://github.com/openai/openai-cookbook/blob/main/docs/install.md",
+                        raw_text="https://github.com/openai/openai-cookbook/blob/main/docs/install.md",
+                    )
+                )
+            self.assertIn("文档路径: docs/install.md", evidence.text)
+            self.assertIn("/install-skill https://example.com/demo.skill", evidence.text)
+            self.assertEqual(evidence.metadata.get("source"), "github_blob")
+            self.assertIn(
+                "https://github.com/openai/openai-cookbook/blob/main/docs/install.md",
+                evidence.metadata.get("signals", {}).get("links", []),
+            )
+
+    def test_github_blob_markdown_keeps_kubelet_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_text",
+                return_value=(
+                    "# Container runtimes\n\n"
+                    "Both the kubelet and the container runtime need compatible cgroup settings.\n"
+                    "The container runtime endpoint must support CRI.\n"
+                ),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="github-blob-2",
+                        source_kind="url",
+                        source_url=(
+                            "https://github.com/kubernetes/website/blob/main/content/en/docs/"
+                            "setup/production-environment/container-runtimes.md"
+                        ),
+                        raw_text=(
+                            "https://github.com/kubernetes/website/blob/main/content/en/docs/"
+                            "setup/production-environment/container-runtimes.md"
+                        ),
+                    )
+                )
+            self.assertIn("kubelet", evidence.text.lower())
+            self.assertIn("container runtime", evidence.text.lower())
+
+    def test_extract_high_value_ocr_lines_filters_ui_noise(self) -> None:
+        ocr_text = """
+        小红书
+        发现
+        推荐一个「美股财报深度分析」Skill
+        直接把github链接丢给OpenClaw
+        https://github.com/VoltAgent/awesome-openclaw-skills
+        你这个open claw 是手机app吗？
+        """
+        lines = _extract_high_value_ocr_lines(ocr_text)
+        self.assertTrue(any("Skill" in line for line in lines))
+        self.assertTrue(any("github" in line.lower() for line in lines))
+        self.assertFalse(any("你这个open claw" in line for line in lines))
+        self.assertFalse(any(line == "发现" for line in lines))
+
+    def test_looks_like_command_line_ignores_long_prose_with_pipe(self) -> None:
+        prose = "Install OpenClaw and bring up the | Guided setup with opencLaw"
+        self.assertFalse(_looks_like_command_line(prose))
+        self.assertFalse(_looks_like_command_line("SOPENCLAW"))
+        self.assertTrue(_looks_like_command_line("curl -fsSL https://example.com/install.sh | bash"))
+
+    def test_should_try_browser_ocr_skips_reliable_docs_domains(self) -> None:
+        cfg = _config("/tmp")
+        self.assertFalse(_should_try_browser_ocr("url", "https://docs.openclaw.ai/", "", cfg))
+        self.assertFalse(_should_try_browser_ocr("url", "https://github.com/openclawai/openclaw", "", cfg))
+
+    def test_canonicalize_video_source_url_for_bilibili_share_link(self) -> None:
+        url = "https://www.bilibili.com/video/BV1HpP5zBEEp?share_source=weixin&timestamp=1772551573"
+        normalized = _canonicalize_video_source_url(url)
+        self.assertEqual(normalized, "https://www.bilibili.com/video/BV1HpP5zBEEp")
+
+    def test_sanitize_video_page_snapshot_text_filters_timeline_noise(self) -> None:
+        text = """
+        2026-03-02 14:15:01
+        00:02 / 00:47
+        平民版彭博终端来了！我用开源situation monitor把全球新闻+金融+地缘热点一屏看完 | Trae一键部署+实测 | Github项目
+        我怎么觉得十几年前就用个这个 psv
+        相关推荐
+        """
+        cleaned = _sanitize_video_page_snapshot_text(text, "平民版彭博终端来了！_哔哩哔哩_bilibili")
+        self.assertIn("平民版彭博终端来了！", cleaned)
+        self.assertNotIn("00:02 / 00:47", cleaned)
+        self.assertNotIn("我怎么觉得十几年前就用个这个 psv", cleaned)
+        self.assertNotIn("相关推荐", cleaned)
+
+    def test_find_browser_tab_for_url_matches_xiaohongshu_share_variants(self) -> None:
+        tabs = [
+            {
+                "targetId": "1",
+                "url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb?app_platform=ios&apptime=111&share_id=aaa",
+                "title": "推荐一个「美股财报深度分析」Skill - 小红书",
+            }
+        ]
+        matched = _find_browser_tab_for_url(
+            "https://www.xiaohongshu.com/explore/69a3032400000000150305bb?app_platform=ios&apptime=222&share_id=bbb",
+            tabs,
+        )
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["targetId"], "1")
+
+    def test_extract_text_from_tencent_snapshot_keeps_steps(self) -> None:
+        snapshot = """
+        - heading "【保姆级教程】手把手教你安装OpenClaw并接入飞书，让AI在聊天软件里帮你干活" [level=1]
+        - paragraph: 根据您的要求，我已将文章内容中的所有代码块设置好对应的代码语言。以下是修改后的完整文章内容：
+        - heading "二、安装nodejs" [level=2]
+        - paragraph: 官方下载地址：https://nodejs.org/zh-cn/download
+        - heading "三、开始安装" [level=2]
+        - heading "一）设置 PowerShell 执行权限" [level=4]
+        - paragraph: 以管理员身份运行 PowerShell：
+        - code: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+        - code: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+        - heading "热门产品" [level=2]
+        """
+        text = _extract_text_from_tencent_snapshot(snapshot)
+        self.assertIn("二、安装nodejs", text)
+        self.assertIn("一）设置 PowerShell 执行权限", text)
+        self.assertIn("命令：Set-ExecutionPolicy RemoteSigned -Scope CurrentUser", text)
+        self.assertNotIn("热门产品", text)
+        steps = _extract_steps_from_tencent_snapshot(snapshot)
+        self.assertTrue(any("二、安装nodejs" in (step.get("title") or "") for step in steps))
+        self.assertTrue(any("一）设置 PowerShell 执行权限" in (step.get("title") or "") for step in steps))
+        self.assertTrue(any("Set-ExecutionPolicy" in (step.get("command") or "") for step in steps))
+
+    def test_mixed_request_merges_web_text_raw_text_and_image_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.webpage_text_command = (
+                "python3 -c 'import json; print(json.dumps({{\"title\":\"网页标题\",\"text\":\"网页正文包含 OpenClaw Skill 链接和安装说明。\"}}, ensure_ascii=False))'"
+            )
+            extractor.config.extractors.image_ocr_command = (
+                "python3 -c 'print(\"tech-earnings-deepdive\\n推荐一个美股财报深度分析 Skill\\nhttps://github.com/VoltAgent/awesome-openclaw-skills\")'"
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_openclaw_browser_screenshot_ocr",
+                return_value=("", None),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="mixed-1",
+                        source_kind="mixed",
+                        source_url="https://example.com/post",
+                        raw_text="用户补充：这个 Skill 的安装方式更简单。",
+                        image_refs=["/tmp/user-image-1.png"],
+                    )
+                )
+            self.assertEqual(evidence.title, "网页标题")
+            self.assertIn("用户补充", evidence.text)
+            self.assertIn("网页正文包含", evidence.text)
+            self.assertIn("[上传图片OCR]", evidence.text)
+            self.assertIn("tech-earnings-deepdive", evidence.text)
+            self.assertIn("/tmp/user-image-1.png", evidence.metadata.get("image_refs", []))
+            signals = evidence.metadata.get("signals", {})
+            self.assertIn("tech-earnings-deepdive", signals.get("skill_ids", []))
+
+    def test_video_request_merges_subtitle_keyframes_ocr_and_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'print(\"本视频介绍如何安装 OpenClaw Skill。\")'"
+            )
+            extractor.config.extractors.video_keyframes_command = (
+                "python3 -c 'print(\"frame-001.jpg\\n关键帧提示：查看 README 安装步骤\")'"
+            )
+            extractor.config.extractors.image_ocr_command = (
+                "python3 -c 'print(\"命令：openclaw skill add awesome-openclaw-skills\\nhttps://github.com/VoltAgent/awesome-openclaw-skills\")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-1",
+                    source_kind="video_url",
+                    source_url="https://example.com/video/abc",
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertIn("[关键帧OCR]", evidence.text)
+            self.assertIn("openclaw skill add awesome-openclaw-skills", evidence.text)
+            self.assertTrue(any(item.endswith("frame-001.jpg") for item in evidence.keyframes))
+            self.assertIn("temp_image_refs", evidence.metadata)
+            self.assertIn("signals", evidence.metadata)
+            signals = evidence.metadata["signals"]
+            self.assertIn("https://github.com/VoltAgent/awesome-openclaw-skills", signals.get("links", []))
+
+    def test_video_skips_audio_when_subtitle_sufficient_and_parses_duration_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'import json; print(json.dumps({{\"duration_seconds\": 601, \"language\": \"zh\", \"text\": \"本视频详细讲解OpenClaw部署。\" * 40}}, ensure_ascii=False))'"
+            )
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'raise SystemExit(\"audio should not run\")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-2",
+                    source_kind="video_url",
+                    source_url="https://example.com/video/xyz",
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertIn("video_duration_seconds", evidence.metadata)
+            self.assertEqual(int(evidence.metadata["video_duration_seconds"]), 601)
+            self.assertEqual(evidence.metadata.get("subtitle_language"), "zh")
+            self.assertEqual(evidence.metadata.get("audio_skipped_reason"), "subtitle_sufficient")
+            tracks = evidence.metadata.get("tracks", {})
+            self.assertTrue(tracks.get("has_subtitle"))
+            self.assertFalse(tracks.get("has_transcript"))
+
+    def test_video_omits_low_signal_keyframe_ocr_when_transcript_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'import json; print(json.dumps({{\"text\":\"本视频完整讲解全球监控系统的核心功能与部署方式。\" * 20, \"duration_seconds\": 47}}, ensure_ascii=False))'"
+            )
+            extractor.config.extractors.video_keyframes_command = (
+                "python3 -c 'print(\"frame-001.jpg\\nframe-002.jpg\")'"
+            )
+            extractor.config.extractors.image_ocr_command = (
+                "python3 -c 'print(\"鳳踪，焦成于使一的态势感知界路。\")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-ocr-suppress-1",
+                    source_kind="video_url",
+                    source_url="https://example.com/video/ocr-suppress",
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertNotIn("[关键帧OCR]", evidence.text)
+            tracks = evidence.metadata.get("tracks", {})
+            self.assertTrue(tracks.get("has_transcript"))
+
+    def test_video_dry_run_probe_skips_audio_and_keyframes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'print(\"本视频前90秒用于探针验证，包含关键术语与流程概览。\" * 20)'"
+            )
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'raise SystemExit(\"audio should be skipped in dry_run probe\")'"
+            )
+            extractor.config.extractors.video_keyframes_command = (
+                "python3 -c 'raise SystemExit(\"keyframes should be skipped in dry_run probe\")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-probe-1",
+                    source_kind="video_url",
+                    source_url="https://example.com/video/probe",
+                    dry_run=True,
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertEqual(evidence.metadata.get("video_probe_seconds"), 90)
+            self.assertEqual(evidence.metadata.get("video_extraction_profile"), "dry_run_probe")
+            self.assertEqual(evidence.metadata.get("audio_skipped_reason"), "dry_run_skip_video_audio")
+            self.assertEqual(evidence.metadata.get("keyframes_skipped_reason"), "dry_run_skip_video_keyframes")
+            self.assertNotIn("fetch_warnings", evidence.metadata)
+            tracks = evidence.metadata.get("tracks", {})
+            self.assertTrue(tracks.get("has_subtitle"))
+            self.assertFalse(tracks.get("has_transcript"))
+            self.assertFalse(tracks.get("has_keyframes"))
+
+    def test_video_without_tracks_falls_back_to_page_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_openclaw_browser_snapshot",
+                return_value=("测试视频标题", "这是视频页面正文补充，包含项目名和核心观点。"),
+            ) as mocked_snapshot:
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="video-page-fallback-1",
+                        source_kind="video_url",
+                        source_url="https://www.bilibili.com/video/BV1HpP5zBEEp?share_source=weixin&timestamp=1772551573",
+                        dry_run=True,
+                    )
+                )
+            self.assertEqual(mocked_snapshot.call_args.args[0], "https://www.bilibili.com/video/BV1HpP5zBEEp")
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertIn("[视频页面补充]", evidence.text)
+            self.assertIn("包含项目名和核心观点", evidence.text)
+            self.assertEqual(evidence.metadata.get("page_title"), "测试视频标题")
+            self.assertTrue(evidence.metadata.get("video_page_snapshot_used"))
+            self.assertEqual(evidence.source_url, "https://www.bilibili.com/video/BV1HpP5zBEEp")
+            tracks = evidence.metadata.get("tracks", {})
+            self.assertFalse(tracks.get("has_subtitle"))
+            self.assertFalse(tracks.get("has_transcript"))
+
+    def test_video_text_compaction_keeps_signal_and_caps_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.video_accuracy.max_evidence_chars = 1200
+            extractor.config.video_accuracy.max_evidence_lines = 80
+            noise = "\n".join(["点赞 投币 收藏" for _ in range(180)])
+            body = "\n".join([f"[{i:02d}:00] 这是教程说明第{i}段，包含环境配置与部署细节。" for i in range(1, 90)])
+            signal = "安装命令：/install-skill https://github.com/star23/Day1Global-Skills"
+            subtitle_text = noise + "\n" + body + "\n" + signal
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'print(" + json.dumps(subtitle_text, ensure_ascii=False) + ")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-compact-1",
+                    source_kind="video_url",
+                    source_url="https://example.com/video/compact",
+                    dry_run=True,
+                )
+            )
+            compact_meta = evidence.metadata.get("video_text_compacted", {})
+            self.assertTrue(compact_meta)
+            self.assertLessEqual(int(compact_meta.get("kept_chars", 99999)), 1200)
+            self.assertIn("/install-skill", evidence.text)
+            self.assertNotIn("点赞 投币 收藏", evidence.text)
+
+
+if __name__ == "__main__":
+    unittest.main()

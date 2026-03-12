@@ -1,0 +1,82 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8765,
+  "state_dir": "./state",
+  "obsidian": {
+    "vault_path": "/Users/boyuewu/Documents/ObsidianVault",
+    "inbox_root": "Inbox/OpenClaw",
+    "topics_root": "Topics",
+    "entities_root": "Entities",
+    "auto_topic_whitelist": ["AI", "股票", "GitHub", "产品", "工具", "商业"],
+    "auto_topic_blocklist": ["测试", "总结", "结构", "回群", "回执", "路径", "显示", "验证", "本地链接", "wiki", "md", "Telegram", "Obsidian", "OpenClaw"],
+    "auto_entity_pages": false
+  },
+  "telegram": {
+    "result_bot_token": "${RESULT_BOT_TOKEN}"
+  },
+  "summarizer": {
+    "api_base_url": "https://aihubmix.com/v1",
+    "api_key": "${SUMMARIZER_API_KEY}",
+    "model": "gpt-4.1-mini",
+    "timeout_seconds": 60
+  },
+  "extractors": {
+    "webpage_text_command": "",
+    "github_text_command": "",
+    "image_ocr_command": "",
+    "video_subtitle_command": "python3 scripts/video_subtitle_extract.py --url \"{url}\" --max-seconds \"{max_seconds}\"",
+    "video_audio_command": "python3 scripts/video_audio_asr.py --url \"{url}\" --max-seconds \"{max_seconds}\" --api-key \"{api_key}\" --api-base-url \"{api_base_url}\"",
+    "video_keyframes_command": "python3 scripts/video_keyframes_extract.py --url \"{url}\" --output-path \"{output_path}\" --max-seconds \"{max_seconds}\"",
+    "browser_ocr_hosts": ["xiaohongshu.com", "weixin.qq.com", "mp.weixin.qq.com"],
+    "browser_ocr_min_chars_url": 280,
+    "browser_ocr_min_chars_mixed": 900
+  },
+  "evidence_gate": {
+    "min_chars_signal_rich_short": 40,
+    "min_chars_media": 60,
+    "min_chars_general": 80,
+    "allow_pasted_text_without_min": true
+  },
+  "routing": {
+    "prefer_local_extraction": true,
+    "enable_network_search_fallback": false,
+    "search_mode": "surfing",
+    "max_search_calls": 1,
+    "trigger_on_partial_coverage": true,
+    "trigger_on_missing_signals": true
+  },
+  "execution": {
+    "dry_run_skip_model_call": true,
+    "enable_summary_cache": true,
+    "summary_cache_ttl_hours": 72,
+    "cache_for_dry_run": true,
+    "cache_for_non_dry_run": true,
+    "dry_run_video_probe_seconds": 90,
+    "dry_run_skip_video_audio": true,
+    "dry_run_skip_video_keyframes": true
+  },
+  "summary_routing": {
+    "enabled": false,
+    "upgrade_model": "gpt-4.1",
+    "trigger_on_error": true,
+    "trigger_on_low_quality": true,
+    "low_quality_threshold": 0.72,
+    "min_signal_coverage": 0.6,
+    "apply_on_dry_run": false
+  },
+  "video_accuracy": {
+    "enabled": true,
+    "min_text_chars": 180,
+    "require_speech_track": true,
+    "require_visual_track": false,
+    "budget_rmb": 0.5,
+    "usd_cny": 7.2,
+    "asr_usd_per_min": 0.006,
+    "summary_input_usd_per_million": 0.15,
+    "summary_output_usd_per_million": 0.6,
+    "expected_summary_output_tokens": 900,
+    "default_duration_minutes": 10.0,
+    "audio_when_subtitle_short_chars": 280,
+    "always_run_audio": false
+  }
+}

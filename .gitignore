@@ -1,0 +1,11 @@
+.env
+config.json
+state/
+__pycache__/
+.pytest_cache/
+.venv/
+.pycache/
+*.pyc
+.DS_Store
+scripts/.tmp_*.json
+src/*.egg-info/

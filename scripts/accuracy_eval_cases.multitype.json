@@ -1,0 +1,122 @@
+[
+  {
+    "id": "xhs_graphic_skill",
+    "source_kind": "url",
+    "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+    "expect": {
+      "required_keywords": [
+        "美股财报深度分析",
+        "tech-earnings-deepdive"
+      ],
+      "required_links": [
+        "https://github.com/star23/Day1Global-Skills"
+      ],
+      "required_projects": [
+        "star23/Day1Global-Skills"
+      ],
+      "required_skill_ids": [
+        "tech-earnings-deepdive"
+      ],
+      "forbidden_phrases": [
+        "模型不可用",
+        "给不熟悉的人",
+        "对你最有用的是"
+      ],
+      "min_evidence_chars": 80
+    }
+  },
+  {
+    "id": "xhs_plain_text_install",
+    "source_kind": "pasted_text",
+    "raw_text": "推荐一个美股财报深度分析 Skill。安装方法：在 Claude 对话中执行 /install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill。项目地址：https://github.com/star23/Day1Global-Skills。安装后可直接问 NVDA、TSLA、MSFT 财报分析问题。",
+    "expect": {
+      "required_keywords": [
+        "tech-earnings-deepdive",
+        "安装方法"
+      ],
+      "required_links": [
+        "https://github.com/star23/Day1Global-Skills"
+      ],
+      "required_actions": [
+        "/install-skill"
+      ],
+      "require_action_checklist": true,
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 80
+    }
+  },
+  {
+    "id": "bilibili_video_story",
+    "source_kind": "video_url",
+    "source_url": "https://www.bilibili.com/video/BV1HpP5zBEEp",
+    "video_probe_seconds": 180,
+    "expect": {
+      "required_keywords": [
+        "GitHub",
+        "热点"
+      ],
+      "required_links": [
+        "https://www.bilibili.com/video/BV1HpP5zBEEp"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 100
+    }
+  },
+  {
+    "id": "github_no_readme_repo",
+    "source_kind": "url",
+    "source_url": "https://github.com/Gebxby-channel/GebxBy",
+    "platform_hint": "github",
+    "expect": {
+      "required_links": [
+        "https://github.com/Gebxby-channel/GebxBy"
+      ],
+      "required_projects": [
+        "Gebxby-channel/GebxBy"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 40
+    }
+  },
+  {
+    "id": "github_markdown_doc",
+    "source_kind": "url",
+    "source_url": "https://github.com/kubernetes/website/blob/main/content/en/docs/setup/production-environment/container-runtimes.md",
+    "platform_hint": "github",
+    "expect": {
+      "required_keywords": [
+        "container runtime",
+        "kubelet"
+      ],
+      "required_links": [
+        "https://github.com/kubernetes/website/blob/main/content/en/docs/setup/production-environment/container-runtimes.md"
+      ],
+      "forbidden_phrases": [
+        "模型不可用"
+      ],
+      "min_evidence_chars": 120
+    }
+  },
+  {
+    "id": "youtube_video",
+    "source_kind": "video_url",
+    "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "video_probe_seconds": 120,
+    "expect": {
+      "required_links": [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+      ],
+      "forbidden_phrases": [
+        "给不熟悉的人"
+      ],
+      "min_evidence_chars": 40
+    }
+  }
+]
+

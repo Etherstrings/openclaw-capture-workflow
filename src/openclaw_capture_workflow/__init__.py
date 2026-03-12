@@ -1,0 +1,2 @@
+"""OpenClaw capture workflow package."""
+
