@@ -9,9 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, ObsidianConfig, SummarizerConfig, TelegramConfig
 from openclaw_capture_workflow.extractor import (
+    _cleanup_browser_tab,
     _canonicalize_video_source_url,
     _extract_high_value_ocr_lines,
     _extract_article_blocks,
+    _fetch_bilibili_video_metadata,
     _extract_meta_description,
     _extract_skill_signals,
     _extract_text_from_browser_snapshot,
@@ -21,10 +23,12 @@ from openclaw_capture_workflow.extractor import (
     _parse_video_text_output,
     _extract_wechat_article,
     _find_browser_tab_for_url,
+    _find_or_open_browser_tab_with_state,
     _looks_like_legal_footer,
     _looks_like_command_line,
     _should_try_browser_ocr,
     _sanitize_video_page_snapshot_text,
+    _split_user_guidance_from_evidence,
     _github_blob_from_url,
 )
 from openclaw_capture_workflow.models import IngestRequest
@@ -204,6 +208,21 @@ class ExtractorTest(unittest.TestCase):
         )
         self.assertIn("https://github.com/star23/Day1Global-Skills", links)
         self.assertFalse(any("项目地址" in link for link in links))
+
+    def test_extract_skill_signals_normalizes_xhs_tracking_url(self) -> None:
+        text = "来源链接：https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7?xsec_token=abc&xsec_source=pc_feed"
+        signals = _extract_skill_signals(text, "https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7?xsec_token=abc&xsec_source=pc_feed")
+        self.assertIn("https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7", signals.get("links", []))
+        self.assertFalse(any("xsec_token=" in item for item in signals.get("links", [])))
+
+    def test_split_user_guidance_from_video_evidence(self) -> None:
+        evidence_text, guidance = _split_user_guidance_from_evidence(
+            "重点看视频里提到的项目和部署方式。",
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1tyNNzxEpK",
+        )
+        self.assertEqual(evidence_text, "")
+        self.assertIn("重点看", guidance)
 
     def test_extract_skill_signals_filters_noisy_skill_names(self) -> None:
         text = (
@@ -386,6 +405,31 @@ class ExtractorTest(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["targetId"], "1")
 
+    def test_find_or_open_browser_tab_with_state_marks_new_tab(self) -> None:
+        with patch(
+            "openclaw_capture_workflow.extractor._run_openclaw_browser_json",
+            side_effect=[
+                {"tabs": []},
+                {"ok": True},
+                {"tabs": [{"targetId": "t1", "url": "https://example.com/video", "title": "video"}]},
+            ],
+        ):
+            tab, opened = _find_or_open_browser_tab_with_state("https://example.com/video", retries=1, delay_seconds=0)
+        self.assertTrue(opened)
+        self.assertEqual(tab["targetId"], "t1")
+
+    def test_cleanup_browser_tab_pauses_and_closes_new_tab(self) -> None:
+        calls: list[tuple] = []
+
+        def _fake_browser_json(*args):
+            calls.append(args)
+            return {"ok": True}
+
+        with patch("openclaw_capture_workflow.extractor._run_openclaw_browser_json", side_effect=_fake_browser_json):
+            _cleanup_browser_tab({"targetId": "t-video-1"}, opened_for_capture=True)
+        self.assertEqual(calls[0][0], "evaluate")
+        self.assertEqual(calls[1], ("close", "t-video-1"))
+
     def test_extract_text_from_tencent_snapshot_keeps_steps(self) -> None:
         snapshot = """
         - heading "【保姆级教程】手把手教你安装OpenClaw并接入飞书，让AI在聊天软件里帮你干活" [level=1]
@@ -499,6 +543,20 @@ class ExtractorTest(unittest.TestCase):
             self.assertTrue(tracks.get("has_subtitle"))
             self.assertFalse(tracks.get("has_transcript"))
 
+    def test_skill_signal_extraction_does_not_treat_readme_prose_as_commands(self) -> None:
+        text = (
+            "项目仓库: VoltAgent/awesome-openclaw-skills\n"
+            "仓库地址: https://github.com/VoltAgent/awesome-openclaw-skills\n"
+            "<strong>Discover 5490+ community-built OpenClaw skills, organized by category.\n"
+            "OpenClaw is a locally-running AI assistant that operates directly on your machine.\n"
+            "npm install -g openclaw@latest\n"
+        )
+        signals = _extract_skill_signals(text, "https://github.com/VoltAgent/awesome-openclaw-skills")
+        self.assertIn("https://github.com/VoltAgent/awesome-openclaw-skills", signals.get("links", []))
+        self.assertIn("npm install -g openclaw@latest", signals.get("commands", []))
+        self.assertFalse(any("Discover 5490" in item for item in signals.get("commands", [])))
+        self.assertFalse(any("locally-running AI assistant" in item for item in signals.get("commands", [])))
+
     def test_video_omits_low_signal_keyframe_ocr_when_transcript_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
@@ -558,10 +616,118 @@ class ExtractorTest(unittest.TestCase):
             self.assertFalse(tracks.get("has_transcript"))
             self.assertFalse(tracks.get("has_keyframes"))
 
+    def test_video_dry_run_bilibili_uses_audio_when_subtitles_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'import json; print(json.dumps({{\"text\":\"\",\"segments\":[]}}, ensure_ascii=False))'"
+            )
+            audio_payload = json.dumps(
+                {
+                    "text": "这是一段真实音频转写内容，用于验证 dry_run 质量优先模式。",
+                    "duration_seconds": 31,
+                    "segments": [
+                        {"start": 2.0, "end": 5.0, "text": "第一段关键结论"},
+                        {"start": 8.0, "end": 12.0, "text": "第二段关键操作"},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'print(" + json.dumps(audio_payload, ensure_ascii=False).replace("{", "{{").replace("}", "}}") + ")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-bili-dry-audio-1",
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1HpP5zBEEp",
+                    dry_run=True,
+                )
+            )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertEqual(evidence.metadata.get("audio_probe_reason"), "dry_run_quality_upgrade_missing_subtitles")
+            self.assertNotIn("audio_skipped_reason", evidence.metadata)
+            self.assertIn("video_audio_asr", evidence.metadata.get("evidence_sources", []))
+            self.assertIn("timeline_highlights", evidence.metadata)
+            self.assertTrue(any("第一段关键结论" in item for item in evidence.metadata.get("timeline_highlights", [])))
+            self.assertIn("[视频时间线要点]", evidence.text)
+            self.assertIn("真实音频转写内容", evidence.text)
+
+    def test_bilibili_platform_duration_overrides_probe_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'import json; print(json.dumps({{\"text\":\"\",\"segments\":[]}}, ensure_ascii=False))'"
+            )
+            audio_payload = json.dumps(
+                {
+                    "text": "这是一段真实音频转写内容，用于验证总时长保留。",
+                    "duration_seconds": 31,
+                    "segments": [
+                        {"start": 2.0, "end": 5.0, "text": "第一段关键结论"},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'print(" + json.dumps(audio_payload, ensure_ascii=False).replace("{", "{{").replace("}", "}}") + ")'"
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_video_metadata",
+                return_value=(
+                    "测试长视频",
+                    "[视频元数据]\n标题: 测试长视频\n视频总时长: 43分17秒",
+                    {"bilibili_duration_seconds": 2597},
+                ),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="video-bili-duration-1",
+                        source_kind="video_url",
+                        source_url="https://www.bilibili.com/video/BV1HpP5zBEEp",
+                        dry_run=True,
+                    )
+                )
+            self.assertEqual(int(evidence.metadata.get("video_duration_seconds", 0)), 2597)
+            self.assertEqual(evidence.metadata.get("bilibili_duration_seconds"), 2597)
+
+    def test_video_dry_run_xhs_uses_keyframes_when_subtitles_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'import json; print(json.dumps({{\"text\":\"\",\"segments\":[]}}, ensure_ascii=False))'"
+            )
+            extractor.config.extractors.video_keyframes_command = (
+                "python3 -c 'print(\"frame-001.jpg\\nframe-002.jpg\")'"
+            )
+            extractor.config.extractors.image_ocr_command = (
+                "python3 -c 'print(\"公司要你的流水目的只有一个压价\\n好offer我就写1万\")'"
+            )
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="video-xhs-dry-keyframes-1",
+                    source_kind="video_url",
+                    source_url="https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7",
+                    dry_run=True,
+                )
+            )
+            self.assertEqual(evidence.metadata.get("keyframes_probe_reason"), "dry_run_quality_upgrade_missing_subtitles")
+            self.assertIn("video_keyframe_ocr", evidence.metadata.get("evidence_sources", []))
+            self.assertIn("[关键帧OCR]", evidence.text)
+
     def test_video_without_tracks_falls_back_to_page_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
             with patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_video_metadata",
+                return_value=(None, "", {}),
+            ), patch(
                 "openclaw_capture_workflow.extractor._fetch_openclaw_browser_snapshot",
                 return_value=("测试视频标题", "这是视频页面正文补充，包含项目名和核心观点。"),
             ) as mocked_snapshot:
@@ -585,6 +751,37 @@ class ExtractorTest(unittest.TestCase):
             tracks = evidence.metadata.get("tracks", {})
             self.assertFalse(tracks.get("has_subtitle"))
             self.assertFalse(tracks.get("has_transcript"))
+
+    def test_fetch_bilibili_video_metadata_formats_title_desc_and_tags(self) -> None:
+        with patch(
+            "openclaw_capture_workflow.extractor._fetch_json",
+            side_effect=[
+                {
+                    "code": 0,
+                    "data": {
+                        "title": "家人们我说杂技伤害特别高有人信吗",
+                        "desc": "谁不喜欢猎宝体操的时候毒脚丫连踹带上毒呢？",
+                        "duration": 2597,
+                        "owner": {"name": "测试UP"},
+                        "stat": {"view": 123456, "like": 7890},
+                    },
+                },
+                {
+                    "code": 0,
+                    "data": [
+                        {"tag_name": "杀戮尖塔2"},
+                        {"tag_name": "游戏杂谈"},
+                    ],
+                },
+            ],
+        ):
+            title, text, meta = _fetch_bilibili_video_metadata("https://www.bilibili.com/video/BV1tyNNzxEpK")
+        self.assertEqual(title, "家人们我说杂技伤害特别高有人信吗")
+        self.assertIn("简介: 谁不喜欢猎宝体操的时候毒脚丫连踹带上毒呢？", text)
+        self.assertIn("视频总时长: 43分17秒", text)
+        self.assertIn("标签: 杀戮尖塔2 | 游戏杂谈", text)
+        self.assertEqual(meta["bilibili_owner"], "测试UP")
+        self.assertEqual(int(meta["bilibili_duration_seconds"]), 2597)
 
     def test_video_text_compaction_keeps_signal_and_caps_length(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

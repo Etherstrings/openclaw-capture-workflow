@@ -103,6 +103,7 @@ python3 -m unittest discover -s tests
 
 For future sessions, read:
 
+- `docs/NEXT_SESSION_HANDOFF.md`
 - `docs/TECHNICAL_HANDOFF.md`
 - `docs/ACCURACY_BASELINE.md`
 

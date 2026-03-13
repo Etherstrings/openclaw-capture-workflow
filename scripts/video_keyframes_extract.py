@@ -238,7 +238,7 @@ def _run_yt_dlp_with_auth_retry(
         cookie_attempts.append(["--cookies", cookies_file])
     for browser in _split_cookie_browsers(cookies_from_browser):
         cookie_attempts.append(["--cookies-from-browser", browser])
-    if _is_youtube_url(url) and _should_retry_with_cookies(initial_error) and not cookie_attempts:
+    if (_is_youtube_url(url) or _is_xiaohongshu_url(url)) and _should_retry_with_cookies(initial_error) and not cookie_attempts:
         cookie_attempts.append(["--cookies-from-browser", "chrome"])
         cookie_attempts.append(["--cookies-from-browser", "chromium"])
         cookie_attempts.append(["--cookies-from-browser", "edge"])

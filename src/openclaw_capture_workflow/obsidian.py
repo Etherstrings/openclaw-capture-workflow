@@ -143,7 +143,8 @@ class ObsidianWriter:
             elif raw_skill_links:
                 priority_project_lines.append("- GitHub地址: " + " | ".join(raw_skill_links[:1]))
             elif non_github_links:
-                priority_project_lines.append("- 关键链接: " + " | ".join(non_github_links[:2]))
+                label = "视频链接" if evidence.source_kind == "video_url" else "关键链接"
+                priority_project_lines.append("- " + label + ": " + " | ".join(non_github_links[:2]))
             if raw_skill_links:
                 priority_project_lines.append("- Skill文件: " + " | ".join(raw_skill_links[:1]))
             if signals.get("skills"):
@@ -158,9 +159,26 @@ class ObsidianWriter:
             elif signals.get("purposes"):
                 priority_project_lines.append("- 核心用途: " + " | ".join([self._clip_signal_line(str(item), 100) for item in signals["purposes"][:2]]))
         concise_bullets = self._dedupe_core_bullets(summary.bullets)
+        if evidence.source_kind == "video_url":
+            concise_bullets = concise_bullets[:4]
         compact_evidence_lines = self._compact_evidence_lines(evidence.text, evidence.source_url)
+        if evidence.source_kind == "video_url":
+            compact_evidence_lines = compact_evidence_lines[:3]
         analysis_paragraph = self._build_explainer_paragraph(summary, signals, evidence.source_kind)
         highlighted_conclusion = re.sub(r"\s+", " ", (summary.conclusion or "").strip()) or "（无可提取结论）"
+        action_items = self._build_action_items(summary.follow_up_actions)
+        keywords_line = self._build_keyword_badges(summary, signals)
+        usefulness_lines = self._build_usefulness_lines(summary, evidence, signals)
+        related_links = self._build_related_links(topic_links, entity_links)
+        text_mind_map = self._build_text_mind_map(
+            title=summary.title,
+            conclusion=highlighted_conclusion,
+            summary=summary,
+            evidence=evidence,
+            project_lines=priority_project_lines,
+            action_items=action_items if 'action_items' in locals() else [],
+            related_links=related_links,
+        )
 
         body = [
             f"# {summary.title}",
@@ -168,7 +186,21 @@ class ObsidianWriter:
             "## 一句话总结",
             highlighted_conclusion,
             "",
+            "## 文字脑图",
+            "```text",
+            text_mind_map,
+            "```",
+            "",
         ]
+        if usefulness_lines:
+            body.extend(["## 对你有什么用"])
+            body.extend(f"- {line}" for line in usefulness_lines)
+            body.append("")
+        judgment_lines = self._build_secretary_judgment_lines(summary)
+        if judgment_lines:
+            body.extend(["## 贾维斯判断"])
+            body.extend(f"- {line}" for line in judgment_lines)
+            body.append("")
         if priority_project_lines:
             body.extend(
                 [
@@ -177,12 +209,15 @@ class ObsidianWriter:
                     "",
                 ]
             )
+        if related_links:
+            body.extend(["## 关联笔记"])
+            body.extend(f"- {line}" for line in related_links)
+            body.append("")
         body.extend(["## 核心事实"])
         if concise_bullets:
             body.extend(f"- {bullet}" for bullet in concise_bullets)
         else:
             body.append("- 未提取到稳定要点。")
-        action_items = self._build_action_items(summary.follow_up_actions)
         if action_items:
             body.extend(["", "## 执行清单"])
             body.extend(f"{idx + 1}. {item}" for idx, item in enumerate(action_items))
@@ -192,15 +227,159 @@ class ObsidianWriter:
         else:
             body.append("- （无可提取正文）")
         body.extend(["", "## 专业解读", analysis_paragraph])
-        if topic_links or entity_links:
-            body.extend(["", "## 知识库关联"])
-            if topic_links:
-                body.append("- 主题: " + " | ".join(topic_links[:3]))
-            if entity_links:
-                body.append("- 实体: " + " | ".join(entity_links[:5]))
+        video_reliability_lines = self._build_video_reliability_lines(evidence)
+        if video_reliability_lines:
+            body.extend(["", "## 可信度与局限"])
+            body.extend(f"- {line}" for line in video_reliability_lines)
         if canonical_source_url:
             body.extend(["", "## 来源", f"- {canonical_source_url}"])
+        if keywords_line:
+            body.extend(["", "## 关键词", keywords_line])
         return "\n".join(frontmatter + body) + "\n"
+
+    def _build_related_links(self, topic_links: List[str], entity_links: List[str]) -> List[str]:
+        links: List[str] = []
+        for item in topic_links[:3]:
+            if item not in links:
+                links.append("主题: " + item)
+        for item in entity_links[:4]:
+            if item not in links:
+                links.append("实体: " + item)
+        return links
+
+    def _build_keyword_badges(self, summary: SummaryResult, signals: Dict[str, object]) -> str:
+        items: List[str] = []
+        items.append(summary.primary_topic)
+        items.extend(summary.secondary_topics[:3])
+        if isinstance(signals, dict):
+            items.extend([str(item) for item in signals.get("projects", [])[:2]])
+            items.extend([str(item) for item in signals.get("skills", [])[:2]])
+            items.extend([str(item) for item in signals.get("skill_ids", [])[:3]])
+        items.extend(summary.entities[:4])
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            text = re.sub(r"\s+", " ", str(raw).strip())
+            if not text or len(text) > 40:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(f"**{text}**")
+            if len(deduped) >= 8:
+                break
+        return " ".join(deduped)
+
+    def _build_usefulness_lines(self, summary: SummaryResult, evidence: EvidenceBundle, signals: Dict[str, object]) -> List[str]:
+        profile = evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {}
+        kind = str(profile.get("kind", "general_capture"))
+        coverage = summary.coverage
+        lines: List[str] = []
+        if kind == "skill_recommendation":
+            lines.append("如果只是想判断这个 Skill 要不要收、要不要装，这页已经够了。")
+            lines.append("入口、Skill ID 和安装动作都已经拎出来了。")
+        elif kind == "installation_tutorial":
+            lines.append("如果打算之后照着做，这页已经把最容易漏掉的前置条件和动作拎出来了。")
+            lines.append("不用再回原文翻命令。")
+        elif kind == "project_overview":
+            lines.append("如果只是想判断这个项目值不值得继续跟，这页基本已经够用。")
+            lines.append("是该收藏、试跑，还是只留档，通常能先做个决定。")
+        elif kind == "video_explainer":
+            guidance = ""
+            if isinstance(evidence.metadata, dict):
+                guidance = re.sub(r"\s+", " ", str(evidence.metadata.get("user_guidance", "")).strip())
+            if any(token in guidance for token in ["学项目", "项目有没有帮助", "学这个项目"]):
+                lines.append("如果你现在只想判断这个项目值不值得学，这页已经够你先做决定。")
+            elif coverage == "partial":
+                lines.append("这版信息只够先做初筛，还不适合直接拍板。")
+            else:
+                lines.append("如果你只想先判断有没有继续看的价值，这页基本已经够了。")
+        else:
+            lines.append("先看这页，通常就能判断这条内容是该继续跟，还是先留档。")
+        return lines[:2]
+
+    def _build_secretary_judgment_lines(self, summary: SummaryResult) -> List[str]:
+        timing_map = {"high": "高", "medium": "中", "low": "低"}
+        effectiveness_map = {"high": "高", "medium": "中", "low": "低"}
+        recommendation_map = {
+            "must_read": "强烈推荐",
+            "recommended": "建议看",
+            "optional": "按需看",
+            "skip": "可跳过",
+        }
+        lines = [
+            "适用身份: 大厂程序员",
+            f"时效性: {timing_map.get(summary.timeliness, '中')}",
+            f"有效程度: {effectiveness_map.get(summary.effectiveness, '中')}",
+            f"推荐等级: {recommendation_map.get(summary.recommendation_level, '按需看')}",
+        ]
+        judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
+        if judgment:
+            lines.append("判断: " + judgment)
+        return lines
+
+    def _build_text_mind_map(
+        self,
+        *,
+        title: str,
+        conclusion: str,
+        summary: SummaryResult,
+        evidence: EvidenceBundle,
+        project_lines: List[str],
+        action_items: List[str],
+        related_links: List[str],
+    ) -> str:
+        profile = evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {}
+        kind = str(profile.get("kind", "general_capture"))
+        focus = self._pick_mind_map_focus(summary, project_lines)
+        action = self._pick_mind_map_action(evidence, action_items)
+        related = related_links[0] if related_links else "无"
+        lines = [
+            f"主题: {title}",
+            f"├─ 结论: {conclusion}",
+            f"├─ 类型: {kind}",
+            f"├─ 核心对象: {focus}",
+            f"├─ 下一步: {action}",
+            f"└─ 关联: {related}",
+        ]
+        return "\n".join(lines)
+
+    def _pick_mind_map_focus(self, summary: SummaryResult, project_lines: List[str]) -> str:
+        for raw in project_lines:
+            line = raw.replace("- ", "", 1)
+            if line.startswith(("项目名称:", "技能名:", "技能ID:", "安装方法:", "关键命令:", "使用方式:", "核心用途:")):
+                return line
+        for bullet in self._dedupe_core_bullets(summary.bullets):
+            candidate = self._mind_map_fact_text(bullet)
+            if candidate:
+                return candidate
+        return summary.primary_topic
+
+    def _pick_mind_map_action(self, evidence: EvidenceBundle, action_items: List[str]) -> str:
+        if action_items:
+            return action_items[0]
+        if evidence.source_kind == "video_url":
+            return "先看上面的关键事实再决定要不要回看原视频"
+        return "先看上面的关键事实再决定要不要投入时间"
+
+    def _mind_map_fact_text(self, bullet: str) -> str:
+        text = re.sub(r"\s+", " ", str(bullet).strip()).strip("。；;")
+        if not text:
+            return ""
+        if ":" in text:
+            label, rest = text.split(":", 1)
+            if label.strip() in {"项目名称", "GitHub地址", "视频链接", "关键链接", "技能名", "技能ID", "安装方法", "关键命令"}:
+                text = rest.strip()
+        elif "：" in text:
+            label, rest = text.split("：", 1)
+            if label.strip() in {"项目名称", "GitHub地址", "视频链接", "关键链接", "技能名", "技能ID", "安装方法", "关键命令"}:
+                text = rest.strip()
+        if not text or text.startswith(("http://", "https://")):
+            return ""
+        if len(text) > 60:
+            text = text[:60].rstrip() + "..."
+        return text
 
     def _compact_evidence_lines(self, text: str, source_url: str | None = None) -> List[str]:
         value = (text or "").strip()
@@ -307,6 +486,8 @@ class ObsidianWriter:
         category_prefix = (
             "项目名称:",
             "GitHub地址:",
+            "视频链接:",
+            "关键链接:",
             "项目仓库:",
             "仓库地址:",
             "项目:",
@@ -369,6 +550,9 @@ class ObsidianWriter:
         bullets = self._dedupe_core_bullets(summary.bullets)
         fact_points: List[str] = []
         for item in bullets:
+            raw_cleaned = item.strip()
+            if re.fullmatch(r"\d{1,2}:\d{2}\s*/\s*\d{1,2}:\d{2}", raw_cleaned):
+                continue
             cleaned = item
             if ":" in cleaned:
                 cleaned = cleaned.split(":", 1)[1].strip()
@@ -384,6 +568,8 @@ class ObsidianWriter:
             if cleaned.startswith(("http://", "https://")):
                 continue
             if "github.com/" in lowered:
+                continue
+            if re.fullmatch(r"\d{1,2}:\d{2}\s*/\s*\d{1,2}:\d{2}", cleaned):
                 continue
             if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", cleaned):
                 continue
@@ -410,27 +596,32 @@ class ObsidianWriter:
             fact_points.append("提取图片中的关键信息")
         while len(fact_points) < 2:
             fact_points.append("当前证据以显式可见文本为准")
-        if project and skill_name:
-            intro = f"该条目聚焦 {skill_name}，对应仓库为 {project}。"
-        elif project:
-            intro = f"该条目围绕仓库 {project} 的能力与用法展开。"
-        else:
-            topic = summary.primary_topic if summary.primary_topic and summary.primary_topic != "未分类" else summary.title
-            intro = f"该条目核心主题为 {topic}。"
-        text = intro + f"从现有证据可确认两项核心信息：{fact_points[0]}；{fact_points[1]}。"
         if source_kind == "video_url":
-            text += "适合用于快速定位视频中的可复用方法、关键结论及后续验证点。"
+            text = f"如果只想先判断值不值得回看，这条视频最核心的是{fact_points[0]}；另外它还补充了{fact_points[1]}。"
+            if summary.coverage == "partial":
+                text += "当前更适合先放进待筛选清单。"
+            else:
+                text += "整体看，值得留在待看清单里。"
         elif source_kind == "image":
+            text = f"这张图最值得记住的是{fact_points[0]}；另外也说明了{fact_points[1]}。"
             text += "适合用于把截图信息转成结构化知识，便于后续追踪与比对。"
         else:
-            text += "适合直接沉淀为知识卡片，并用于后续检索、对比和复盘。"
-        if summary.coverage == "partial":
+            if project and skill_name:
+                intro = f"该条目聚焦 {skill_name}，对应仓库为 {project}。"
+            elif project:
+                intro = f"该条目围绕仓库 {project} 的能力与用法展开。"
+            else:
+                topic = summary.primary_topic if summary.primary_topic and summary.primary_topic != "未分类" else summary.title
+                intro = f"该条目核心主题为 {topic}。"
+            text = intro + f"现在最该记住的两点是：{fact_points[0]}；{fact_points[1]}。"
+            text += "适合直接沉淀为知识卡片。"
+        if summary.coverage == "partial" and source_kind != "video_url":
             text += "当前证据覆盖不完整，建议补充原文或更多上下文后再下最终判断。"
         text = re.sub(r"\s+", " ", text).strip()
-        if len(text) < 90:
+        if len(text) < 55:
             text += "可结合上方关键要点与证据摘录进行二次验证。"
-        if len(text) > 220:
-            text = text[:220].rstrip("，。；; ") + "。"
+        if len(text) > 140:
+            text = text[:140].rstrip("，。；; ") + "。"
         return text
 
     def _build_action_items(self, actions: List[str]) -> List[str]:
@@ -453,6 +644,33 @@ class ObsidianWriter:
         if len(text) <= limit:
             return text
         return text[:limit].rstrip() + "..."
+
+    def _build_video_reliability_lines(self, evidence: EvidenceBundle) -> List[str]:
+        if evidence.source_kind != "video_url":
+            return []
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
+        sources = metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []
+        reasons = metadata.get("video_gate_reasons", []) if isinstance(metadata.get("video_gate_reasons"), list) else []
+        lines: List[str] = []
+        if sources:
+            lines.append("证据来源: " + " | ".join([str(item) for item in sources[:6]]))
+        track_parts: List[str] = []
+        for label, key in [
+            ("字幕", "has_subtitle"),
+            ("转写", "has_transcript"),
+            ("关键帧", "has_keyframes"),
+            ("关键帧OCR", "has_keyframe_ocr"),
+        ]:
+            track_parts.append(f"{label}={'有' if tracks.get(key) else '无'}")
+        if track_parts:
+            lines.append("轨道状态: " + " | ".join(track_parts))
+        if reasons:
+            lines.append("当前局限: " + "；".join([str(item) for item in reasons[:3]]))
+            lines.append("建议动作: 优先补抓字幕或语音轨后再下最终判断")
+        else:
+            lines.append("当前局限: 未发现明显证据缺口，可直接人工复核")
+        return lines
 
     def _collect_focus_terms(self, summary: SummaryResult, signals: Dict[str, object]) -> List[str]:
         terms: List[str] = []

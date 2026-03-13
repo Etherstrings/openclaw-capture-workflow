@@ -82,6 +82,10 @@ class SummaryResult:
     confidence: str
     note_tags: List[str]
     follow_up_actions: List[str]
+    timeliness: str = "medium"
+    effectiveness: str = "medium"
+    recommendation_level: str = "optional"
+    reader_judgment: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -101,6 +105,10 @@ class SummaryResult:
             confidence=data.get("confidence", "medium"),
             note_tags=list(data.get("note_tags", [])),
             follow_up_actions=list(data.get("follow_up_actions", [])),
+            timeliness=data.get("timeliness", "medium"),
+            effectiveness=data.get("effectiveness", "medium"),
+            recommendation_level=data.get("recommendation_level", "optional"),
+            reader_judgment=data.get("reader_judgment", ""),
         )
 
 

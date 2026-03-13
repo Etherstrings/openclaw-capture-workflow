@@ -506,9 +506,9 @@ class ObsidianWriterTest(unittest.TestCase):
             self.assertIsNotNone(match)
             paragraph = match.group(1).strip()
             visible_length = len(paragraph.replace("**", ""))
-            self.assertGreaterEqual(visible_length, 80)
-            self.assertLessEqual(visible_length, 220)
-            self.assertIn("从现有证据可确认", paragraph)
+            self.assertGreaterEqual(visible_length, 55)
+            self.assertLessEqual(visible_length, 140)
+            self.assertIn("现在最该记住的两点是", paragraph)
             self.assertNotIn("给不熟悉的人", paragraph)
             self.assertNotIn("对你最有用的是", paragraph)
 
@@ -558,8 +558,9 @@ class ObsidianWriterTest(unittest.TestCase):
             self.assertIsNotNone(match)
             paragraph = match.group(1).strip()
             visible_length = len(paragraph.replace("**", ""))
-            self.assertGreaterEqual(visible_length, 80)
-            self.assertLessEqual(visible_length, 220)
+            self.assertGreaterEqual(visible_length, 40)
+            self.assertLessEqual(visible_length, 140)
+            self.assertIn("当前更适合先放进待筛选清单", paragraph)
             self.assertNotIn("可直接安装到 OpenClaw", paragraph)
             self.assertNotIn("财报", paragraph)
             self.assertNotIn("对你最有用的是", paragraph)
@@ -651,6 +652,225 @@ class ObsidianWriterTest(unittest.TestCase):
             self.assertIn("## 执行清单", content)
             self.assertIn("/install-skill", content)
             self.assertIn("验证技能已在对话中自动激活", content)
+
+    def test_video_preview_includes_reliability_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="视频案例",
+                    primary_topic="AI",
+                    secondary_topics=[],
+                    entities=[],
+                    conclusion="当前证据不完整。",
+                    bullets=["视频链接: https://www.bilibili.com/video/BV1tyNNzxEpK", "主题: 某个视频"],
+                    evidence_quotes=["关键片段"],
+                    coverage="partial",
+                    confidence="medium",
+                    note_tags=[],
+                    follow_up_actions=["补抓字幕或语音轨后再复核结论"],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1tyNNzxEpK",
+                    platform_hint="bilibili",
+                    title="视频案例",
+                    text="[视频时间线要点]\n[00:02] 第一段关键结论",
+                    evidence_type="multimodal_video",
+                    coverage="partial",
+                    metadata={
+                        "evidence_sources": ["video_platform_metadata", "video_audio_asr"],
+                        "tracks": {
+                            "has_subtitle": False,
+                            "has_transcript": True,
+                            "has_keyframes": True,
+                            "has_keyframe_ocr": True,
+                        },
+                        "video_gate_reasons": ["missing speech track (subtitle/transcript)"],
+                    },
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("## 可信度与局限", content)
+            self.assertIn("证据来源:", content)
+            self.assertIn("轨道状态:", content)
+            self.assertIn("建议动作:", content)
+
+    def test_video_mind_map_prefers_fact_focus_and_clean_next_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="开源项目使用视频教程",
+                    primary_topic="开源项目",
+                    secondary_topics=[],
+                    entities=[],
+                    conclusion="视频的核心意思是：了解项目功能和技术点是入手的第一步；同时补充如何下载和运行开源项目。",
+                    bullets=[
+                        "视频链接: https://www.bilibili.com/video/BV1y4411p74E",
+                        "了解项目功能和技术点是入手的第一步",
+                        "视频中介绍了如何下载和运行开源项目",
+                    ],
+                    evidence_quotes=["怎么来完整一个开源项目"],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=[],
+                    follow_up_actions=["尝试下载并运行推荐的Hello项目"],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1y4411p74E",
+                    platform_hint="bilibili",
+                    title="视频演示如何玩转一个开源项目",
+                    text="正文",
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    metadata={
+                        "signals": {
+                            "links": ["https://www.bilibili.com/video/BV1y4411p74E"]
+                        },
+                        "content_profile": {
+                            "kind": "video_explainer",
+                        },
+                    },
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("├─ 核心对象: 了解项目功能和技术点是入手的第一步", content)
+            self.assertIn("├─ 下一步: 尝试下载并运行推荐的Hello项目", content)
+            self.assertIn("## 核心事实\n- 了解项目功能和技术点是入手的第一步", content)
+
+    def test_note_frontloads_mind_map_usefulness_and_keywords(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["技能推荐", "GitHub"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="Skill 安装说明",
+                    primary_topic="技能推荐",
+                    secondary_topics=["GitHub"],
+                    entities=["tech-earnings-deepdive"],
+                    conclusion="该技能可直接安装使用。",
+                    bullets=[
+                        "项目名称: star23/Day1Global-Skills",
+                        "GitHub地址: https://github.com/star23/Day1Global-Skills",
+                        "安装方法: /install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill",
+                    ],
+                    evidence_quotes=["/install-skill"],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=[],
+                    follow_up_actions=["执行命令：/install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill"],
+                ),
+                EvidenceBundle(
+                    source_kind="pasted_text",
+                    source_url=None,
+                    platform_hint=None,
+                    title="Skill 安装说明",
+                    text="推荐一个 Skill，安装命令已经给出。",
+                    evidence_type="raw_text",
+                    coverage="full",
+                    metadata={
+                        "content_profile": {
+                            "kind": "skill_recommendation",
+                            "required_signal_keys": ["projects", "links", "skill_ids", "commands"],
+                            "optional_signal_keys": [],
+                            "require_action_checklist": True,
+                            "require_project_section": True,
+                        },
+                        "signals": {
+                            "projects": ["star23/Day1Global-Skills"],
+                            "links": ["https://github.com/star23/Day1Global-Skills"],
+                            "skills": ["美股财报深度分析 Skill"],
+                            "skill_ids": ["tech-earnings-deepdive"],
+                            "commands": ["/install-skill https://github.com/Day1Global/Day1Global-Skills/raw/main/tech-earnings-deepdive.skill"],
+                        },
+                    },
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("## 文字脑图", content)
+            self.assertIn("## 对你有什么用", content)
+            self.assertIn("## 关键词", content)
+            self.assertIn("**技能推荐**", content)
+
+    def test_note_renders_secretary_judgment_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="项目判断",
+                    primary_topic="AI",
+                    secondary_topics=[],
+                    entities=[],
+                    conclusion="这个项目值得关注。",
+                    bullets=["项目名称: demo/project", "GitHub地址: https://github.com/demo/project", "适合快速试跑"],
+                    evidence_quotes=["适合快速试跑"],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=[],
+                    follow_up_actions=[],
+                    timeliness="high",
+                    effectiveness="medium",
+                    recommendation_level="recommended",
+                    reader_judgment="从大厂程序员视角看，这条内容值得收藏，适合后续试跑。",
+                ),
+                EvidenceBundle(
+                    source_kind="url",
+                    source_url="https://github.com/demo/project",
+                    platform_hint="github",
+                    title="项目判断",
+                    text="正文",
+                    evidence_type="visible_page_text",
+                    coverage="full",
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("## 贾维斯判断", content)
+            self.assertIn("适用身份: 大厂程序员", content)
+            self.assertIn("时效性: 高", content)
+            self.assertIn("有效程度: 中", content)
+            self.assertIn("推荐等级: 建议看", content)
+            self.assertIn("从大厂程序员视角看，这条内容值得收藏", content)
 
 
 if __name__ == "__main__":

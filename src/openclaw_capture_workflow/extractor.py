@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import Dict, List, Optional
 from urllib import request as urlrequest
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .config import AppConfig
 from .content_profile import build_signal_requirements, infer_content_profile
@@ -77,6 +77,76 @@ def _looks_like_url_only(text: str, source_url: str | None = None) -> bool:
     if source_url and value == source_url.strip():
         return True
     return bool(re.fullmatch(r"https?://\S+", value))
+
+
+def _normalize_signal_url(url: str) -> str:
+    value = (url or "").strip()
+    if not value.startswith(("http://", "https://")):
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    ignored_keys = {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "share_id",
+        "share_source",
+        "share_medium",
+        "share_session_id",
+        "share_from",
+        "share_tag",
+        "apptime",
+        "shareRedId",
+        "author_share",
+        "xsec_source",
+        "xsec_token",
+        "spm_id_from",
+        "from_spmid",
+        "timestamp",
+        "unique_k",
+        "mid",
+        "buvid",
+        "vd_source",
+    }
+    items = parse_qsl(parsed.query, keep_blank_values=False)
+    filtered = [(k, v) for k, v in items if k not in ignored_keys and not k.startswith("utm_")]
+    normalized_query = urlencode(filtered, doseq=True)
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", normalized_query, ""))
+
+
+def _split_user_guidance_from_evidence(raw_text: str, *, source_kind: str, source_url: str | None) -> tuple[str, str]:
+    text = (raw_text or "").strip()
+    if not text:
+        return "", ""
+    if source_kind not in {"video_url", "url", "mixed"} or not source_url:
+        return text, ""
+    compact = re.sub(r"\s+", " ", text)
+    lowered = compact.lower()
+    guidance_tokens = [
+        "帮我",
+        "请你",
+        "请帮",
+        "我想看",
+        "重点看",
+        "重点提炼",
+        "重点关注",
+        "重点总结",
+        "只看",
+        "告诉我",
+        "帮我归档",
+        "帮我提取",
+        "请总结",
+        "请提炼",
+    ]
+    if len(compact) <= 120 and any(token in compact for token in guidance_tokens):
+        return "", compact
+    if len(compact) <= 90 and any(token in lowered for token in ["focus on", "summarize", "extract", "highlight"]):
+        return "", compact
+    return compact, ""
 
 
 def _looks_like_legal_footer(text: str) -> bool:
@@ -594,12 +664,12 @@ def parsed_url_path_key(url: str) -> tuple[str, str]:
     return parsed.netloc, path
 
 
-def _find_or_open_browser_tab(url: str, retries: int = 8, delay_seconds: float = 0.6) -> dict | None:
+def _find_or_open_browser_tab_with_state(url: str, retries: int = 8, delay_seconds: float = 0.6) -> tuple[dict | None, bool]:
     tabs_payload = _run_openclaw_browser_json("tabs")
     tabs = tabs_payload.get("tabs", [])
     tab = _find_browser_tab_for_url(url, tabs)
     if tab:
-        return tab
+        return tab, False
     _run_openclaw_browser_json("open", url)
     for _ in range(retries):
         time.sleep(delay_seconds)
@@ -607,8 +677,35 @@ def _find_or_open_browser_tab(url: str, retries: int = 8, delay_seconds: float =
         tabs = tabs_payload.get("tabs", [])
         tab = _find_browser_tab_for_url(url, tabs)
         if tab:
-            return tab
-    return None
+            return tab, True
+    return None, False
+
+
+def _find_or_open_browser_tab(url: str, retries: int = 8, delay_seconds: float = 0.6) -> dict | None:
+    tab, _ = _find_or_open_browser_tab_with_state(url, retries=retries, delay_seconds=delay_seconds)
+    return tab
+
+
+def _cleanup_browser_tab(tab: dict | None, *, opened_for_capture: bool) -> None:
+    if not opened_for_capture or not isinstance(tab, dict):
+        return
+    target_id = str(tab.get("targetId", "")).strip()
+    if not target_id:
+        return
+    try:
+        _run_openclaw_browser_json(
+            "evaluate",
+            "--target-id",
+            target_id,
+            "--fn",
+            '() => { const videos = Array.from(document.querySelectorAll("video")); for (const video of videos) { try { video.pause(); } catch (e) {} } return { videoCount: videos.length, pausedCount: videos.filter((video) => video.paused).length }; }',
+        )
+    except Exception:
+        pass
+    try:
+        _run_openclaw_browser_json("close", target_id)
+    except Exception:
+        pass
 
 
 def _looks_like_ui_noise(text: str) -> bool:
@@ -697,7 +794,11 @@ def _looks_like_comment_noise(text: str) -> bool:
         return True
     if any(candidate.startswith(prefix) for prefix in ["你这个", "我是", "我想问", "请问", "有人知道"]):
         return True
+    if candidate.startswith(("本人hrbp", "本人hrbp ", "本人hrbp，", "本人hrbp,")):
+        return True
     if any(token in candidate for token in ["评论", "回复", "共 ", "条评论"]):
+        return True
+    if len(candidate) <= 24 and any(token in candidate for token in ["有用的", "心计", "笑死", "傻傻"]):
         return True
     return False
 
@@ -707,6 +808,10 @@ def _looks_like_command_line(text: str) -> bool:
     if not value:
         return False
     if value.startswith("http://") or value.startswith("https://"):
+        return False
+    if value.startswith(("<img", "<strong", "<div", "<span", "<a ")):
+        return False
+    if re.search(r"<[^>]+>", value):
         return False
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", value))
     if has_cjk:
@@ -750,10 +855,20 @@ def _looks_like_command_line(text: str) -> bool:
         and not any(symbol in value for symbol in ["--", " /", "\\", "=", ";"])
     ):
         return False
+    if (
+        word_count > 5
+        and not lowered.startswith(command_prefixes)
+        and not any(symbol in value for symbol in ["--", "&&", "||", " /", "\\", "=", ";", "$"])
+    ):
+        return False
     if any(token in lowered for token in command_tokens):
+        if lowered.startswith(("openclaw is ", "openclaw was ", "openclaw can ", "openclaw supports ")):
+            return False
         if "openclaw" in lowered and " " not in value and "-" not in value and "_" not in value and "/" not in value:
             return False
         if has_cjk and not lowered.startswith(("openclaw ", "set-executionpolicy", "iwr ", "curl ", "wget ", "npm ", "node ", "pip ", "python ", "git ")):
+            return False
+        if not lowered.startswith(command_prefixes) and word_count > 3:
             return False
         return True
     if "|" in value and any(token.strip() in lowered for token in ["openclaw", "iwr", "curl", "wget", "npm", "python"]):
@@ -923,7 +1038,7 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
     normalized = text or ""
     url_pattern = r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
     for match in re.findall(url_pattern, normalized):
-        url = match.rstrip(")]}>,.;，。；：")
+        url = _normalize_signal_url(match.rstrip(")]}>,.;，。；："))
         if url and _is_high_value_link(url, source_url) and url not in signals["links"]:
             signals["links"].append(url)
 
@@ -939,7 +1054,7 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
         repo_key = f"{owner}/{repo}"
         if repo_key not in signals["projects"]:
             signals["projects"].append(repo_key)
-        normalized_url = f"https://github.com/{owner}/{repo}"
+        normalized_url = _normalize_signal_url(f"https://github.com/{owner}/{repo}")
         if normalized_url not in signals["links"]:
             signals["links"].append(normalized_url)
 
@@ -970,7 +1085,7 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
             repo_key = f"{owner}/{repo}"
             if repo_key not in signals["projects"]:
                 signals["projects"].append(repo_key)
-            normalized_url = f"https://github.com/{owner}/{repo}"
+            normalized_url = _normalize_signal_url(f"https://github.com/{owner}/{repo}")
             if normalized_url not in signals["links"]:
                 signals["links"].append(normalized_url)
     if source_url:
@@ -985,8 +1100,9 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
                 "xiaohongshu.com/explore/",
             ]
         )
-        if (force_source_link or _is_high_value_link(source_url, source_url)) and source_url not in signals["links"]:
-            signals["links"].append(source_url)
+        normalized_source_url = _normalize_signal_url(source_url)
+        if (force_source_link or _is_high_value_link(normalized_source_url, source_url)) and normalized_source_url not in signals["links"]:
+            signals["links"].append(normalized_source_url)
 
     for match in re.findall(r"「([^」]{2,60})」\s*Skill", normalized, re.IGNORECASE):
         skill = _clean_skill_name(f"{match} Skill")
@@ -1376,41 +1492,47 @@ def _extract_steps_from_tencent_snapshot(snapshot: str) -> list[dict]:
 
 
 def _fetch_openclaw_browser_snapshot(url: str, limit: int = 500) -> tuple[str | None, str]:
-    tab = _find_or_open_browser_tab(url)
+    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
     if not tab:
         raise RuntimeError("browser tab not found for url")
-    snapshot_payload = _run_openclaw_browser_json(
-        "snapshot",
-        "--target-id",
-        tab["targetId"],
-        "--limit",
-        str(limit),
-    )
-    title = tab.get("title")
-    raw_snapshot = snapshot_payload.get("snapshot", "")
-    if "cloud.tencent.com" in url:
-        text = _extract_text_from_tencent_snapshot(raw_snapshot)
-    else:
-        text = _extract_text_from_browser_snapshot(raw_snapshot)
-    return title, text
+    try:
+        snapshot_payload = _run_openclaw_browser_json(
+            "snapshot",
+            "--target-id",
+            tab["targetId"],
+            "--limit",
+            str(limit),
+        )
+        title = tab.get("title")
+        raw_snapshot = snapshot_payload.get("snapshot", "")
+        if "cloud.tencent.com" in url:
+            text = _extract_text_from_tencent_snapshot(raw_snapshot)
+        else:
+            text = _extract_text_from_browser_snapshot(raw_snapshot)
+        return title, text
+    finally:
+        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
 
 def _fetch_openclaw_browser_snapshot_with_steps(url: str, limit: int = 500) -> tuple[str | None, str, list[dict]]:
-    tab = _find_or_open_browser_tab(url)
+    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
     if not tab:
         raise RuntimeError("browser tab not found for url")
-    snapshot_payload = _run_openclaw_browser_json(
-        "snapshot",
-        "--target-id",
-        tab["targetId"],
-        "--limit",
-        str(limit),
-    )
-    raw_snapshot = snapshot_payload.get("snapshot", "")
-    title = tab.get("title")
-    text = _extract_text_from_tencent_snapshot(raw_snapshot)
-    steps = _extract_steps_from_tencent_snapshot(raw_snapshot)
-    return title, text, steps
+    try:
+        snapshot_payload = _run_openclaw_browser_json(
+            "snapshot",
+            "--target-id",
+            tab["targetId"],
+            "--limit",
+            str(limit),
+        )
+        raw_snapshot = snapshot_payload.get("snapshot", "")
+        title = tab.get("title")
+        text = _extract_text_from_tencent_snapshot(raw_snapshot)
+        steps = _extract_steps_from_tencent_snapshot(raw_snapshot)
+        return title, text, steps
+    finally:
+        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
 
 def _resolve_default_ocr_command() -> str:
@@ -1592,6 +1714,39 @@ def _compact_video_evidence_text(text: str, *, max_lines: int, max_chars: int) -
     }
 
 
+def _select_video_timeline_highlights(*line_groups: list[str], limit: int = 8) -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for group in line_groups:
+        if not isinstance(group, list):
+            continue
+        for raw in group[:400]:
+            line = _normalize_text(str(raw))
+            if not line:
+                continue
+            norm = re.sub(r"\s+", " ", line).strip().lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if not re.match(r"^\[[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?\]", line):
+                continue
+            if _looks_like_ui_noise(line) or _looks_like_comment_noise(line):
+                continue
+            score = _score_video_signal_line(line) + 3
+            if any(token in line for token in ["点赞", "收藏", "转发", "评论"]):
+                score -= 5
+            if len(line) < 16:
+                score -= 2
+            candidates.append((score, line))
+    selected: list[str] = []
+    for _, line in sorted(candidates, key=lambda item: item[0], reverse=True):
+        if line not in selected:
+            selected.append(line)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def _extract_ocr_lines(text: str, *, strict: bool, limit: int) -> list[str]:
     lines: list[str] = []
     for raw in text.splitlines():
@@ -1738,6 +1893,20 @@ def _format_seconds_label(value: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _format_duration_cn(value: float) -> str:
+    seconds = max(0, int(round(value)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    if minutes > 0:
+        parts.append(f"{minutes}分")
+    if secs > 0 or not parts:
+        parts.append(f"{secs}秒")
+    return "".join(parts)
+
+
 def _parse_duration_seconds(value) -> float | None:
     if isinstance(value, (int, float)):
         duration = float(value)
@@ -1779,6 +1948,81 @@ def _canonicalize_video_source_url(url: str | None) -> str | None:
     return source
 
 
+def _extract_bvid(source_url: str | None) -> str | None:
+    if not source_url:
+        return None
+    match = re.search(r"(?i)\b(BV[0-9A-Za-z]{10,})\b", source_url)
+    if match:
+        return match.group(1)
+    parsed = urlparse(source_url)
+    query_match = re.search(r"(?i)\bbvid=([A-Za-z0-9]+)\b", parsed.query or "")
+    if query_match:
+        return query_match.group(1)
+    return None
+
+
+def _fetch_bilibili_video_metadata(url: str) -> tuple[str | None, str, dict[str, object]]:
+    bvid = _extract_bvid(url)
+    if not bvid:
+        return None, "", {}
+    view = _fetch_json(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}")
+    if int(view.get("code", -1)) != 0:
+        return None, "", {}
+    data = view.get("data", {}) if isinstance(view.get("data"), dict) else {}
+    title = _normalize_text(str(data.get("title", "")).strip()) or None
+    desc = _normalize_text(str(data.get("desc", "")).strip())
+    owner_name = ""
+    owner = data.get("owner")
+    if isinstance(owner, dict):
+        owner_name = _normalize_text(str(owner.get("name", "")).strip())
+    stat = data.get("stat") if isinstance(data.get("stat"), dict) else {}
+    view_count = stat.get("view")
+    like_count = stat.get("like")
+    duration_seconds = _parse_duration_seconds(data.get("duration"))
+    tags_text: list[str] = []
+    try:
+        tags_payload = _fetch_json(
+            f"https://api.bilibili.com/x/tag/archive/tags?bvid={bvid}",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://www.bilibili.com/video/{bvid}"},
+        )
+        tags_data = tags_payload.get("data") or []
+        if isinstance(tags_data, list):
+            for item in tags_data[:8]:
+                if not isinstance(item, dict):
+                    continue
+                name = _normalize_text(str(item.get("tag_name", "")).strip())
+                if name:
+                    tags_text.append(name)
+    except Exception:
+        tags_text = []
+    lines: list[str] = []
+    if title:
+        lines.append(f"标题: {title}")
+    if owner_name:
+        lines.append(f"UP主: {owner_name}")
+    if desc:
+        desc_lines = [line.strip() for line in desc.splitlines() if line.strip()]
+        if desc_lines:
+            lines.append("简介: " + " | ".join(desc_lines[:3]))
+    if duration_seconds:
+        lines.append(f"视频总时长: {_format_duration_cn(duration_seconds)}")
+    if tags_text:
+        lines.append("标签: " + " | ".join(tags_text[:6]))
+    if view_count:
+        lines.append(f"播放量: {view_count}")
+    if like_count:
+        lines.append(f"点赞量: {like_count}")
+    metadata: dict[str, object] = {
+        "bilibili_title": title or "",
+        "bilibili_description": desc,
+        "bilibili_tags": tags_text[:12],
+        "bilibili_owner": owner_name,
+    }
+    if duration_seconds:
+        metadata["bilibili_duration_seconds"] = round(duration_seconds, 3)
+    return title, "\n".join(lines).strip(), metadata
+
+
 def _normalize_video_page_title(title: str | None) -> str:
     value = _normalize_text(title or "")
     if not value:
@@ -1817,6 +2061,8 @@ def _sanitize_video_page_snapshot_text(text: str, title: str | None = None) -> s
         line = _normalize_text(raw)
         if not line:
             continue
+        if normalized_title and line == normalized_title:
+            continue
         lowered = line.lower()
         if _looks_like_ui_noise(line) or _looks_like_comment_noise(line):
             continue
@@ -1840,6 +2086,12 @@ def _sanitize_video_page_snapshot_text(text: str, title: str | None = None) -> s
             or "skill" in lowered
             or "http://" in lowered
             or "https://" in lowered
+            or "攻略" in line
+            or "新手" in line
+            or "基础流派" in line
+            or "薪资流水" in line
+            or "背调" in line
+            or "offer" in lowered
         )
         if not has_signal and re.search(r"(我怎么|这个就是|十年前|笑死|离谱|有没有人|求个|太离谱)", line):
             continue
@@ -1855,6 +2107,16 @@ def _sanitize_video_page_snapshot_text(text: str, title: str | None = None) -> s
             cleaned_lines.append(line)
         if len(cleaned_lines) >= 8:
             break
+    if len(cleaned_lines) <= 1 and normalized_title:
+        title_terms = [term for term in re.split(r"[\s/|_-]+", normalized_title) if len(term) >= 2]
+        for raw in (text or "").splitlines():
+            line = _normalize_text(raw)
+            if not line or line in cleaned_lines:
+                continue
+            if any(term in line for term in title_terms):
+                cleaned_lines.append(line[:180].rstrip() + ("..." if len(line) > 180 else ""))
+                if len(cleaned_lines) >= 4:
+                    break
     return "\n".join(cleaned_lines).strip()
 
 
@@ -2035,21 +2297,24 @@ def _select_salient_lines(lines: list[str], limit: int = 18) -> list[str]:
 def _fetch_openclaw_browser_screenshot_ocr(url: str, command_template: str) -> tuple[str, str | None]:
     if not command_template:
         return "", None
-    tab = _find_or_open_browser_tab(url)
+    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
     if not tab:
         raise RuntimeError("browser tab not found for screenshot OCR")
-    screenshot_payload = _run_openclaw_browser_json(
-        "screenshot",
-        tab["targetId"],
-        "--full-page",
-    )
-    image_path = screenshot_payload.get("path")
-    if not image_path:
-        raise RuntimeError("screenshot path missing from browser response")
-    ocr_text = _run_template(command_template, input_path=image_path)
-    lines = _extract_high_value_ocr_lines(ocr_text)
-    lines = _select_salient_lines(lines, limit=16)
-    return "\n".join(lines).strip(), image_path
+    try:
+        screenshot_payload = _run_openclaw_browser_json(
+            "screenshot",
+            tab["targetId"],
+            "--full-page",
+        )
+        image_path = screenshot_payload.get("path")
+        if not image_path:
+            raise RuntimeError("screenshot path missing from browser response")
+        ocr_text = _run_template(command_template, input_path=image_path)
+        lines = _extract_high_value_ocr_lines(ocr_text)
+        lines = _select_salient_lines(lines, limit=16)
+        return "\n".join(lines).strip(), image_path
+    finally:
+        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
 
 class EvidenceExtractor:
@@ -2339,13 +2604,34 @@ class EvidenceExtractor:
         keyframes: List[str] = []
         transcript = None
         metadata: Dict[str, object] = {}
-        if request.raw_text:
+        user_text = (request.raw_text or "").strip()
+        evidence_hint_text, user_guidance = _split_user_guidance_from_evidence(
+            user_text,
+            source_kind="video_url",
+            source_url=request.source_url,
+        )
+        if user_text:
             _add_evidence_source(metadata, "user_raw_text")
+        if user_guidance:
+            metadata["user_guidance"] = user_guidance
         warnings: list[str] = []
         video_url = _canonicalize_video_source_url(request.source_url)
         if request.source_url and video_url and request.source_url != video_url:
             metadata["raw_source_url"] = request.source_url
             metadata["normalized_source_url"] = video_url
+        metadata_text = ""
+        if video_url and "bilibili.com/video/" in video_url:
+            try:
+                bili_title, bili_text, bili_meta = _fetch_bilibili_video_metadata(video_url)
+                if bili_title and not metadata.get("page_title"):
+                    metadata["page_title"] = bili_title
+                if bili_text:
+                    metadata_text = "[视频元数据]\n" + bili_text
+                    _add_evidence_source(metadata, "video_platform_metadata")
+                if bili_meta:
+                    metadata.update({key: value for key, value in bili_meta.items() if value})
+            except Exception as exc:
+                warnings.append(f"video_platform_metadata_failed: {exc}")
         subtitle_meta: dict[str, object] = {}
         audio_meta: dict[str, object] = {}
         probe_seconds = 0
@@ -2373,9 +2659,22 @@ class EvidenceExtractor:
             except Exception as exc:
                 warnings.append(f"video_subtitle_failed: {exc}")
                 subtitle_text = ""
-        skip_audio_in_dry_run = (
-            request.dry_run and not request.force_full_video and self.config.execution.dry_run_skip_video_audio
+        dry_run_quality_audio_platforms = ("bilibili.com", "xiaohongshu.com")
+        should_force_audio_in_dry_run = (
+            request.dry_run
+            and not request.force_full_video
+            and bool(video_url)
+            and any(platform in (video_url or "").lower() for platform in dry_run_quality_audio_platforms)
+            and len(subtitle_text.strip()) < self.config.video_accuracy.audio_when_subtitle_short_chars
         )
+        skip_audio_in_dry_run = (
+            request.dry_run
+            and not request.force_full_video
+            and self.config.execution.dry_run_skip_video_audio
+            and not should_force_audio_in_dry_run
+        )
+        if should_force_audio_in_dry_run:
+            metadata["audio_probe_reason"] = "dry_run_quality_upgrade_missing_subtitles"
         should_run_audio = (
             video_url
             and bool(self.config.extractors.video_audio_command)
@@ -2407,9 +2706,22 @@ class EvidenceExtractor:
             else:
                 metadata["audio_skipped_reason"] = "subtitle_sufficient"
         keyframe_text_hints: list[str] = []
-        skip_keyframes_in_dry_run = (
-            request.dry_run and not request.force_full_video and self.config.execution.dry_run_skip_video_keyframes
+        dry_run_quality_keyframe_platforms = ("bilibili.com", "xiaohongshu.com")
+        should_force_keyframes_in_dry_run = (
+            request.dry_run
+            and not request.force_full_video
+            and bool(video_url)
+            and any(platform in (video_url or "").lower() for platform in dry_run_quality_keyframe_platforms)
+            and len(subtitle_text.strip()) < self.config.video_accuracy.audio_when_subtitle_short_chars
         )
+        skip_keyframes_in_dry_run = (
+            request.dry_run
+            and not request.force_full_video
+            and self.config.execution.dry_run_skip_video_keyframes
+            and not should_force_keyframes_in_dry_run
+        )
+        if should_force_keyframes_in_dry_run:
+            metadata["keyframes_probe_reason"] = "dry_run_quality_upgrade_missing_subtitles"
         if video_url and self.config.extractors.video_keyframes_command and not skip_keyframes_in_dry_run:
             output_dir = self.artifacts_dir / request.request_id
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2452,9 +2764,10 @@ class EvidenceExtractor:
             )
             include_keyframe_ocr = transcript_len < 160 or has_high_signal
         merged_text = _merge_text_blocks(
+            metadata_text,
             subtitle_text,
             transcript or "",
-            request.raw_text or "",
+            evidence_hint_text,
             "\n".join(keyframe_text_hints),
             "[关键帧OCR]\n" + "\n".join(keyframe_ocr_lines) if include_keyframe_ocr else "",
         )
@@ -2512,7 +2825,15 @@ class EvidenceExtractor:
             metadata["transcript_timeline_lines"] = audio_meta["timeline_lines"]
         if audio_meta.get("language"):
             metadata["transcript_language"] = audio_meta["language"]
+        timeline_highlights = _select_video_timeline_highlights(
+            audio_meta.get("timeline_lines") if isinstance(audio_meta.get("timeline_lines"), list) else [],
+            subtitle_meta.get("timeline_lines") if isinstance(subtitle_meta.get("timeline_lines"), list) else [],
+            limit=8,
+        )
+        if timeline_highlights:
+            metadata["timeline_highlights"] = timeline_highlights
         duration_candidates = [
+            _parse_duration_seconds(metadata.get("bilibili_duration_seconds")),
             _parse_duration_seconds(subtitle_meta.get("duration_seconds")),
             _parse_duration_seconds(audio_meta.get("duration_seconds")),
             _infer_duration_from_timestamps(subtitle_text),
@@ -2533,6 +2854,8 @@ class EvidenceExtractor:
         signals = _extract_skill_signals(merged_text, video_url)
         if signals:
             metadata["signals"] = signals
+        if timeline_highlights:
+            merged_text = _merge_text_blocks(merged_text, "[视频时间线要点]\n" + "\n".join(timeline_highlights))
         metadata = _finalize_evidence_metadata(
             metadata,
             source_kind="video_url",

@@ -5,10 +5,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.models import EvidenceBundle, SummaryResult
-from openclaw_capture_workflow.summarizer import _validate_and_normalize_summary
+from openclaw_capture_workflow.summarizer import PROMPT, _validate_and_normalize_summary
 
 
 class SummarizerPostprocessTest(unittest.TestCase):
+    def test_prompt_uses_jarvis_role(self) -> None:
+        self.assertIn("J.A.R.V.I.S.", PROMPT)
+        self.assertIn("Tony Stark", PROMPT)
+        self.assertIn("Sir", PROMPT)
+        self.assertIn("large tech company", PROMPT)
+
     def test_signal_facts_are_prioritized_and_generic_bullets_removed(self) -> None:
         evidence = EvidenceBundle(
             source_kind="url",
@@ -131,6 +137,36 @@ class SummarizerPostprocessTest(unittest.TestCase):
         normalized = _validate_and_normalize_summary(summary, evidence)
         self.assertTrue(any("/install-skill" in item for item in normalized.follow_up_actions))
         self.assertTrue(any("安装方法" in item for item in normalized.bullets))
+
+    def test_default_secretary_judgment_fields_are_populated(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="url",
+            source_url="https://docs.openclaw.ai/",
+            platform_hint="docs",
+            title="OpenClaw Docs",
+            text="Onboard and install the service\nPair WhatsApp and start the Gateway",
+            evidence_type="visible_page_text",
+            coverage="full",
+            metadata={"content_profile": {"kind": "installation_tutorial"}},
+        )
+        summary = SummaryResult(
+            title="OpenClaw 安装",
+            primary_topic="OpenClaw",
+            secondary_topics=[],
+            entities=[],
+            conclusion="OpenClaw 支持安装。",
+            bullets=["安装流程包括服务部署", "支持 WhatsApp 配对", "可作为 AI Agent 网关"],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertEqual(normalized.timeliness, "medium")
+        self.assertEqual(normalized.effectiveness, "medium")
+        self.assertEqual(normalized.recommendation_level, "optional")
+        self.assertIn("大厂程序员", normalized.reader_judgment)
 
     def test_bullets_keep_long_github_links_and_key_terms(self) -> None:
         evidence = EvidenceBundle(
@@ -274,6 +310,145 @@ class SummarizerPostprocessTest(unittest.TestCase):
         self.assertEqual(normalized.coverage, "partial")
         self.assertEqual(normalized.confidence, "medium")
         self.assertIn("证据不完整", normalized.conclusion)
+
+    def test_incomplete_video_prefers_evidence_backed_bullets_and_guidance_actions(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1tyNNzxEpK",
+            platform_hint="bilibili",
+            title="杀戮尖塔2 全英雄基础流派攻略",
+            text="杀戮尖塔2 全英雄基础流派攻略\n新手必看小技巧，主要讲选牌与路线",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={
+                "signals": {
+                    "links": ["https://www.bilibili.com/video/BV1tyNNzxEpK"]
+                },
+                "video_gate_reasons": ["missing speech track (subtitle/transcript)"],
+                "evidence_sources": ["video_page_snapshot"],
+            },
+        )
+        summary = SummaryResult(
+            title="杀戮尖塔2 全英雄基础流派攻略",
+            primary_topic="游戏攻略",
+            secondary_topics=[],
+            entities=[],
+            conclusion="这是一个完整深入的视频讲解。",
+            bullets=[
+                "视频链接: https://www.bilibili.com/video/BV1tyNNzxEpK",
+                "视频包含全英雄基础流派的攻略",
+                "素材未包含进阶内容",
+            ],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=["观看视频以获取详细攻略"],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        joined = "\n".join(normalized.bullets)
+        self.assertIn("https://www.bilibili.com/video/BV1tyNNzxEpK", joined)
+        self.assertNotIn("素材未包含进阶内容", joined)
+        self.assertIn("主题: 杀戮尖塔2 全英雄基础流派攻略", joined)
+        self.assertTrue(any("补抓字幕或语音轨" in item for item in normalized.follow_up_actions))
+
+    def test_complete_video_rewrites_generic_conclusion_and_filters_noisy_actions(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1y4411p74E",
+            platform_hint="bilibili",
+            title="视频演示如何玩转一个开源项目 |如何运行+如何读代码 |顺便讲讲IDEA和Spring Boot |Java/Python/C语言/C++项目均适用 |视频教程",
+            text="重点看这个视频对我学项目有没有帮助。",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={
+                "user_guidance": "重点看这个视频对我学项目有没有帮助。",
+                "video_extraction_profile": "dry_run_probe",
+                "signals": {
+                    "links": ["https://www.bilibili.com/video/BV1y4411p74E"]
+                },
+            },
+        )
+        summary = SummaryResult(
+            title="开源项目使用视频教程",
+            primary_topic="开源项目",
+            secondary_topics=[],
+            entities=[],
+            conclusion="已提取核心事实。",
+            bullets=[
+                "视频链接: https://www.bilibili.com/video/BV1y4411p74E",
+                "了解项目功能和技术点是入手的第一步",
+                "视频中介绍了如何下载和运行开源项目",
+                "强调了对陌生项目的决心和学习兴趣",
+                "视频时长约90秒，适合快速学习",
+            ],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[
+                "标题: 视频演示如何玩转一个开源项目 |如何运行+如何读代码 |顺便讲讲IDEA和Spring Boot |Java/Python/C语言/C++项目均适用 |视频教程",
+                "[00:21] 但是我还是不太会运行它,跑不起来",
+                "观看视频以获取详细步骤",
+                "尝试下载并运行推荐的Hello项目",
+                "记录学习过程中遇到的问题以便后续解决",
+            ],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertEqual(
+            normalized.conclusion,
+            "视频的核心意思是：了解项目功能和技术点是入手的第一步；同时补充如何下载和运行开源项目。",
+        )
+        self.assertFalse(any("视频时长约90秒" in item for item in normalized.bullets))
+        self.assertEqual(
+            normalized.follow_up_actions,
+            [
+                "尝试下载并运行推荐的Hello项目",
+                "记录学习过程中遇到的问题以便后续解决",
+                "先确认项目是干什么的、关键技术点是什么，再决定是否继续投入",
+                "挑一个示例项目先下载并跑起来",
+            ],
+        )
+
+    def test_complete_video_filters_comment_area_actions_and_prefers_real_next_steps(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1zCfdBqEbs",
+            platform_hint="bilibili",
+            title="Situation Monitor开源情报聚合面板实测",
+            text="重点看这个项目值不值得学。",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={"user_guidance": "重点看这个项目值不值得学。"},
+        )
+        summary = SummaryResult(
+            title="Situation Monitor开源情报聚合面板实测",
+            primary_topic="Situation Monitor开源项目",
+            secondary_topics=[],
+            entities=[],
+            conclusion="Situation Monitor项目适合需要聚合全球新闻、金融和地缘数据的用户，部署简单，值得关注和学习。",
+            bullets=[
+                "视频链接: https://www.bilibili.com/video/BV1zCfdBqEbs",
+                "Situation Monitor为开源情报聚合面板，支持全球新闻、金融市场、地缘政治等多数据源实时可视化",
+                "项目可通过TRAE或chain工具几分钟内一键本地部署，适合非技术用户快速上手",
+                "支持自定义仪表盘和数据源，核心新闻数据源为GDELT等开放接口",
+                "面板内容和界面为全英文，适合具备一定英文基础的用户",
+            ],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[
+                "访问视频评论区获取Situation Monitor的GitHub链接",
+                "准备本地Python环境，确保依赖项齐全",
+                "使用TRAE或chain工具复制项目URL并一键部署",
+                "根据需求自定义仪表盘和数据源",
+            ],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertFalse(any("评论区" in item for item in normalized.follow_up_actions))
+        self.assertTrue(any("TRAE或chain" in item for item in normalized.follow_up_actions))
+        self.assertTrue(any("仪表盘和数据源" in item for item in normalized.follow_up_actions))
 
     def test_signal_links_strip_tracking_params_in_bullets(self) -> None:
         evidence = EvidenceBundle(

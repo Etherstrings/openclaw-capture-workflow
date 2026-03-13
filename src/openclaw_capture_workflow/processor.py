@@ -21,7 +21,7 @@ from .extractor import EvidenceExtractor
 from .models import IngestRequest, JobRecord, SummaryResult
 from .obsidian import ObsidianWriter
 from .storage import JobStore
-from .summarizer import OpenAICompatibleSummarizer, SummaryEngine
+from .summarizer import OpenAICompatibleSummarizer, SummaryEngine, PROMPT_VERSION
 from .telegram import TelegramNotifier
 
 
@@ -136,6 +136,7 @@ def _evidence_fingerprint(evidence) -> str:
         "text": text[:12000],
         "transcript": transcript[:12000],
         "tracks": tracks,
+        "prompt_version": PROMPT_VERSION,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -320,7 +321,10 @@ def _extract_steps_from_text(text: str) -> list[str]:
 
 
 def _normalize_requirement_token(value: str) -> str:
-    text = str(value).strip().lower()
+    text = str(value).strip()
+    if text.startswith(("http://", "https://")):
+        text = _normalize_source_url_for_cache(text)
+    text = text.lower()
     return re.sub(r"\s+", " ", text)
 
 
@@ -406,6 +410,20 @@ def _summary_quality_score(summary: SummaryResult, evidence) -> tuple[float, lis
         score += 0.05
     elif missing and any(item.startswith(("section:执行清单", "actions:")) for item in missing):
         score -= 0.15
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    video_gate = metadata.get("video_gate_reasons") if isinstance(metadata, dict) else None
+    evidence_sources = metadata.get("evidence_sources", []) if isinstance(metadata, dict) else []
+    if evidence.source_kind == "video_url":
+        if isinstance(video_gate, list) and video_gate:
+            score -= 0.35
+        if isinstance(evidence_sources, list):
+            normalized_sources = {str(item) for item in evidence_sources}
+            weak_only = {"user_raw_text", "video_page_snapshot", "video_html_fallback"}
+            if normalized_sources and normalized_sources.issubset(weak_only):
+                score -= 0.15
+        text_len = len((evidence.text or "").strip())
+        if text_len < 180:
+            score -= 0.1
     score = max(0.0, min(1.0, score))
     reasons: list[str] = []
     if missing:
@@ -414,7 +432,62 @@ def _summary_quality_score(summary: SummaryResult, evidence) -> tuple[float, lis
         reasons.append("too_few_bullets")
     if len(conclusion) < 12:
         reasons.append("conclusion_too_short")
+    if evidence.source_kind == "video_url":
+        if isinstance(video_gate, list) and video_gate:
+            reasons.append("video_incomplete")
+        if isinstance(evidence_sources, list):
+            normalized_sources = {str(item) for item in evidence_sources}
+            weak_only = {"user_raw_text", "video_page_snapshot", "video_html_fallback"}
+            if normalized_sources and normalized_sources.issubset(weak_only):
+                reasons.append("video_page_snapshot_only")
+        if len((evidence.text or "").strip()) < 180:
+            reasons.append("video_evidence_short")
     return score, reasons, coverage
+
+
+def _video_assessment(evidence, config: AppConfig) -> dict[str, object] | None:
+    if evidence.source_kind != "video_url":
+        return None
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
+    reasons = _video_gate_reasons(evidence, config)
+    text_chars = len((evidence.text or "").strip())
+    sources = metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []
+    score = 0
+    if tracks.get("has_subtitle"):
+        score += 3
+    if tracks.get("has_transcript"):
+        score += 4
+    if tracks.get("has_keyframes"):
+        score += 1
+    if tracks.get("has_keyframe_ocr"):
+        score += 1
+    if text_chars >= 400:
+        score += 2
+    elif text_chars >= 180:
+        score += 1
+    missing_speech = any("missing speech track" in item for item in reasons)
+    if missing_speech and config.video_accuracy.require_speech_track:
+        level = "weak"
+    elif not reasons and (tracks.get("has_subtitle") or tracks.get("has_transcript")):
+        level = "strong"
+    elif score >= 3 and text_chars >= 180:
+        level = "medium"
+    else:
+        level = "weak"
+    next_step = "当前证据可直接人工复核。"
+    if any("missing speech track" in item for item in reasons):
+        next_step = "优先补抓字幕或语音轨，再判断视频结论是否可信。"
+    elif text_chars < 180:
+        next_step = "优先补充更多页面文本、关键帧 OCR 或字幕内容。"
+    return {
+        "level": level,
+        "score": score,
+        "reasons": reasons,
+        "text_chars": text_chars,
+        "evidence_sources": sources,
+        "next_step": next_step,
+    }
 
 
 def _infer_entry_context(ingest: IngestRequest) -> dict[str, object]:
@@ -1067,6 +1140,9 @@ class WorkflowProcessor:
                     result["summary_error"] = summary_error
                 if video_cost_estimate is not None:
                     result["video_cost_estimate"] = video_cost_estimate
+                video_assessment = _video_assessment(evidence, self.config)
+                if video_assessment is not None:
+                    result["video_assessment"] = video_assessment
                 if video_recovery is not None:
                     result["video_recovery"] = video_recovery
                 if note_meta is not None:

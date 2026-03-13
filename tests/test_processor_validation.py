@@ -255,6 +255,8 @@ class ProcessorValidationTest(unittest.TestCase):
             self.assertIn("video_gate_reasons", job.result["evidence"]["metadata"])
             reasons = job.result["evidence"]["metadata"]["video_gate_reasons"]
             self.assertTrue(any("missing speech track" in item for item in reasons))
+            self.assertEqual(job.result["video_assessment"]["level"], "weak")
+            self.assertTrue(any("video_incomplete" in item for item in job.result["summary_quality"]["reasons"]))
 
     def test_video_recovery_reextracts_and_applies_better_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

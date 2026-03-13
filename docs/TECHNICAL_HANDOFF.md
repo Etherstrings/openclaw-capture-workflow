@@ -101,9 +101,10 @@ These files are the main continuation points for future sessions:
 Read these in order:
 
 1. [`README.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/README.md)
-2. [`TASK_STATUS.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/TASK_STATUS.md)
-3. [`docs/TECHNICAL_HANDOFF.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/TECHNICAL_HANDOFF.md)
-4. [`docs/ACCURACY_BASELINE.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/ACCURACY_BASELINE.md)
+2. [`docs/NEXT_SESSION_HANDOFF.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/NEXT_SESSION_HANDOFF.md)
+3. [`TASK_STATUS.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/TASK_STATUS.md)
+4. [`docs/TECHNICAL_HANDOFF.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/TECHNICAL_HANDOFF.md)
+5. [`docs/ACCURACY_BASELINE.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/ACCURACY_BASELINE.md)
 
 Then run:
 
