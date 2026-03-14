@@ -79,6 +79,31 @@ class ExecutionConfig:
 
 
 @dataclass
+class AnalysisConfig:
+    model: str = "gpt-5-mini"
+    fallback_model: str = "gpt-5.4"
+    browser_backend: str = "playwright"
+    page_timeout_seconds: int = 30
+    max_images: int = 6
+    max_videos: int = 3
+    max_tables: int = 6
+    max_video_frames: int = 8
+    temp_root: str = "tmp"
+    pinchtab_base_url: str = ""
+
+
+@dataclass
+class VideoSummaryConfig:
+    provider: str = "aihubmix_gemini"
+    transport: str = "openai_compat"
+    api_base_url: str = ""
+    api_key: str = ""
+    model: str = "gemini-2.5-pro"
+    fallback_model: str = "gemini-2.5-flash"
+    timeout_seconds: int = 60
+
+
+@dataclass
 class SummaryRoutingConfig:
     enabled: bool = False
     upgrade_model: str = "gpt-4.1"
@@ -124,6 +149,8 @@ class AppConfig:
     evidence_gate: EvidenceGateConfig = field(default_factory=EvidenceGateConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
+    video_summary: VideoSummaryConfig = field(default_factory=VideoSummaryConfig)
     summary_routing: SummaryRoutingConfig = field(default_factory=SummaryRoutingConfig)
 
     @classmethod
@@ -140,6 +167,14 @@ class AppConfig:
             ["测试", "总结", "结构", "回群", "回执", "路径", "显示", "验证", "本地链接", "wiki", "md", "Telegram", "Obsidian", "OpenClaw"],
         )
         obsidian.setdefault("auto_entity_pages", False)
+        video_summary = VideoSummaryConfig(**data.get("video_summary", {}))
+        if not video_summary.api_base_url.strip():
+            video_summary.api_base_url = data.get("summarizer", {}).get("api_base_url", "https://aihubmix.com/v1")
+        if not video_summary.api_key.strip():
+            video_summary.api_key = data.get("summarizer", {}).get("api_key", "")
+        if not video_summary.timeout_seconds:
+            video_summary.timeout_seconds = int(data.get("summarizer", {}).get("timeout_seconds", 60))
+
         return cls(
             listen_host=data.get("listen_host", "127.0.0.1"),
             listen_port=int(data.get("listen_port", 8765)),
@@ -152,6 +187,8 @@ class AppConfig:
             evidence_gate=EvidenceGateConfig(**data.get("evidence_gate", {})),
             routing=RoutingConfig(**data.get("routing", {})),
             execution=ExecutionConfig(**data.get("execution", {})),
+            analysis=AnalysisConfig(**data.get("analysis", {})),
+            video_summary=video_summary,
             summary_routing=SummaryRoutingConfig(**data.get("summary_routing", {})),
         )
 

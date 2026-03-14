@@ -37,6 +37,11 @@ class SilentNotifier:
         return None
 
 
+class FakeNoteRenderer:
+    def render(self, materials):
+        return f"# {materials.get('title', '未命名内容')}\n\n{materials.get('summary', {}).get('conclusion', '')}\n"
+
+
 class StaticExtractor:
     def extract(self, request: IngestRequest) -> EvidenceBundle:
         return EvidenceBundle(
@@ -146,6 +151,7 @@ class RobotEntryReplayTest(unittest.TestCase):
                 processor = WorkflowProcessor(_config(tmp), jobs, ReplaySummarizer(), state_dir)
                 processor.extractor = StaticExtractor()
                 processor.notifier = SilentNotifier()
+                processor.writer.renderer = FakeNoteRenderer()
                 processor.start()
                 ingest = IngestRequest.from_dict(case["payload"])
                 processor.enqueue(ingest)

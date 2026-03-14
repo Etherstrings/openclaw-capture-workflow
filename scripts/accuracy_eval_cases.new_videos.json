@@ -1,5 +1,21 @@
 [
   {
+    "id": "milky_bilibili_video",
+    "source_kind": "video_url",
+    "source_url": "https://www.bilibili.com/video/BV1bFPMzFEnd/?spm_id_from=333.337.search-card.all.click&vd_source=74b26c8022b2f0d66e2448dfc0bf6ea1",
+    "video_probe_seconds": 240,
+    "expect": {
+      "required_links": [
+        "https://www.bilibili.com/video/BV1bFPMzFEnd"
+      ],
+      "forbidden_phrases": [
+        "模型不可用",
+        "给不熟悉的人"
+      ],
+      "min_evidence_chars": 120
+    }
+  },
+  {
     "id": "new_bilibili_video",
     "source_kind": "video_url",
     "source_url": "https://www.bilibili.com/video/BV1tyNNzxEpK/?spm_id_from=333.1007.tianma.1-2-2.click",

@@ -55,6 +55,27 @@
     "dry_run_skip_video_audio": true,
     "dry_run_skip_video_keyframes": true
   },
+  "analysis": {
+    "model": "gpt-5-mini",
+    "fallback_model": "gpt-5.4",
+    "browser_backend": "playwright",
+    "page_timeout_seconds": 30,
+    "max_images": 6,
+    "max_videos": 3,
+    "max_tables": 6,
+    "max_video_frames": 8,
+    "temp_root": "tmp",
+    "pinchtab_base_url": ""
+  },
+  "video_summary": {
+    "provider": "aihubmix_gemini",
+    "transport": "openai_compat",
+    "api_base_url": "https://aihubmix.com/v1",
+    "api_key": "${SUMMARIZER_API_KEY}",
+    "model": "gemini-2.5-pro",
+    "fallback_model": "gemini-2.5-flash",
+    "timeout_seconds": 60
+  },
   "summary_routing": {
     "enabled": false,
     "upgrade_model": "gpt-4.1",

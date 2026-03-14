@@ -55,19 +55,13 @@ class AccuracyEvalTest(unittest.TestCase):
     def test_note_step_detects_forbidden_sections(self) -> None:
         note = """# 标题
 
-## 一句话总结
-测试
+## 这是什么
+这是一个测试页面。
 
-## 核心事实
+## 核心信息
 - a
 - b
 - c
-
-## 关键证据
-- d
-
-## 专业解读
-测试
 
 ## 步骤细节
 1. 不应出现
@@ -83,19 +77,13 @@ class AccuracyEvalTest(unittest.TestCase):
     def test_note_step_requires_action_checklist_when_expected(self) -> None:
         note = """# 标题
 
-## 一句话总结
-测试
+## 这是什么
+这是一个测试页面。
 
-## 核心事实
+## 核心信息
 - a
 - b
 - c
-
-## 关键证据
-- d
-
-## 专业解读
-测试
 
 ## 来源
 - https://example.com
@@ -103,7 +91,13 @@ class AccuracyEvalTest(unittest.TestCase):
         expect = EvalExpectation(require_action_checklist=True)
         step = evaluate_note_step(note, expect)
         self.assertFalse(step.passed)
-        self.assertTrue(any("执行清单" in item for item in step.missing))
+        self.assertTrue(any("expected_procedure" in item for item in step.missing))
+
+    def test_note_step_blocks_old_template_phrases(self) -> None:
+        note = "# 标题\n\n帮助你快速理解\n\n## 核心事实\n- a\n"
+        step = evaluate_note_step(note, EvalExpectation())
+        self.assertFalse(step.passed)
+        self.assertTrue(any("帮助你快速理解" in item or "## 核心事实" in item for item in step.forbidden_hits))
 
     def test_root_cause_priority(self) -> None:
         extract_step = StepScore(score=0.4, passed=False)

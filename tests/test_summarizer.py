@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.models import EvidenceBundle, SummaryResult
-from openclaw_capture_workflow.summarizer import PROMPT, _validate_and_normalize_summary
+from openclaw_capture_workflow.summarizer import PROMPT, _extract_explicit_video_outline, _validate_and_normalize_summary
 
 
 class SummarizerPostprocessTest(unittest.TestCase):
@@ -105,6 +105,119 @@ class SummarizerPostprocessTest(unittest.TestCase):
         )
         normalized = _validate_and_normalize_summary(summary, evidence)
         self.assertEqual(normalized.title, "演示视频")
+
+    def test_video_story_blocks_replace_raw_asr_fragments(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+            platform_hint="bilibili",
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            text="视频证据",
+            transcript="今天给大家介绍一个用龙虾做的一件事情最后会在每天早上开盘之前给你一个自选股分析",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={
+                "video_story_blocks": [
+                    {
+                        "label": "core_topic",
+                        "summary": "视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。",
+                        "evidence": ["标题: OpenClaw你虾哥每天股票量化交易推荐"],
+                    },
+                    {
+                        "label": "workflow",
+                        "summary": "流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。",
+                        "evidence": ["[00:16] 最后会在每天早上开盘之前"],
+                    },
+                    {
+                        "label": "risk",
+                        "summary": "视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。",
+                        "evidence": ["简介: 图一乐 别真跟着买 当然我跟着买了"],
+                    },
+                ]
+            },
+        )
+        summary = SummaryResult(
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            primary_topic="视频",
+            secondary_topics=[],
+            entities=[],
+            conclusion="视频介绍了一个流程。",
+            bullets=[
+                "1. 今天给大家介绍一个用龙虾做的一件事情最后会在每天早上开盘之前给你一个自选股分析",
+                "2. 给你一个当天的自选股分析并给出建议",
+                "3. 图一乐别真跟着买",
+            ],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertEqual(
+            normalized.bullets,
+            [
+                "1. 视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。",
+                "2. 流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。",
+                "3. 视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。",
+            ],
+        )
+
+    def test_video_story_blocks_do_not_invent_viewer_feedback(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+            platform_hint="bilibili",
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            text="视频证据",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={
+                "viewer_feedback": [],
+                "video_story_blocks": [
+                    {"label": "core_topic", "summary": "视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。", "evidence": []},
+                    {"label": "workflow", "summary": "流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。", "evidence": []},
+                    {"label": "risk", "summary": "视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。", "evidence": []},
+                ],
+            },
+        )
+        summary = SummaryResult(
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            primary_topic="视频",
+            secondary_topics=[],
+            entities=[],
+            conclusion="视频介绍了一个流程。",
+            bullets=["无关紧要", "另一个无关紧要", "第三个无关紧要"],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertEqual(len(normalized.bullets), 3)
+        self.assertFalse(any("评论区" in item or "观众" in item for item in normalized.bullets))
+
+    def test_explicit_video_outline_does_not_use_summary_bullets_as_evidence(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+            platform_hint="bilibili",
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            text="视频证据",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={},
+        )
+        points = _extract_explicit_video_outline(
+            evidence,
+            [
+                "1. 视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。",
+                "2. 流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。",
+                "3. 视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。",
+            ],
+        )
+        self.assertEqual(points, [])
 
     def test_tutorial_follow_up_actions_are_enriched_from_commands(self) -> None:
         evidence = EvidenceBundle(

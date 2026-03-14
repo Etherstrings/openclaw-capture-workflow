@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from .config import AppConfig, SummarizerConfig
 from .extractor import EvidenceExtractor
 from .models import EvidenceBundle, IngestRequest, SummaryResult
+from .note_renderer import OpenAICompatibleNoteRenderer
 from .obsidian import ObsidianWriter
 from .processor import _build_fallback_summary
 from .summarizer import OpenAICompatibleSummarizer
@@ -270,17 +271,6 @@ def evaluate_summary_step(summary: SummaryResult, expect: EvalExpectation) -> St
 
 
 def evaluate_note_step(note_content: str, expect: EvalExpectation) -> StepScore:
-    required_sections = [
-        "## 一句话总结",
-        "## 核心事实",
-        "## 关键证据",
-        "## 专业解读",
-        "## 来源",
-    ]
-    if expect.require_action_checklist:
-        required_sections.append("## 执行清单")
-    section_hit = sum(1 for item in required_sections if item in note_content)
-    section_ratio = section_hit / len(required_sections)
     lines = [line.strip() for line in note_content.splitlines() if line.strip()]
     unique_ratio = (len(set(lines)) / len(lines)) if lines else 0.0
     duplication_penalty = 0.0
@@ -289,11 +279,36 @@ def evaluate_note_step(note_content: str, expect: EvalExpectation) -> StepScore:
         duplication_penalty = min(0.35, (0.72 - unique_ratio) * 0.8)
         notes.append(f"duplicate_ratio_low:{round(unique_ratio, 3)}")
     coverage, missing = _evaluate_expected_recall(note_content, expect)
-    if expect.require_action_checklist and "## 执行清单" not in note_content:
-        missing.append("section:执行清单")
-    forbidden = _forbidden_hits(note_content, expect, extra_forbidden=["步骤细节", "图片与帧（后置）"])
+    length_score = min(1.0, len(_normalize_text(note_content)) / 240) if note_content.strip() else 0.0
+    if expect.require_action_checklist and not re.search(r"/install-skill|执行|安装|验证|运行|步骤", note_content):
+        missing.append("action:expected_procedure")
+    forbidden = _forbidden_hits(
+        note_content,
+        expect,
+        extra_forbidden=[
+            "步骤细节",
+            "图片与帧（后置）",
+            "## 一句话总结",
+            "## 文字脑图",
+            "## 对你有什么用",
+            "## 贾维斯判断",
+            "## 项目与链接",
+            "## 关联笔记",
+            "## 核心事实",
+            "## 执行清单",
+            "## 关键证据",
+            "## 专业解读",
+            "## 可信度与局限",
+            "## 关键词",
+            "帮助你快速理解",
+            "已提取核心事实",
+            "对你有用",
+            "推荐等级",
+            "大厂程序员视角",
+        ],
+    )
     forbidden_penalty = min(0.4, 0.2 * len(forbidden))
-    score = max(0.0, 0.45 * section_ratio + 0.45 * coverage + 0.1 * unique_ratio - duplication_penalty - forbidden_penalty)
+    score = max(0.0, 0.55 * coverage + 0.30 * length_score + 0.15 * unique_ratio - duplication_penalty - forbidden_penalty)
     passed = score >= 0.7 and not missing and not forbidden
     return StepScore(score=score, passed=passed, missing=missing, forbidden_hits=forbidden, notes=notes)
 
@@ -636,8 +651,6 @@ def run_accuracy_eval(
     if max_cases > 0:
         cases = cases[: max_cases]
 
-    extractor = EvidenceExtractor(config, state_dir / "artifacts")
-    writer = ObsidianWriter(config.obsidian)
     effective_summary_cfg = config.summarizer
     if summary_mode == "model" and summary_model.strip():
         effective_summary_cfg = SummarizerConfig(
@@ -646,6 +659,12 @@ def run_accuracy_eval(
             model=summary_model.strip(),
             timeout_seconds=config.summarizer.timeout_seconds,
         )
+    extractor = EvidenceExtractor(config, state_dir / "artifacts")
+    writer = ObsidianWriter(
+        config.obsidian,
+        renderer=OpenAICompatibleNoteRenderer(effective_summary_cfg),
+        materials_root=state_dir / "materials",
+    )
     summarizer = OpenAICompatibleSummarizer(effective_summary_cfg) if summary_mode == "model" else None
 
     judge_config = None

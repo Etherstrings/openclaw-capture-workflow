@@ -10,18 +10,26 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .config import ObsidianConfig
 from .models import EvidenceBundle, SummaryResult
+from .note_renderer import NoteRenderEngine, build_note_materials, save_materials_file
 from .note_graph import build_structure_map, safe_name, unique_topics
 
 
 class ObsidianWriter:
-    def __init__(self, config: ObsidianConfig) -> None:
+    def __init__(
+        self,
+        config: ObsidianConfig,
+        renderer: NoteRenderEngine | None = None,
+        materials_root: Path | None = None,
+    ) -> None:
         self.config = config
+        self.renderer = renderer
         self.vault_path = Path(config.vault_path).expanduser()
         self.vault_name = self.vault_path.name
         self.topic_whitelist = set(config.auto_topic_whitelist)
         self.topic_blocklist = tuple(config.auto_topic_blocklist)
+        self.materials_root = materials_root or (self.vault_path.parent / "state" / "materials")
 
-    def write(self, summary: SummaryResult, evidence: EvidenceBundle) -> Dict[str, object]:
+    def write(self, summary: SummaryResult, evidence: EvidenceBundle, use_model_render: bool = False) -> Dict[str, object]:
         note_rel = self._resolve_note_rel(summary, evidence)
         inbox_dir = (self.vault_path / note_rel).parent
         inbox_dir.mkdir(parents=True, exist_ok=True)
@@ -31,56 +39,87 @@ class ObsidianWriter:
         self._remove_note_from_all_topic_indexes(note_rel.as_posix())
         topic_links = self._update_topic_indexes(linked_topics, note_rel.as_posix())
         self._prune_empty_topic_indexes()
+        keyword_l1, keyword_l2 = self._extract_keyword_hierarchy(summary, evidence)
+        self._remove_note_from_all_keyword_indexes(note_rel.as_posix())
+        keyword_links = self._update_keyword_indexes(keyword_l1, keyword_l2, note_rel.as_posix())
         entity_links = self._update_entity_pages(summary, note_rel.as_posix()) if self.config.auto_entity_pages else []
         structure_map = build_structure_map(summary, evidence, note_rel.as_posix(), topic_links, entity_links)
-        content = self._render_note_content(
+        content, note_render_error, materials_file = self._render_note_content(
             summary=summary,
             evidence=evidence,
             structure_map=structure_map,
             topic_links=topic_links,
             entity_links=entity_links,
+            keyword_l1=keyword_l1,
+            keyword_l2=keyword_l2,
+            keyword_links=keyword_links,
             skipped_topics=skipped_topics,
+            use_model_render=use_model_render,
         )
-
-        path = self.vault_path / note_rel
-        path.write_text(content, encoding="utf-8")
-        return {
+        payload = {
             "note_path": note_rel.as_posix(),
             "obsidian_uri": self._obsidian_uri(note_rel.as_posix()),
             "title": summary.title,
             "primary_topic": summary.primary_topic,
             "secondary_topics": ",".join(summary.secondary_topics),
             "topic_links": topic_links,
+            "keyword_l1": keyword_l1 or "",
+            "keyword_l2": ",".join(keyword_l2),
+            "keyword_links": keyword_links,
             "entity_links": entity_links,
             "structure_map": structure_map,
         }
+        if materials_file:
+            payload["materials_file"] = materials_file
+        if note_render_error:
+            payload["note_render_error"] = note_render_error
+            return payload
+        assert content is not None
+        path = self.vault_path / note_rel
+        path.write_text(content, encoding="utf-8")
+        return payload
 
-    def preview(self, summary: SummaryResult, evidence: EvidenceBundle) -> Dict[str, object]:
+    def preview(self, summary: SummaryResult, evidence: EvidenceBundle, use_model_render: bool = False) -> Dict[str, object]:
         note_rel = self._resolve_note_rel(summary, evidence)
         linked_topics = self._select_topics(summary)
         skipped_topics = [topic for topic in unique_topics(summary) if topic not in linked_topics]
         topic_links = self._build_topic_links(linked_topics)
+        keyword_l1, keyword_l2 = self._extract_keyword_hierarchy(summary, evidence)
+        keyword_links = self._build_keyword_links(keyword_l1, keyword_l2)
         entity_links = self._build_entity_links(summary) if self.config.auto_entity_pages else []
         structure_map = build_structure_map(summary, evidence, note_rel.as_posix(), topic_links, entity_links)
-        content = self._render_note_content(
+        content, note_render_error, materials_file = self._render_note_content(
             summary=summary,
             evidence=evidence,
             structure_map=structure_map,
             topic_links=topic_links,
             entity_links=entity_links,
+            keyword_l1=keyword_l1,
+            keyword_l2=keyword_l2,
+            keyword_links=keyword_links,
             skipped_topics=skipped_topics,
+            use_model_render=use_model_render,
         )
-        return {
+        payload = {
             "note_path": note_rel.as_posix(),
             "obsidian_uri": self._obsidian_uri(note_rel.as_posix()),
             "title": summary.title,
             "primary_topic": summary.primary_topic,
             "secondary_topics": ",".join(summary.secondary_topics),
             "topic_links": topic_links,
+            "keyword_l1": keyword_l1 or "",
+            "keyword_l2": ",".join(keyword_l2),
+            "keyword_links": keyword_links,
             "entity_links": entity_links,
             "structure_map": structure_map,
-            "content": content,
         }
+        if content is not None:
+            payload["content"] = content
+        if materials_file:
+            payload["materials_file"] = materials_file
+        if note_render_error:
+            payload["note_render_error"] = note_render_error
+        return payload
 
     def _resolve_note_rel(self, summary: SummaryResult, evidence: EvidenceBundle) -> Path:
         now = datetime.now()
@@ -115,8 +154,12 @@ class ObsidianWriter:
         structure_map: str,
         topic_links: List[str],
         entity_links: List[str],
+        keyword_l1: str | None,
+        keyword_l2: List[str],
+        keyword_links: List[str],
         skipped_topics: List[str],
-    ) -> str:
+        use_model_render: bool = False,
+    ) -> tuple[str | None, str | None, str]:
         canonical_source_url = self._canonical_source_url(evidence.source_url)
         frontmatter = [
             "---",
@@ -126,116 +169,341 @@ class ObsidianWriter:
             f"captured_at: {datetime.now().isoformat(timespec='seconds')}",
             f"source_url: {canonical_source_url or ''}",
             f"content_profile: {evidence.metadata.get('content_profile', {}).get('kind', '') if isinstance(evidence.metadata, dict) else ''}",
+            f"keyword_l1: {keyword_l1 or ''}",
+            f"keyword_l2: {','.join(keyword_l2)}",
             "---",
             "",
         ]
-        signals = evidence.metadata.get("signals", {}) if isinstance(evidence.metadata, dict) else {}
-        priority_project_lines: List[str] = []
-        if isinstance(signals, dict):
-            if signals.get("projects"):
-                priority_project_lines.append("- 项目名称: " + " | ".join([str(item) for item in signals["projects"][:1]]))
-            links = [self._canonical_source_url(str(item)) for item in signals.get("links", []) if str(item).strip()]
-            repo_links = [item for item in links if "github.com/" in item.lower() and "/raw/" not in item.lower() and not item.lower().endswith(".skill")]
-            raw_skill_links = [item for item in links if item not in repo_links and ("github.com/" in item.lower() or item.lower().endswith(".skill"))]
-            non_github_links = [item for item in links if item not in repo_links and item not in raw_skill_links]
-            if repo_links:
-                priority_project_lines.append("- GitHub地址: " + " | ".join(repo_links[:2]))
-            elif raw_skill_links:
-                priority_project_lines.append("- GitHub地址: " + " | ".join(raw_skill_links[:1]))
-            elif non_github_links:
-                label = "视频链接" if evidence.source_kind == "video_url" else "关键链接"
-                priority_project_lines.append("- " + label + ": " + " | ".join(non_github_links[:2]))
-            if raw_skill_links:
-                priority_project_lines.append("- Skill文件: " + " | ".join(raw_skill_links[:1]))
-            if signals.get("skills"):
-                priority_project_lines.append("- 技能名: " + " | ".join([str(item) for item in signals["skills"][:2]]))
-            if signals.get("skill_ids"):
-                priority_project_lines.append("- 技能ID: " + " | ".join([str(item) for item in signals["skill_ids"][:2]]))
-            if signals.get("commands"):
-                label = "安装方法" if any("install" in str(item).lower() or "/install-skill" in str(item).lower() for item in signals["commands"]) else "关键命令"
-                priority_project_lines.append("- " + label + ": " + " | ".join([str(item) for item in signals["commands"][:2]]))
-            if signals.get("use_cases"):
-                priority_project_lines.append("- 使用方式: " + " | ".join([self._clip_signal_line(str(item), 100) for item in signals["use_cases"][:2]]))
-            elif signals.get("purposes"):
-                priority_project_lines.append("- 核心用途: " + " | ".join([self._clip_signal_line(str(item), 100) for item in signals["purposes"][:2]]))
-        concise_bullets = self._dedupe_core_bullets(summary.bullets)
-        if evidence.source_kind == "video_url":
-            concise_bullets = concise_bullets[:4]
-        compact_evidence_lines = self._compact_evidence_lines(evidence.text, evidence.source_url)
-        if evidence.source_kind == "video_url":
-            compact_evidence_lines = compact_evidence_lines[:3]
-        analysis_paragraph = self._build_explainer_paragraph(summary, signals, evidence.source_kind)
-        highlighted_conclusion = re.sub(r"\s+", " ", (summary.conclusion or "").strip()) or "（无可提取结论）"
-        action_items = self._build_action_items(summary.follow_up_actions)
-        keywords_line = self._build_keyword_badges(summary, signals)
-        usefulness_lines = self._build_usefulness_lines(summary, evidence, signals)
-        related_links = self._build_related_links(topic_links, entity_links)
-        text_mind_map = self._build_text_mind_map(
-            title=summary.title,
-            conclusion=highlighted_conclusion,
+        materials = build_note_materials(
             summary=summary,
             evidence=evidence,
-            project_lines=priority_project_lines,
-            action_items=action_items if 'action_items' in locals() else [],
-            related_links=related_links,
+            structure_map=structure_map,
+            topic_links=topic_links,
+            entity_links=entity_links,
+            keyword_links=keyword_links,
+            skipped_topics=skipped_topics,
+            canonical_source_url=canonical_source_url,
         )
+        materials_file = save_materials_file(
+            materials,
+            self.materials_root,
+            summary.title,
+        )
+        if self.renderer is None:
+            return None, "note renderer unavailable", materials_file
+        try:
+            body = self.renderer.render(materials)
+        except Exception as exc:
+            return None, str(exc), materials_file
+        if not body or not str(body).strip():
+            return None, "note renderer returned empty content", materials_file
+        polished_body = self._polish_rendered_body(str(body), summary, evidence, materials)
+        content = "\n".join(frontmatter) + polished_body.rstrip() + "\n"
+        return content, None, materials_file
 
-        body = [
-            f"# {summary.title}",
-            "",
-            "## 一句话总结",
-            highlighted_conclusion,
-            "",
-            "## 文字脑图",
-            "```text",
-            text_mind_map,
-            "```",
-            "",
+    def _polish_rendered_body(
+        self,
+        body: str,
+        summary: SummaryResult,
+        evidence: EvidenceBundle,
+        materials: Dict[str, object],
+    ) -> str:
+        text = str(body or "").strip()
+        if not text:
+            return text
+        text = self._strip_debug_leaks(text)
+        capture_status = {}
+        context = materials.get("context", {}) if isinstance(materials, dict) else {}
+        if isinstance(context, dict):
+            capture_status = context.get("capture_status", {}) if isinstance(context.get("capture_status"), dict) else {}
+        if capture_status.get("kind") == "video_extract_blocked":
+            return self._build_blocked_video_body(summary, evidence, capture_status)
+        text = re.sub(
+            r"(?m)^(#{2,4})\s*可直接做的下一步\s*$",
+            r"\1 贾维斯的思考",
+            text,
+        )
+        if not self._should_keep_thought_checklist(summary, evidence):
+            text = self._rewrite_thought_section_as_paragraph(text, evidence)
+        return text
+
+    def _strip_debug_leaks(self, text: str) -> str:
+        blocked_tokens = [
+            "python 3.9",
+            "yt-dlp",
+            "unsupported url",
+            "traceback",
+            "systemexit(",
+            "deprecated feature",
         ]
-        if usefulness_lines:
-            body.extend(["## 对你有什么用"])
-            body.extend(f"- {line}" for line in usefulness_lines)
-            body.append("")
-        judgment_lines = self._build_secretary_judgment_lines(summary)
-        if judgment_lines:
-            body.extend(["## 贾维斯判断"])
-            body.extend(f"- {line}" for line in judgment_lines)
-            body.append("")
-        if priority_project_lines:
-            body.extend(
-                [
-                    "## 项目与链接",
-                    *priority_project_lines,
-                    "",
-                ]
+        cleaned_lines: List[str] = []
+        for line in text.splitlines():
+            lowered = line.lower()
+            if any(token in lowered for token in blocked_tokens):
+                continue
+            cleaned_lines.append(line.rstrip())
+        return "\n".join(cleaned_lines).strip()
+
+    def _build_blocked_video_body(
+        self,
+        summary: SummaryResult,
+        evidence: EvidenceBundle,
+        capture_status: Dict[str, object],
+    ) -> str:
+        title = summary.title or evidence.title or "这条内容"
+        summary_line = re.sub(r"\s+", " ", str(capture_status.get("summary", "")).strip())
+        if not summary_line:
+            summary_line = "这条内容当前没拿到有效正文，继续看这版结果意义不大。"
+        paragraphs = [
+            f"# {title}",
+            "",
+            f"{summary_line} 现在只能确认它来自平台侧受限或分享链路不可直接读取，而不是内容本身没有价值。",
+            "",
+            "如果之后能拿到正常页面、音频或画面证据，再回来看会更有意义；以目前这版结果，先别在这条上继续花时间。",
+            "",
+            "## 贾维斯的思考",
+            "",
+            "如果我是你，这条我会先放到一边，等链接能正常打开或者能拿到可读内容后再判断值不值得深挖。",
+        ]
+        return "\n".join(paragraphs).strip()
+
+    def _should_keep_thought_checklist(self, summary: SummaryResult, evidence: EvidenceBundle) -> bool:
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        profile = metadata.get("content_profile", {}) if isinstance(metadata.get("content_profile"), dict) else {}
+        kind = str(profile.get("kind", "")).strip()
+        if kind in {"installation_tutorial", "skill_recommendation"}:
+            return True
+        actions = [str(item).strip() for item in summary.follow_up_actions if str(item).strip()]
+        action_corpus = "\n".join(actions).lower()
+        return any(token in action_corpus for token in ["/install-skill", "执行命令", "验证", "安装", "部署", "运行"])
+
+    def _rewrite_thought_section_as_paragraph(self, text: str, evidence: EvidenceBundle) -> str:
+        lines = text.splitlines()
+        result: List[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            heading_match = re.match(r"^(#{2,4})\s*(贾维斯的思考)\s*$", line.strip())
+            if not heading_match:
+                result.append(line)
+                i += 1
+                continue
+            level = heading_match.group(1)
+            result.append(f"{level} 贾维斯的思考")
+            i += 1
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            section_lines: List[str] = []
+            while i < len(lines) and not re.match(r"^#{1,6}\s+", lines[i].strip()):
+                section_lines.append(lines[i])
+                i += 1
+            actions: List[str] = []
+            for raw in section_lines:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                bullet_match = re.match(r"^(?:[-*]|\d+\.)\s+(.+)$", stripped)
+                if bullet_match:
+                    actions.append(bullet_match.group(1).strip().rstrip("。；;"))
+                else:
+                    actions.append(stripped.rstrip("。；;"))
+            actions = [item for item in actions if item]
+            if actions:
+                result.append("")
+                result.append(self._jarvis_thought_paragraph(actions, evidence))
+            continue
+        return "\n".join(result).strip()
+
+    def _jarvis_thought_paragraph(self, actions: List[str], evidence: EvidenceBundle) -> str:
+        picked = [self._normalize_jarvis_action(item) for item in actions[:3] if self._normalize_jarvis_action(item)]
+        if not picked:
+            return "如果我是你，我会先把这条内容留在待看清单里，等真正需要的时候再回来看。"
+        if len(picked) == 1:
+            if picked[0].startswith("如果我是你"):
+                return picked[0].rstrip("。；;") + "。"
+            return f"如果我是你，我会先{picked[0]}，然后再决定要不要继续往下投入。"
+        if len(picked) == 2:
+            return f"如果我是你，我会先{picked[0]}，再{picked[1]}，这样基本就能判断这条内容值不值得继续跟。"
+        return f"如果我是你，我会先{picked[0]}，再{picked[1]}，最后{picked[2]}；走到这一步，通常就知道这条内容该继续深挖还是先放着。"
+
+    def _normalize_jarvis_action(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
+        if not text:
+            return ""
+        text = re.sub(r"^如果我是你[，,]?(?:这条我)?会先", "", text).strip(" ，,")
+        text = re.sub(r"^我会先", "", text).strip(" ，,")
+        return text
+
+    def _keyword_root_rel(self) -> Path:
+        return Path(self.config.topics_root) / "_Keywords"
+
+    def _keyword_root_path(self) -> Path:
+        return self.vault_path / self._keyword_root_rel()
+
+    def _build_keyword_links(self, keyword_l1: str | None, keyword_l2: List[str]) -> List[str]:
+        if not keyword_l1:
+            return []
+        links: List[str] = []
+        primary_name = safe_name(keyword_l1)
+        primary_rel = self._keyword_root_rel() / primary_name / f"{primary_name} Index.md"
+        links.append(f"[[{primary_rel.as_posix()}]]")
+        for keyword in keyword_l2:
+            secondary_name = safe_name(keyword)
+            secondary_rel = self._keyword_root_rel() / primary_name / f"{secondary_name}.md"
+            links.append(f"[[{secondary_rel.as_posix()}]]")
+        return links
+
+    def _update_keyword_indexes(self, keyword_l1: str | None, keyword_l2: List[str], note_rel_path: str) -> List[str]:
+        if not keyword_l1:
+            return []
+        keyword_root = self._keyword_root_path()
+        primary_name = safe_name(keyword_l1)
+        primary_dir = keyword_root / primary_name
+        primary_dir.mkdir(parents=True, exist_ok=True)
+        primary_rel = self._keyword_root_rel() / primary_name / f"{primary_name} Index.md"
+        primary_path = self.vault_path / primary_rel
+        primary_text = primary_path.read_text(encoding="utf-8") if primary_path.exists() else f"# {keyword_l1}\n\n## 二级关键词\n\n## 相关笔记\n"
+        note_entry = f"- [[{note_rel_path}]]"
+        if note_entry not in primary_text:
+            primary_text = primary_text.rstrip() + "\n" + note_entry + "\n"
+        for keyword in keyword_l2:
+            secondary_name = safe_name(keyword)
+            secondary_rel = self._keyword_root_rel() / primary_name / f"{secondary_name}.md"
+            secondary_entry = f"- [[{secondary_rel.as_posix()}]]"
+            if secondary_entry not in primary_text:
+                primary_text = primary_text.rstrip() + "\n" + secondary_entry + "\n"
+            secondary_path = self.vault_path / secondary_rel
+            secondary_path.parent.mkdir(parents=True, exist_ok=True)
+            secondary_text = (
+                secondary_path.read_text(encoding="utf-8")
+                if secondary_path.exists()
+                else f"# {keyword}\n\n上级关键词: [[{primary_rel.as_posix()}]]\n\n## 相关笔记\n"
             )
-        if related_links:
-            body.extend(["## 关联笔记"])
-            body.extend(f"- {line}" for line in related_links)
-            body.append("")
-        body.extend(["## 核心事实"])
-        if concise_bullets:
-            body.extend(f"- {bullet}" for bullet in concise_bullets)
-        else:
-            body.append("- 未提取到稳定要点。")
-        if action_items:
-            body.extend(["", "## 执行清单"])
-            body.extend(f"{idx + 1}. {item}" for idx, item in enumerate(action_items))
-        body.extend(["", "## 关键证据"])
-        if compact_evidence_lines:
-            body.extend(f"- {line}" for line in compact_evidence_lines)
-        else:
-            body.append("- （无可提取正文）")
-        body.extend(["", "## 专业解读", analysis_paragraph])
-        video_reliability_lines = self._build_video_reliability_lines(evidence)
-        if video_reliability_lines:
-            body.extend(["", "## 可信度与局限"])
-            body.extend(f"- {line}" for line in video_reliability_lines)
-        if canonical_source_url:
-            body.extend(["", "## 来源", f"- {canonical_source_url}"])
-        if keywords_line:
-            body.extend(["", "## 关键词", keywords_line])
-        return "\n".join(frontmatter + body) + "\n"
+            if note_entry not in secondary_text:
+                secondary_text = secondary_text.rstrip() + "\n" + note_entry + "\n"
+            secondary_path.write_text(secondary_text, encoding="utf-8")
+        primary_path.write_text(primary_text, encoding="utf-8")
+        return self._build_keyword_links(keyword_l1, keyword_l2)
+
+    def _remove_note_from_all_keyword_indexes(self, note_rel_path: str) -> None:
+        keyword_root = self._keyword_root_path()
+        if not keyword_root.exists():
+            return
+        entry = f"- [[{note_rel_path}]]"
+        for keyword_path in keyword_root.rglob("*.md"):
+            existing = keyword_path.read_text(encoding="utf-8")
+            if entry not in existing:
+                continue
+            lines = [line for line in existing.splitlines() if line.strip() != entry]
+            keyword_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    def _extract_keyword_hierarchy(self, summary: SummaryResult, evidence: EvidenceBundle) -> tuple[str | None, List[str]]:
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
+        generic = {"未分类", "视频", "图文", "内容", "链接", "网页", "文章"}
+
+        def normalize(value: str) -> str:
+            return re.sub(r"\s+", " ", str(value).strip()).strip("#[]()")
+
+        def reasonable(value: str) -> bool:
+            text = normalize(value)
+            if not text or text in generic:
+                return False
+            if len(text) < 2 or len(text) > 36:
+                return False
+            if text.startswith(("http://", "https://")):
+                return False
+            return True
+
+        corpus_parts = [
+            summary.title,
+            summary.primary_topic,
+            *summary.secondary_topics,
+            *summary.entities,
+            *summary.note_tags,
+            summary.conclusion,
+            *summary.bullets,
+            evidence.title or "",
+            evidence.text or "",
+        ]
+        if isinstance(signals, dict):
+            for key in ["skills", "skill_ids", "projects", "hashtags"]:
+                values = signals.get(key, [])
+                if isinstance(values, list):
+                    corpus_parts.extend([str(item) for item in values[:6]])
+        bilibili_tags = metadata.get("bilibili_tags", []) if isinstance(metadata.get("bilibili_tags"), list) else []
+        corpus_parts.extend([str(item) for item in bilibili_tags[:8]])
+        corpus = "\n".join([normalize(item) for item in corpus_parts if normalize(item)]).lower()
+
+        def token_hit(token: str) -> bool:
+            lowered = token.lower()
+            if re.fullmatch(r"[a-z0-9.+_-]+", lowered) and len(lowered) <= 4:
+                return bool(re.search(rf"\b{re.escape(lowered)}\b", corpus))
+            return lowered in corpus
+
+        category_rules = [
+            ("网络安全", ["0day", "漏洞", "二进制", "逆向", "摄像头", "iot", "安全", "exploit", "kali", "ida"]),
+            ("游戏", ["杀戮尖塔", "游戏", "卡牌", "流派", "攻略", "boss", "肉鸽", "steam"]),
+            ("股票投资", ["股票", "财报", "量化", "交易", "自选股", "美股", "投资", "大盘", "行情"]),
+            ("出海SaaS", ["saas", "出海", "支付", "海外公司", "订阅", "billing"]),
+            ("求职职场", ["薪资", "求职", "面试", "背调", "offer", "职场", "工资"]),
+            ("知识管理", ["obsidian", "知识管理", "笔记", "pkm", "claudian"]),
+            ("饮食健康", ["热量", "减脂", "饮食", "外出就餐", "大卡", "包子", "鸡蛋粥"]),
+            ("人物访谈", ["访谈", "方法论", "人生", "美国梦", "老兵", "故事", "对话"]),
+            ("AI工具", ["openclaw", "claude", "gpt", "ai", "agent", "skill", "rag", "模型"]),
+            ("编程开发", ["python", "kubernetes", "container runtime", "nodejs", "开发", "编程", "runtime", "docker"]),
+            ("开源项目", ["github", "开源", "repo", "仓库", "project"]),
+            ("效率工具", ["效率", "工作流", "自动化", "生产力", "工具"]),
+        ]
+        keyword_l1 = None
+        for label, tokens in category_rules:
+            if any(token_hit(token) for token in tokens):
+                keyword_l1 = label
+                break
+        if keyword_l1 is None:
+            primary_candidates = [
+                summary.primary_topic,
+                *summary.secondary_topics,
+                *summary.entities,
+            ]
+            if isinstance(signals, dict):
+                primary_candidates.extend([str(item) for item in signals.get("skills", [])[:2]])
+                primary_candidates.extend([str(item) for item in signals.get("projects", [])[:1]])
+            keyword_l1 = next((normalize(item) for item in primary_candidates if reasonable(item)), None)
+
+        secondary_candidates: List[str] = []
+        secondary_candidates.extend([normalize(item) for item in summary.secondary_topics if reasonable(item)])
+        secondary_candidates.extend([normalize(item) for item in summary.entities if reasonable(item)])
+        secondary_candidates.extend([normalize(item) for item in summary.note_tags if reasonable(item)])
+        secondary_candidates.extend([normalize(str(item)) for item in bilibili_tags if reasonable(str(item))])
+        if isinstance(signals, dict):
+            secondary_candidates.extend([normalize(str(item)) for item in signals.get("skills", [])[:3] if reasonable(str(item))])
+            secondary_candidates.extend([normalize(str(item)) for item in signals.get("skill_ids", [])[:3] if reasonable(str(item))])
+            secondary_candidates.extend([normalize(str(item)) for item in signals.get("projects", [])[:2] if reasonable(str(item))])
+        title = normalize(evidence.title or summary.title)
+        title_patterns = [
+            r"(杀戮尖塔\d?)",
+            r"(OpenClaw)",
+            r"(Claudian)",
+            r"(Trading Agents)",
+            r"(OpenRAG)",
+            r"(DCS\d+[A-Z]?)",
+            r"(0day)",
+            r"(Obsidian)",
+        ]
+        for pattern in title_patterns:
+            match = re.search(pattern, title, flags=re.IGNORECASE)
+            if match:
+                secondary_candidates.append(normalize(match.group(1)))
+
+        keyword_l2: List[str] = []
+        for item in secondary_candidates:
+            if not item or item == keyword_l1 or item in keyword_l2:
+                continue
+            keyword_l2.append(item)
+            if len(keyword_l2) >= 4:
+                break
+        return keyword_l1, keyword_l2
 
     def _build_related_links(self, topic_links: List[str], entity_links: List[str]) -> List[str]:
         links: List[str] = []
@@ -906,7 +1174,15 @@ class ObsidianWriter:
         topics_root = self.vault_path / self.config.topics_root
         if not topics_root.exists():
             return
-        for topic_path in topics_root.rglob("* Index.md"):
+        try:
+            topic_paths = list(topics_root.rglob("* Index.md"))
+        except FileNotFoundError:
+            return
+        for topic_path in topic_paths:
+            if "_Keywords" in topic_path.parts:
+                continue
+            if not topic_path.exists():
+                continue
             lines = topic_path.read_text(encoding="utf-8").splitlines()
             has_note_link = any(line.strip().startswith("- [[") and line.strip().endswith("]]") for line in lines)
             if has_note_link:
@@ -918,5 +1194,5 @@ class ObsidianWriter:
             topic_dir = topic_path.parent
             try:
                 next(topic_dir.iterdir())
-            except StopIteration:
+            except (StopIteration, FileNotFoundError):
                 topic_dir.rmdir()

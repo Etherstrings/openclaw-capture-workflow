@@ -15,8 +15,10 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .config import AppConfig
+from .analyzer import analyze_url
 from .content_profile import build_signal_requirements, infer_content_profile
 from .models import EvidenceBundle, IngestRequest
+from .video_story_blocks import build_video_story_blocks, story_blocks_are_qualified
 
 
 def _run_template(command: str, **kwargs: str) -> str:
@@ -1265,6 +1267,88 @@ def _append_signal_hint(text: str, signals: Dict[str, list[str]]) -> str:
     return text.rstrip() + "\n\n" + hint_block
 
 
+def _structured_document_to_text(document: dict) -> str:
+    lines: list[str] = []
+    title = str(document.get("title", "")).strip()
+    summary = str(document.get("summary", "")).strip()
+    if title:
+        lines.append(f"标题: {title}")
+    if summary:
+        lines.append(f"摘要: {summary}")
+
+    sections = document.get("sections", [])
+    if isinstance(sections, list) and sections:
+        lines.append("[章节]")
+        for item in sections[:6]:
+            if not isinstance(item, dict):
+                continue
+            heading = str(item.get("heading", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if heading and content:
+                lines.append(f"{heading}: {content}")
+            elif content:
+                lines.append(content)
+
+    images = document.get("images", [])
+    if isinstance(images, list) and images:
+        lines.append("[图片]")
+        for item in images[:4]:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("src", "")).strip()
+            alt = str(item.get("alt", "")).strip()
+            caption = str(item.get("caption", "")).strip()
+            context = str(item.get("context", "")).strip()
+            parts = [part for part in [caption, alt, context, src] if part]
+            if parts:
+                lines.append(" | ".join(parts[:4]))
+
+    videos = document.get("videos", [])
+    if isinstance(videos, list) and videos:
+        lines.append("[视频]")
+        for item in videos[:3]:
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("src", "")).strip()
+            provider = str(item.get("provider", "")).strip()
+            duration = item.get("duration_seconds")
+            summaries = item.get("frame_summaries", [])
+            parts = []
+            if provider:
+                parts.append(f"来源: {provider}")
+            if isinstance(duration, (int, float)):
+                parts.append(f"时长: {round(float(duration), 1)} 秒")
+            if src:
+                parts.append(f"链接: {src}")
+            if parts:
+                lines.append(" | ".join(parts))
+            if isinstance(summaries, list):
+                for summary in summaries[:3]:
+                    text = str(summary).strip()
+                    if text:
+                        lines.append(text)
+
+    tables = document.get("tables", [])
+    if isinstance(tables, list) and tables:
+        lines.append("[表格]")
+        for item in tables[:3]:
+            if not isinstance(item, dict):
+                continue
+            caption = str(item.get("caption", "")).strip()
+            headers = item.get("headers", [])
+            rows = item.get("rows", [])
+            if caption:
+                lines.append(f"表格标题: {caption}")
+            if isinstance(headers, list) and headers:
+                lines.append("表头: " + " | ".join(str(entry).strip() for entry in headers if str(entry).strip()))
+            if isinstance(rows, list):
+                for row in rows[:2]:
+                    if isinstance(row, list) and row:
+                        lines.append("行: " + " | ".join(str(cell).strip() for cell in row if str(cell).strip()))
+
+    return "\n".join(line for line in lines if line).strip()
+
+
 def _extract_text_from_tencent_snapshot(snapshot: str) -> str:
     start_markers = [
         "【保姆级教程】手把手教你安装OpenClaw并接入飞书",
@@ -1531,6 +1615,170 @@ def _fetch_openclaw_browser_snapshot_with_steps(url: str, limit: int = 500) -> t
         text = _extract_text_from_tencent_snapshot(raw_snapshot)
         steps = _extract_steps_from_tencent_snapshot(raw_snapshot)
         return title, text, steps
+    finally:
+        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
+
+
+def _scroll_bilibili_page_for_comments(target_id: str) -> None:
+    scroll_fn = (
+        "() => {"
+        " const nodes = Array.from(document.querySelectorAll('h2,div,span'));"
+        " let target = null;"
+        " for (const node of nodes) {"
+        "   const text = (node.textContent || '').trim();"
+        "   if (text === '评论' || /^评论\\s*\\d+/.test(text)) {"
+        "     const rect = node.getBoundingClientRect();"
+        "     target = rect.top + window.scrollY;"
+        "     break;"
+        "   }"
+        " }"
+        " const fallback = Math.max((document.body && document.body.scrollHeight ? document.body.scrollHeight * 0.45 : 0), 1400);"
+        " const finalTarget = Math.max(0, (target === null ? fallback : target - 220));"
+        " window.scrollTo(0, finalTarget);"
+        " return { targetY: finalTarget, currentY: window.scrollY, bodyHeight: document.body ? document.body.scrollHeight : 0 };"
+        " }"
+    )
+    _run_openclaw_browser_json(
+        "evaluate",
+        "--target-id",
+        target_id,
+        "--fn",
+        scroll_fn,
+    )
+    time.sleep(1.0)
+
+
+def _looks_like_bilibili_viewer_feedback(text: str, *, author_name: str | None, owner_name: str | None) -> bool:
+    candidate = _normalize_text(text)
+    if not candidate:
+        return False
+    if owner_name and author_name and _normalize_text(author_name) == _normalize_text(owner_name):
+        return False
+    if len(candidate) < 8 or len(candidate) > 90:
+        return False
+    if _looks_like_ui_noise(candidate):
+        return False
+    if any(token in candidate for token in ["评论区", "条回复", "点击查看", "置顶", "展开", "收起"]):
+        return False
+    if candidate.endswith(("?", "？", "吗", "吗？", "吗?")):
+        return False
+    if any(candidate.startswith(prefix) for prefix in ["如何", "怎么", "请问", "可以", "能否", "有没有"]):
+        return False
+    if len(candidate) <= 18 and any(token in candidate for token in ["哈哈", "笑死", "牛", "绝了", "好家伙", "绷不住"]):
+        return False
+    return True
+
+
+def _extract_bilibili_viewer_feedback_from_snapshot(
+    snapshot: str,
+    *,
+    owner_name: str | None = None,
+    limit: int = 5,
+) -> list[str]:
+    in_comment_section = False
+    current_author: str | None = None
+    current_paragraph: list[str] = []
+    current_indent: int | None = None
+    feedback: list[str] = []
+
+    def _flush_paragraph() -> None:
+        nonlocal current_author, current_paragraph, current_indent
+        if not current_paragraph:
+            current_indent = None
+            return
+        merged = _normalize_text("".join(current_paragraph))
+        if _looks_like_bilibili_viewer_feedback(merged, author_name=current_author, owner_name=owner_name):
+            if merged not in feedback:
+                feedback.append(merged)
+        current_paragraph = []
+        current_indent = None
+
+    for raw_line in (snapshot or "").splitlines():
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        if current_indent is not None and indent <= current_indent and not line.startswith("- text:"):
+            _flush_paragraph()
+            if len(feedback) >= limit:
+                break
+        if 'heading "评论"' in line:
+            in_comment_section = True
+            current_author = None
+            continue
+        if not in_comment_section:
+            continue
+        if any(token in line for token in ['heading "相关推荐"', 'heading "大家都在搜"', "返回顶部", "点击关闭迷你播放器"]):
+            break
+        if len(feedback) >= limit:
+            break
+        if line.startswith("- paragraph "):
+            current_indent = indent
+            if ":" in line:
+                inline = line.split(":", 1)[1].strip()
+                if inline:
+                    current_paragraph.append(inline)
+            continue
+        if current_indent is not None:
+            text_match = re.search(r'- text:\s*(.+)$', line)
+            if text_match:
+                current_paragraph.append(text_match.group(1))
+                continue
+            if indent > current_indent:
+                link_match = re.search(r'- link "([^"]+)"', line)
+                if link_match:
+                    current_paragraph.append(link_match.group(1))
+                continue
+        link_match = re.search(r'- link "([^"]+)"', line)
+        if link_match:
+            candidate = _normalize_text(link_match.group(1))
+            if (
+                candidate
+                and candidate not in {"最热", "最新", "回复", "评论"}
+                and not candidate.startswith(("http://", "https://"))
+                and "评论" not in candidate
+                and "自动化交易" not in candidate
+            ):
+                current_author = candidate
+
+    _flush_paragraph()
+    return feedback[:limit]
+
+
+def _fetch_bilibili_viewer_feedback(
+    url: str,
+    *,
+    owner_name: str | None = None,
+    limit: int = 5,
+    snapshot_limit: int = 1600,
+) -> tuple[list[str], dict[str, object]]:
+    capture = {"attempted": True, "count": 0, "warning": None}
+    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
+    if not tab:
+        capture["warning"] = "browser tab not found for bilibili viewer feedback"
+        return [], capture
+    try:
+        target_id = str(tab.get("targetId", "")).strip()
+        if not target_id:
+            capture["warning"] = "bilibili viewer feedback target id missing"
+            return [], capture
+        _scroll_bilibili_page_for_comments(target_id)
+        snapshot_payload = _run_openclaw_browser_json(
+            "snapshot",
+            "--target-id",
+            target_id,
+            "--limit",
+            str(snapshot_limit),
+        )
+        raw_snapshot = snapshot_payload.get("snapshot", "")
+        feedback = _extract_bilibili_viewer_feedback_from_snapshot(
+            raw_snapshot,
+            owner_name=owner_name,
+            limit=limit,
+        )
+        capture["count"] = len(feedback)
+        return feedback, capture
+    except Exception as exc:
+        capture["warning"] = str(exc)
+        return [], capture
     finally:
         _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
@@ -1941,11 +2189,53 @@ def _canonicalize_video_source_url(url: str | None) -> str | None:
     if not source:
         return source
     lowered = source.lower()
+    if "b23.tv" in lowered:
+        redirected = _resolve_short_video_url(source)
+        if redirected and redirected != source:
+            source = redirected
+            lowered = source.lower()
     if "bilibili.com" in lowered or "b23.tv" in lowered:
         match = re.search(r"(?i)\b(BV[0-9A-Za-z]{10,})\b", source)
         if match:
             return f"https://www.bilibili.com/video/{match.group(1)}"
+    if "xiaohongshu.com" in lowered:
+        normalized_xhs = _canonicalize_xiaohongshu_video_url(source)
+        if normalized_xhs:
+            return normalized_xhs
     return source
+
+
+def _resolve_short_video_url(url: str) -> str | None:
+    req = urlrequest.Request(url, headers={"User-Agent": "Mozilla/5.0 OpenClawCaptureWorkflow/0.1"})
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            final_url = resp.geturl()
+    except Exception:
+        return None
+    return str(final_url or "").strip() or None
+
+
+def _canonicalize_xiaohongshu_video_url(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = parsed.netloc.lower()
+    if "xiaohongshu.com" not in host:
+        return None
+    query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+    path = parsed.path or ""
+    if path.startswith("/login"):
+        redirect = query.get("redirectPath", "")
+        if redirect:
+            return _canonicalize_xiaohongshu_video_url(redirect) or url
+    match = re.search(r"/(?:explore|discovery/item)/([0-9a-z]{16,24})", path, flags=re.IGNORECASE)
+    if match:
+        return f"https://www.xiaohongshu.com/explore/{match.group(1)}"
+    target_note_id = query.get("target_note_id", "").strip()
+    if target_note_id:
+        return f"https://www.xiaohongshu.com/explore/{target_note_id}"
+    return f"https://www.xiaohongshu.com{path}" if path.startswith("/explore/") else None
 
 
 def _extract_bvid(source_url: str | None) -> str | None:
@@ -2323,6 +2613,88 @@ class EvidenceExtractor:
         self.artifacts_dir = artifacts_dir
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    def _enrich_video_story_context(self, evidence: EvidenceBundle) -> EvidenceBundle:
+        if evidence.source_kind != "video_url":
+            return evidence
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        viewer_feedback = metadata.get("viewer_feedback", [])
+        if not isinstance(viewer_feedback, list):
+            viewer_feedback = []
+        viewer_feedback = _dedupe_strings([_normalize_text(item) for item in viewer_feedback if _normalize_text(item)], limit=5)
+        capture = metadata.get("viewer_feedback_capture")
+        if not isinstance(capture, dict):
+            capture = {"attempted": False, "count": 0, "warning": None}
+        capture.setdefault("attempted", False)
+        capture.setdefault("count", len(viewer_feedback))
+        capture.setdefault("warning", None)
+        source_url = str(evidence.source_url or "").strip().lower()
+        if "bilibili.com/video/" in source_url and not capture.get("attempted"):
+            fetched_feedback, capture = _fetch_bilibili_viewer_feedback(
+                evidence.source_url or "",
+                owner_name=str(metadata.get("bilibili_owner") or "").strip() or None,
+                limit=5,
+            )
+            viewer_feedback = _dedupe_strings(viewer_feedback + fetched_feedback, limit=5)
+        capture["count"] = len(viewer_feedback)
+        metadata["viewer_feedback"] = viewer_feedback
+        metadata["viewer_feedback_capture"] = capture
+        story_blocks = build_video_story_blocks(evidence)
+        metadata["video_story_blocks"] = story_blocks if story_blocks_are_qualified(story_blocks) else []
+        evidence.metadata = metadata
+        return evidence
+
+    def _analyzer_to_evidence(self, request: IngestRequest) -> EvidenceBundle | None:
+        if not request.source_url or request.dry_run:
+            return None
+        try:
+            outcome = analyze_url(
+                url=request.source_url,
+                requested_output_lang=request.requested_output_lang or "zh-CN",
+                config=self.config,
+                state_dir=self.artifacts_dir.parent,
+                auto_case_sink=self.artifacts_dir.parent / "cases" / "inbox.jsonl",
+                auto_case_source_kind=request.source_kind,
+                auto_case_raw_text=request.raw_text,
+                auto_case_platform_hint=request.platform_hint,
+            )
+        except Exception:
+            return None
+
+        document = outcome.document.to_dict()
+        analyzer_text = _structured_document_to_text(document)
+        if not analyzer_text:
+            return None
+
+        metadata: Dict[str, object] = {
+            "structured_document": document,
+            "analyzer_warnings": list(outcome.warnings),
+        }
+        _add_evidence_source(metadata, "url_understanding_analyzer")
+        if request.raw_text and not _looks_like_url_only((request.raw_text or "").strip(), request.source_url):
+            _add_evidence_source(metadata, "user_raw_text")
+            analyzer_text = _merge_text_blocks((request.raw_text or "").strip(), analyzer_text)
+        signals = _extract_skill_signals(analyzer_text, request.source_url)
+        if signals:
+            metadata["signals"] = signals
+        metadata = _finalize_evidence_metadata(
+            metadata,
+            source_kind=request.source_kind,
+            source_url=request.source_url,
+            text=analyzer_text,
+        )
+        return self._enrich_video_story_context(
+            EvidenceBundle(
+                source_kind=request.source_kind,
+                source_url=request.source_url,
+                platform_hint=request.platform_hint,
+                title=str(document.get("title", "")).strip() or None,
+                text=analyzer_text,
+                evidence_type="structured_document",
+                coverage="full",
+                metadata=metadata,
+            )
+        )
+
     def extract(self, request: IngestRequest) -> EvidenceBundle:
         if request.source_kind == "pasted_text":
             return self._from_text(request)
@@ -2362,6 +2734,9 @@ class EvidenceExtractor:
         )
 
     def _from_web(self, request: IngestRequest) -> EvidenceBundle:
+        analyzer_evidence = self._analyzer_to_evidence(request)
+        if analyzer_evidence is not None:
+            return analyzer_evidence
         raw_text = (request.raw_text or "").strip()
         text = "" if _looks_like_url_only(raw_text, request.source_url) else raw_text
         title = None
@@ -2600,6 +2975,11 @@ class EvidenceExtractor:
         )
 
     def _from_video(self, request: IngestRequest) -> EvidenceBundle:
+        analyzer_evidence = self._analyzer_to_evidence(request)
+        if analyzer_evidence is not None:
+            analyzer_evidence.platform_hint = request.platform_hint or analyzer_evidence.platform_hint
+            analyzer_evidence.metadata["video_analysis_path"] = "analyzer"
+            return analyzer_evidence
         subtitle_text = ""
         keyframes: List[str] = []
         transcript = None
@@ -2864,15 +3244,17 @@ class EvidenceExtractor:
         )
         evidence_type = "multimodal_video"
         video_title = str(metadata.get("page_title") or "").strip() if isinstance(metadata, dict) else ""
-        return EvidenceBundle(
-            source_kind="video_url",
-            source_url=video_url,
-            platform_hint=request.platform_hint,
-            title=video_title or None,
-            text=merged_text,
-            evidence_type=evidence_type,
-            coverage="full" if merged_text else "partial",
-            transcript=transcript,
-            keyframes=keyframes,
-            metadata=metadata,
+        return self._enrich_video_story_context(
+            EvidenceBundle(
+                source_kind="video_url",
+                source_url=video_url,
+                platform_hint=request.platform_hint,
+                title=video_title or None,
+                text=merged_text,
+                evidence_type=evidence_type,
+                coverage="full" if merged_text else "partial",
+                transcript=transcript,
+                keyframes=keyframes,
+                metadata=metadata,
+            )
         )

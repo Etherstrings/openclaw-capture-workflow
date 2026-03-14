@@ -1,0 +1,14 @@
+[
+  {
+    "id": "youtube_structured_chapters",
+    "source_kind": "video_url",
+    "source_url": "https://www.youtube.com/watch?v=c7qJzG_swUE",
+    "video_probe_seconds": 180,
+    "expect": {
+      "required_links": [
+        "https://www.youtube.com/watch?v=c7qJzG_swUE"
+      ],
+      "min_evidence_chars": 80
+    }
+  }
+]

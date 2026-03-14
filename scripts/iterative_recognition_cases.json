@@ -1,0 +1,28 @@
+[
+  {
+    "id": "manual_python_tutorial",
+    "source_kind": "url",
+    "source_url": "https://docs.python.org/3/tutorial/index.html",
+    "platform_hint": "docs",
+    "provenance": "manual",
+    "labels": ["docs", "python", "tutorial"],
+    "expect": {
+      "required_keywords": ["Python", "教程", "标准库"],
+      "min_evidence_chars": 180
+    }
+  },
+  {
+    "id": "manual_openai_cookbook_repo",
+    "source_kind": "url",
+    "source_url": "https://github.com/openai/openai-cookbook",
+    "platform_hint": "github",
+    "provenance": "manual",
+    "labels": ["github", "openai", "readme"],
+    "expect": {
+      "required_keywords": ["OpenAI API", "OPENAI_API_KEY"],
+      "required_links": ["https://github.com/openai/openai-cookbook"],
+      "required_projects": ["openai/openai-cookbook"],
+      "min_evidence_chars": 120
+    }
+  }
+]

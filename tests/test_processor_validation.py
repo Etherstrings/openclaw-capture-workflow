@@ -17,6 +17,16 @@ from openclaw_capture_workflow.processor import (
 from openclaw_capture_workflow.storage import JobStore
 
 
+class FakeNoteRenderer:
+    def render(self, materials):
+        return f"# {materials.get('title', '未命名内容')}\n\n{materials.get('summary', {}).get('conclusion', '')}\n"
+
+
+def _attach_note_renderer(processor: WorkflowProcessor) -> WorkflowProcessor:
+    processor.writer.renderer = FakeNoteRenderer()
+    return processor
+
+
 class WeakSummarizer:
     def summarize(self, evidence: EvidenceBundle) -> SummaryResult:
         return SummaryResult(
@@ -105,7 +115,7 @@ class ProcessorValidationTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, WeakSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, WeakSummarizer(), state_dir))
             processor.start()
             ingest = IngestRequest(
                 chat_id="-1001",
@@ -216,7 +226,7 @@ class ProcessorValidationTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, WeakSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, WeakSummarizer(), state_dir))
             processor.extractor = StaticExtractor(
                 EvidenceBundle(
                     source_kind="video_url",
@@ -280,7 +290,7 @@ class ProcessorValidationTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, StableSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, StableSummarizer(), state_dir))
             processor.notifier = SilentNotifier()
 
             initial = EvidenceBundle(

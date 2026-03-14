@@ -11,6 +11,27 @@ from openclaw_capture_workflow.processor import WorkflowProcessor, _extract_step
 from openclaw_capture_workflow.storage import JobStore
 
 
+class FakeNoteRenderer:
+    def render(self, materials):
+        title = materials.get("title", "未命名内容")
+        conclusion = materials.get("summary", {}).get("conclusion", "")
+        evidence_text = str(materials.get("evidence", {}).get("text", "")).strip()
+        lines = [f"# {title}"]
+        if conclusion:
+            lines.extend(["", conclusion])
+        if evidence_text:
+            lines.extend(["", evidence_text[:240]])
+        source_url = materials.get("source", {}).get("source_url", "")
+        if source_url:
+            lines.extend(["", source_url])
+        return "\n".join(lines) + "\n"
+
+
+def _attach_note_renderer(processor: WorkflowProcessor) -> WorkflowProcessor:
+    processor.writer.renderer = FakeNoteRenderer()
+    return processor
+
+
 class FakeSummarizer:
     def summarize(self, evidence: EvidenceBundle) -> SummaryResult:
         return SummaryResult(
@@ -107,7 +128,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             processor.notifier = FakeNotifier()
             processor.start()
             ingest = IngestRequest(
@@ -147,7 +168,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             notifier = FakeNotifier()
             processor.notifier = notifier
             processor.start()
@@ -199,7 +220,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             processor.notifier = FailingNotifier()
             processor.start()
             ingest = IngestRequest(
@@ -249,7 +270,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, BrokenSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, BrokenSummarizer(), state_dir))
             processor.notifier = FakeNotifier()
             processor.start()
             ingest = IngestRequest(
@@ -292,7 +313,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             processor.notifier = FakeNotifier()
 
             temp_image = state_dir / "temp-shot.jpg"
@@ -357,7 +378,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             processor.notifier = FakeNotifier()
             processor.extractor = StaticExtractor(
                 EvidenceBundle(
@@ -423,7 +444,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, counting, state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, counting, state_dir))
             processor.notifier = FakeNotifier()
             processor.start()
             ingest = IngestRequest(
@@ -470,7 +491,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             jobs = JobStore(state_dir / "jobs")
-            processor = WorkflowProcessor(cfg, jobs, counting, state_dir)
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, counting, state_dir))
             processor.notifier = FakeNotifier()
             processor.extractor = StaticExtractor(
                 EvidenceBundle(

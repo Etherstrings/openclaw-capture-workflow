@@ -15,6 +15,7 @@ from openclaw_capture_workflow.extractor import (
     _extract_article_blocks,
     _fetch_bilibili_video_metadata,
     _extract_meta_description,
+    _extract_bilibili_viewer_feedback_from_snapshot,
     _extract_skill_signals,
     _extract_text_from_browser_snapshot,
     _extract_steps_from_tencent_snapshot,
@@ -33,6 +34,7 @@ from openclaw_capture_workflow.extractor import (
 )
 from openclaw_capture_workflow.models import IngestRequest
 from openclaw_capture_workflow.extractor import EvidenceExtractor
+from openclaw_capture_workflow.analyzer.models import AnalysisOutcome, SectionResult, StructuredDocument
 
 
 def _config(tmp: str) -> AppConfig:
@@ -55,6 +57,65 @@ def _config(tmp: str) -> AppConfig:
 
 
 class ExtractorTest(unittest.TestCase):
+    def test_url_request_prefers_analyzer_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            document = StructuredDocument(
+                title="Analyzer title",
+                summary="Analyzer summary",
+                sections=[SectionResult(heading="Intro", level=1, content="Analyzer body")],
+                images=[],
+                videos=[],
+                tables=[],
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor.analyze_url",
+                return_value=AnalysisOutcome(document=document, warnings=["sample warning"]),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="job-analyzer-web",
+                        source_kind="url",
+                        source_url="https://example.com/article",
+                        raw_text="https://example.com/article",
+                        dry_run=False,
+                    )
+                )
+            self.assertEqual(evidence.evidence_type, "structured_document")
+            self.assertEqual(evidence.title, "Analyzer title")
+            self.assertIn("Analyzer summary", evidence.text)
+            self.assertEqual(evidence.metadata.get("structured_document", {}).get("title"), "Analyzer title")
+
+    def test_video_request_prefers_analyzer_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            document = StructuredDocument(
+                title="Video title",
+                summary="Video summary",
+                sections=[SectionResult(heading="Overview", level=1, content="Video body")],
+                images=[],
+                videos=[],
+                tables=[],
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor.analyze_url",
+                return_value=AnalysisOutcome(document=document, warnings=[]),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="job-analyzer-video",
+                        source_kind="video_url",
+                        source_url="https://example.com/demo.mp4",
+                        dry_run=False,
+                    )
+                )
+            self.assertEqual(evidence.evidence_type, "structured_document")
+            self.assertEqual(evidence.metadata.get("video_analysis_path"), "analyzer")
+
     def test_github_blob_from_url_parses_markdown_path(self) -> None:
         parsed = _github_blob_from_url("https://github.com/openai/openai-cookbook/blob/main/README.md")
         self.assertEqual(parsed, ("openai", "openai-cookbook", "main", "README.md"))
@@ -178,6 +239,48 @@ class ExtractorTest(unittest.TestCase):
         self.assertNotIn("沪ICP备13030189号", text)
         self.assertIn("github.com/VoltAgent/awesome-openclaw-skills", text)
         self.assertNotIn("creator.xiaohongshu.com", text)
+
+    def test_extract_bilibili_viewer_feedback_from_snapshot_filters_questions_and_owner_replies(self) -> None:
+        snapshot = """
+        - heading "评论" [level=2]
+        - generic [ref=e271]:
+          - generic [ref=e277]:
+            - generic [ref=e280]:
+              - link "Mmming1011" [ref=e282] [cursor=pointer]
+            - paragraph [ref=e292]:
+              - text: 你
+              - link "2月28日" [ref=e293] [cursor=pointer]
+              - text: 强烈建议买入的
+              - link "中科曙光" [ref=e295] [cursor=pointer]
+              - text: ，到昨天才回本
+        - generic [ref=e314]:
+          - generic [ref=e319]:
+            - generic [ref=e322]:
+              - link "圆圆小缘_" [ref=e324] [cursor=pointer]
+            - paragraph [ref=e334]:
+              - text: 可以让
+              - link "openclaw" [ref=e335] [cursor=pointer]
+              - text: 实现美股市场的选股及自动化交易套利吗
+        - generic [ref=e360]:
+          - generic [ref=e361]:
+            - generic [ref=e363]:
+              - link "以太与弦Justice" [ref=e367] [cursor=pointer]
+            - paragraph [ref=e373]: 6 那你得上最猛的模型最猛的信源 要钱的
+        - generic [ref=e391]:
+          - generic [ref=e396]:
+            - generic [ref=e399]:
+              - link "路人甲" [ref=e401] [cursor=pointer]
+            - generic [ref=e411]:
+              - paragraph [ref=e413]: 3月3号的 还挺准 让卖的都大跌
+        """
+        feedback = _extract_bilibili_viewer_feedback_from_snapshot(snapshot, owner_name="以太与弦Justice")
+        self.assertEqual(
+            feedback,
+            [
+                "你2月28日强烈建议买入的中科曙光，到昨天才回本",
+                "3月3号的 还挺准 让卖的都大跌",
+            ],
+        )
 
     def test_extract_skill_signals_prefers_high_value_links(self) -> None:
         text = """
@@ -375,6 +478,29 @@ class ExtractorTest(unittest.TestCase):
         url = "https://www.bilibili.com/video/BV1HpP5zBEEp?share_source=weixin&timestamp=1772551573"
         normalized = _canonicalize_video_source_url(url)
         self.assertEqual(normalized, "https://www.bilibili.com/video/BV1HpP5zBEEp")
+
+    def test_canonicalize_video_source_url_resolves_b23_short_link(self) -> None:
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def geturl(self):
+                return "https://www.bilibili.com/video/BV19VAUzUEL6/?share_source=copy"
+
+        with patch("openclaw_capture_workflow.extractor.urlrequest.urlopen", return_value=_Resp()):
+            normalized = _canonicalize_video_source_url("https://b23.tv/fKZ8dA4")
+        self.assertEqual(normalized, "https://www.bilibili.com/video/BV19VAUzUEL6")
+
+    def test_canonicalize_video_source_url_normalizes_xiaohongshu_share_to_note(self) -> None:
+        url = (
+            "https://xiaohongshu.com/explore?app_platform=ios&type=video&target_note_id=69aea021000000001a028a59"
+            "&xsec_token=abc"
+        )
+        normalized = _canonicalize_video_source_url(url)
+        self.assertEqual(normalized, "https://www.xiaohongshu.com/explore/69aea021000000001a028a59")
 
     def test_sanitize_video_page_snapshot_text_filters_timeline_noise(self) -> None:
         text = """
@@ -751,6 +877,93 @@ class ExtractorTest(unittest.TestCase):
             tracks = evidence.metadata.get("tracks", {})
             self.assertFalse(tracks.get("has_subtitle"))
             self.assertFalse(tracks.get("has_transcript"))
+            self.assertEqual(evidence.metadata.get("video_story_blocks"), [])
+
+    def test_video_extract_adds_viewer_feedback_and_story_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'import json; print(json.dumps({{\"text\":\"\",\"segments\":[]}}, ensure_ascii=False))'"
+            )
+            audio_payload = json.dumps(
+                {
+                    "text": (
+                        "今天给大家介绍一个用龙虾做的一件事情。"
+                        "最后会在每天早上开盘之前给你一个当天自选股的分析。"
+                        "会给出买入或者持有的建议。"
+                    ),
+                    "duration_seconds": 31,
+                    "segments": [
+                        {"start": 2.0, "end": 5.0, "text": "把自选股交给OpenClaw"},
+                        {"start": 8.0, "end": 12.0, "text": "开盘前给出买入或持有建议"},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            extractor.config.extractors.video_audio_command = (
+                "python3 -c 'print(" + json.dumps(audio_payload, ensure_ascii=False).replace("{", "{{").replace("}", "}}") + ")'"
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_video_metadata",
+                return_value=(
+                    "OpenClaw你虾哥每天股票量化交易推荐",
+                    "[视频元数据]\n标题: OpenClaw你虾哥每天股票量化交易推荐\n简介: 图一乐 别真跟着买 当然我跟着买了",
+                    {"bilibili_owner": "以太与弦Justice", "bilibili_description": "图一乐 别真跟着买 当然我跟着买了"},
+                ),
+            ), patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_viewer_feedback",
+                return_value=(
+                    ["评论区有人反馈信号有一定参考性", "也有人提醒不要直接跟单"],
+                    {"attempted": True, "count": 2, "warning": None},
+                ),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="video-story-block-1",
+                        source_kind="video_url",
+                        source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+                        dry_run=True,
+                    )
+                )
+            self.assertEqual(
+                evidence.metadata.get("viewer_feedback"),
+                ["评论区有人反馈信号有一定参考性", "也有人提醒不要直接跟单"],
+            )
+            self.assertEqual(evidence.metadata.get("viewer_feedback_capture", {}).get("count"), 2)
+            story_blocks = evidence.metadata.get("video_story_blocks", [])
+            labels = [item.get("label") for item in story_blocks]
+            self.assertIn("core_topic", labels)
+            self.assertIn("workflow", labels)
+            self.assertIn("risk", labels)
+
+    def test_video_viewer_feedback_failure_does_not_break_extract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            extractor.config.extractors.video_subtitle_command = (
+                "python3 -c 'print(\"[00:03] 视频展示OpenClaw的分析流程\")'"
+            )
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_video_metadata",
+                return_value=("测试视频", "[视频元数据]\n标题: 测试视频", {"bilibili_owner": "测试UP"}),
+            ), patch(
+                "openclaw_capture_workflow.extractor._fetch_bilibili_viewer_feedback",
+                return_value=([], {"attempted": True, "count": 0, "warning": "browser failed"}),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="video-feedback-fail-1",
+                        source_kind="video_url",
+                        source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+                        dry_run=True,
+                    )
+                )
+            self.assertEqual(evidence.evidence_type, "multimodal_video")
+            self.assertEqual(evidence.metadata.get("viewer_feedback"), [])
+            self.assertEqual(evidence.metadata.get("viewer_feedback_capture", {}).get("warning"), "browser failed")
 
     def test_fetch_bilibili_video_metadata_formats_title_desc_and_tags(self) -> None:
         with patch(

@@ -20,6 +20,7 @@ from .content_profile import build_signal_requirements, infer_content_profile, i
 from .extractor import EvidenceExtractor
 from .models import IngestRequest, JobRecord, SummaryResult
 from .obsidian import ObsidianWriter
+from .note_renderer import OpenAICompatibleNoteRenderer
 from .storage import JobStore
 from .summarizer import OpenAICompatibleSummarizer, SummaryEngine, PROMPT_VERSION
 from .telegram import TelegramNotifier
@@ -666,7 +667,12 @@ class WorkflowProcessor:
             self._upgrade_summarizer = OpenAICompatibleSummarizer(upgrade_cfg)
         self.base_state_dir = base_state_dir
         self.extractor = EvidenceExtractor(config, base_state_dir / "artifacts")
-        self.writer = ObsidianWriter(config.obsidian)
+        self.note_renderer = OpenAICompatibleNoteRenderer(config.summarizer) if isinstance(summarizer, OpenAICompatibleSummarizer) else None
+        self.writer = ObsidianWriter(
+            config.obsidian,
+            renderer=self.note_renderer,
+            materials_root=base_state_dir / "materials",
+        )
         self.notifier = TelegramNotifier(config.telegram.result_bot_token)
         self.summary_cache_dir = base_state_dir / "summary_cache"
         self.summary_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1076,17 +1082,44 @@ class WorkflowProcessor:
 
                 if ingest.dry_run:
                     job.set_phase("write_note", "skipped")
-                    note_preview = self.writer.preview(summary, evidence)
-                    preview_file = self._save_note_preview_file(ingest.request_id, note_preview)
-                    if preview_file:
-                        note_preview["preview_file"] = preview_file
+                    note_preview = self.writer.preview(
+                        summary,
+                        evidence,
+                        use_model_render=True,
+                    )
+                    if "content" in note_preview:
+                        preview_file = self._save_note_preview_file(ingest.request_id, note_preview)
+                        if preview_file:
+                            note_preview["preview_file"] = preview_file
                     job.set_phase("notify", "skipped")
                 else:
                     current_phase = "write_note"
                     job.mark("processing", message="writing note")
                     job.set_phase("write_note", "processing")
                     self.jobs.save(job)
-                    note_meta = self.writer.write(summary, evidence)
+                    note_meta = self.writer.write(summary, evidence, use_model_render=True)
+                    if note_meta.get("note_render_error"):
+                        job.set_phase("write_note", "failed")
+                        partial_result: Dict[str, object] = {
+                            "summary": summary.to_dict(),
+                            "evidence": evidence.to_dict(),
+                            "dry_run": ingest.dry_run,
+                            "summary_mode": summary_mode,
+                            "summary_attempts": summary_attempts,
+                            "summary_model": summary_model_used,
+                            "summary_model_chain": summary_model_chain,
+                            "entry_context": _infer_entry_context(ingest),
+                            "content_profile": evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {},
+                            "signal_requirements": evidence.metadata.get("signal_requirements", {}) if isinstance(evidence.metadata, dict) else {},
+                            "evidence_sources": evidence.metadata.get("evidence_sources", []) if isinstance(evidence.metadata, dict) else [],
+                            "note_render_error": note_meta.get("note_render_error"),
+                            "materials_file": note_meta.get("materials_file"),
+                        }
+                        if summary_quality:
+                            partial_result["summary_quality"] = summary_quality
+                        job.mark("failed", message="note_render_failed", result=partial_result, error=str(note_meta.get("note_render_error")))
+                        self.jobs.save(job)
+                        continue
                     job.set_phase("write_note", "done")
                     open_url = f"{self.config.local_base_url}/open?path={quote(str(note_meta['note_path']), safe='')}"
 
@@ -1152,6 +1185,43 @@ class WorkflowProcessor:
                     result["note_preview"] = note_preview
                 if notification_error:
                     result["notification_error"] = notification_error
+
+                if not ingest.dry_run and evidence.source_kind in {"url", "video_url"}:
+                    relevant_warning_prefixes = (
+                        "summary_quality_flags",
+                        "notification_error",
+                        "video_evidence_incomplete",
+                        "video_cost_over_budget",
+                        "video_recovery_failed",
+                        "summary_model_upgrade_failed",
+                        "summary_model_upgrade_skipped",
+                        "video_download_failed",
+                        "video_frame_sampling_failed",
+                    )
+                    relevant_warnings = [
+                        warning for warning in job.warnings if str(warning).startswith(relevant_warning_prefixes)
+                    ]
+                    auto_reason = ""
+                    if evidence.coverage == "partial":
+                        auto_reason = "coverage_partial"
+                    elif quality_score < 0.72:
+                        auto_reason = "summary_quality_low"
+                    if relevant_warnings or auto_reason:
+                        from .iterative_cases import maybe_record_auto_case
+
+                        maybe_record_auto_case(
+                            self.base_state_dir / "cases" / "inbox.jsonl",
+                            source_kind=evidence.source_kind,
+                            source_url=evidence.source_url,
+                            raw_text=ingest.raw_text,
+                            platform_hint=ingest.platform_hint,
+                            warnings=relevant_warnings,
+                            coverage=evidence.coverage,
+                            summary_quality_score=quality_score,
+                            dry_run=ingest.dry_run,
+                            labels=["processor", evidence.source_kind] + ([ingest.platform_hint] if ingest.platform_hint else []),
+                            extra_reason=auto_reason,
+                        )
 
                 done_message = "completed_with_warnings" if job.warnings else "completed"
                 job.error = None

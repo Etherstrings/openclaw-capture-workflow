@@ -13,6 +13,12 @@ from urllib.error import HTTPError, URLError
 from .config import SummarizerConfig
 from .content_profile import infer_content_profile, iter_required_signal_entries
 from .models import EvidenceBundle, SummaryResult
+from .video_story_blocks import (
+    get_qualified_video_story_blocks,
+    get_story_block_bullets,
+    get_story_block_outline_points,
+    get_viewer_feedback,
+)
 
 
 PROMPT = """Role: J.A.R.V.I.S. (Just A Rather Very Intelligent System)
@@ -91,6 +97,12 @@ Rules:
 - Avoid boilerplate/meta statements like "已提取核心事实" or "帮助你快速理解".
 - Avoid vague phrases like "内容完整/覆盖全面/适用于开发者和爱好者" unless the evidence explicitly states them.
 - Do not repeat the same fact in different bullets with slight wording changes.
+- If the evidence clearly enumerates multiple points using explicit numbering, preserve all detected points in order instead of compressing them into 3-5 generic bullets.
+- If `video_outline.outline_detected=true`, keep the outline structure in order and rewrite each point clearly instead of collapsing it into vague themes.
+- If `video_story_blocks` is present, treat it as the main structure for narrative videos and rewrite each block into clear human language.
+- If `video_story_blocks` contains `workflow`, `risk`, or `viewer_feedback`, prioritize those blocks in bullets when the evidence supports them.
+- Do not copy long raw ASR fragments into bullets; rewrite them as concise topic blocks.
+- If `viewer_feedback` is empty, do not invent audience reaction.
 """
 
 PROMPT_VERSION = hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()[:16]
@@ -106,6 +118,7 @@ class OpenAICompatibleSummarizer:
         self.config = config
 
     def summarize(self, evidence: EvidenceBundle) -> SummaryResult:
+        video_context = _build_video_prompt_context(evidence)
         payload = {
             "model": self.config.model,
             "temperature": 0.1,
@@ -125,6 +138,7 @@ class OpenAICompatibleSummarizer:
                             "text": evidence.text,
                             "transcript": evidence.transcript,
                             "metadata": evidence.metadata,
+                            **video_context,
                         },
                         ensure_ascii=False,
                     ),
@@ -260,6 +274,243 @@ def _fallback_bullets(evidence: EvidenceBundle, limit: int = 5) -> list[str]:
         if len(bullets) >= limit:
             break
     return bullets
+
+
+_ENUM_PATTERNS = [
+    re.compile(r"^\s*(\d{1,2})[.)、]\s*(.+)$"),
+    re.compile(r"^\s*第\s*(\d{1,2})\s*点[:：]?\s*(.+)$"),
+    re.compile(r"^\s*(十一|十二|十|[一二三四五六七八九])[、.）)]\s*(.+)$"),
+]
+
+_CN_ENUM_MAP = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+
+
+def _chinese_enum_to_int(value: str) -> int | None:
+    token = (value or "").strip()
+    if token in _CN_ENUM_MAP:
+        return _CN_ENUM_MAP[token]
+    if token == "十一":
+        return 11
+    if token == "十二":
+        return 12
+    return None
+
+
+def _extract_section_outline_points(evidence: EvidenceBundle, *, max_points: int = 12) -> list[str]:
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    structured = metadata.get("structured_document", {}) if isinstance(metadata.get("structured_document"), dict) else {}
+    sections = structured.get("sections", []) if isinstance(structured.get("sections"), list) else []
+    points: list[str] = []
+    generic_tokens = ["播放", "控制", "权限", "推荐", "用户互动", "基本信息", "标签", "页面", "概述", "结论", "证据"]
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        heading = re.sub(r"\s+", " ", str(section.get("heading", "")).strip())
+        content = re.sub(r"\s+", " ", str(section.get("content", "")).strip())
+        if heading and heading not in points and len(heading) >= 4 and not any(token in heading for token in generic_tokens):
+            points.append(heading)
+        elif content and len(content) >= 8:
+            snippet = content[:48].rstrip("，。；; ")
+            if snippet and snippet not in points:
+                points.append(snippet)
+        if len(points) >= max_points:
+            break
+    return points if len(points) >= 2 else []
+
+
+def _extract_step_outline_points(evidence: EvidenceBundle, *, max_points: int = 12) -> list[str]:
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    step_items = metadata.get("step_items", []) if isinstance(metadata.get("step_items"), list) else []
+    points: list[str] = []
+    for item in step_items:
+        if not isinstance(item, dict):
+            continue
+        title = re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+        detail = re.sub(r"\s+", " ", str(item.get("detail", "")).strip())
+        text = title or detail
+        if text and text not in points:
+            points.append(text)
+        if len(points) >= max_points:
+            break
+    return points if len(points) >= 2 else []
+
+
+def _extract_timestamp_outline_points(text: str, *, max_points: int = 12) -> list[str]:
+    points: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        match = re.match(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+)$", line)
+        if not match:
+            continue
+        content = match.group(2).strip()
+        if len(content) < 4:
+            continue
+        if content not in points:
+            points.append(content)
+        if len(points) >= max_points:
+            break
+    return points if len(points) >= 2 else []
+
+
+def _extract_sequence_outline_points(text: str) -> list[str]:
+    compact = re.sub(r"\s+", " ", text or "")
+    patterns = [
+        re.compile(r"(?:首先|先)([^。；\n]{2,60})"),
+        re.compile(r"(?:其次|再|然后)([^。；\n]{2,60})"),
+        re.compile(r"(?:最后|最终)([^。；\n]{2,60})"),
+    ]
+    points: list[str] = []
+    for pattern in patterns:
+        match = pattern.search(compact)
+        if not match:
+            continue
+        content = match.group(1).strip(" ，,：:;；")
+        if content and content not in points:
+            points.append(content)
+    return points if len(points) >= 2 else []
+
+
+def _extract_enumerated_points_from_text(text: str, *, min_points: int = 3, max_points: int = 12) -> list[str]:
+    found: list[tuple[int, str]] = []
+    for raw_line in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        if len(line) < 4:
+            continue
+        number = None
+        content = ""
+        for pattern in _ENUM_PATTERNS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            token = match.group(1)
+            content = match.group(2).strip()
+            if pattern is _ENUM_PATTERNS[2]:
+                number = _chinese_enum_to_int(token)
+            else:
+                try:
+                    number = int(token)
+                except ValueError:
+                    number = None
+            break
+        if number is None or not content:
+            continue
+        if number < 1 or number > max_points:
+            continue
+        if len(content) < 2:
+            continue
+        found.append((number, content))
+
+    if not found:
+        return []
+    dedup_by_number: dict[int, str] = {}
+    for number, content in found:
+        dedup_by_number.setdefault(number, content)
+    ordered = sorted(dedup_by_number.items(), key=lambda item: item[0])
+    numbers = [number for number, _ in ordered]
+    if len(numbers) < min_points:
+        return []
+    expected = list(range(numbers[0], numbers[0] + len(numbers)))
+    if numbers != expected:
+        return []
+    return [content for _, content in ordered]
+
+
+def _extract_enumerated_points(evidence: EvidenceBundle, bullets: list[str]) -> list[str]:
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    candidates = []
+    for field in [
+        evidence.text,
+        evidence.transcript or "",
+        str(metadata.get("video_page_snapshot_text", "")),
+    ]:
+        if field:
+            candidates.append(str(field))
+    for candidate in candidates:
+        points = _extract_enumerated_points_from_text(candidate)
+        if points:
+            return points
+    return []
+
+
+def _extract_explicit_video_outline(evidence: EvidenceBundle, bullets: list[str]) -> list[str]:
+    if evidence.source_kind != "video_url":
+        return []
+    for extractor in [
+        lambda: _extract_section_outline_points(evidence),
+        lambda: _extract_step_outline_points(evidence),
+        lambda: _extract_enumerated_points(evidence, bullets),
+    ]:
+        points = extractor()
+        if points:
+            return points[:12]
+    return []
+
+
+def _extract_video_outline(evidence: EvidenceBundle, bullets: list[str]) -> list[str]:
+    explicit_points = _extract_explicit_video_outline(evidence, bullets)
+    if explicit_points:
+        return explicit_points[:12]
+    story_points = get_story_block_outline_points(evidence, include_feedback=False)
+    if story_points:
+        return story_points[:12]
+    if evidence.source_kind != "video_url":
+        return []
+    sequence_points = _extract_sequence_outline_points(evidence.transcript or evidence.text)
+    return sequence_points[:12]
+
+
+def _build_video_story_payload(evidence: EvidenceBundle) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    for block in get_qualified_video_story_blocks(evidence):
+        label = str(block.get("label", "")).strip()
+        summary = re.sub(r"\s+", " ", str(block.get("summary", "")).strip())
+        evidence_items = block.get("evidence", [])
+        if not label or not summary or not isinstance(evidence_items, list):
+            continue
+        payload.append(
+            {
+                "label": label,
+                "summary": summary,
+                "evidence": [re.sub(r"\s+", " ", str(item).strip()) for item in evidence_items if str(item).strip()][:3],
+            }
+        )
+    return payload[:6]
+
+
+def _build_video_outline_payload(evidence: EvidenceBundle) -> dict[str, object]:
+    explicit_points = _extract_explicit_video_outline(evidence, [])
+    story_points = get_story_block_outline_points(evidence, include_feedback=False)
+    points = explicit_points or story_points or _extract_sequence_outline_points(evidence.transcript or evidence.text)
+    return {
+        "outline_detected": bool(points),
+        "outline_points": points,
+        "hierarchy_depth": 1 if points else 0,
+        "outline_source": "explicit" if explicit_points else "story_blocks" if story_points else "sequence" if points else "none",
+        "evidence_tracks": (
+            evidence.metadata.get("evidence_sources", [])
+            if isinstance(evidence.metadata, dict) and isinstance(evidence.metadata.get("evidence_sources"), list)
+            else []
+        ),
+    }
+
+
+def _build_video_prompt_context(evidence: EvidenceBundle) -> dict[str, object]:
+    return {
+        "video_outline": _build_video_outline_payload(evidence),
+        "video_story_blocks": _build_video_story_payload(evidence),
+        "viewer_feedback": get_viewer_feedback(evidence),
+    }
 
 
 def _normalize_bullet_text(value: str) -> str:
@@ -570,6 +821,17 @@ def _refine_incomplete_video_bullets(bullets: list[str], evidence: EvidenceBundl
 
 
 def _refine_bullets(summary_bullets: list[str], evidence: EvidenceBundle) -> list[str]:
+    if evidence.source_kind == "video_url":
+        explicit_outline = _extract_explicit_video_outline(evidence, summary_bullets)
+        if explicit_outline:
+            return [f"{idx + 1}. {point}" for idx, point in enumerate(explicit_outline)]
+        story_bullets = get_story_block_bullets(evidence, include_feedback=True, limit=6)
+        if story_bullets:
+            return [f"{idx + 1}. {point}" for idx, point in enumerate(story_bullets)]
+        outline_points = _extract_video_outline(evidence, summary_bullets)
+        if outline_points:
+            return [f"{idx + 1}. {point}" for idx, point in enumerate(outline_points)]
+
     candidates: list[str] = []
     for raw in summary_bullets:
         bullet = _normalize_bullet_text(raw)
@@ -836,7 +1098,7 @@ def _missing_required_fields(
     if not profile:
         profile = infer_content_profile(evidence.source_kind, evidence.source_url, evidence.text, metadata)
     signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
-    corpus = "\n".join([title, conclusion, *bullets, *evidence_quotes, *follow_up_actions]).lower()
+    corpus = "\n".join([title, conclusion, evidence.source_url or "", *bullets, *evidence_quotes, *follow_up_actions]).lower()
     missing: list[str] = []
     for key, value in iter_required_signal_entries(profile, signals):
         normalized = _normalize_requirement_token(value)
@@ -859,6 +1121,9 @@ def _missing_required_fields(
         )
         if not has_project_link:
             missing.append("section:项目与链接")
+    outline_points = _extract_video_outline(evidence, bullets)
+    if evidence.source_kind == "video_url" and outline_points and len(bullets) < len(outline_points):
+        missing.append(f"video_outline:{len(bullets)}/{len(outline_points)}")
     return missing
 
 

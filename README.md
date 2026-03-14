@@ -38,19 +38,134 @@ brew install yt-dlp ffmpeg
 
 If you cannot install system binaries, the bundled scripts can fall back to Python packages (`yt-dlp`, `imageio-ffmpeg`).
 
-3. Start the local service:
+3. Install analyzer runtime dependencies for real URL understanding:
+
+```bash
+uv venv .venv-runtime
+uv pip install --python .venv-runtime/bin/python beautifulsoup4 playwright fastapi uvicorn httpx
+.venv-runtime/bin/python -m playwright install chromium
+```
+
+4. Start the local service:
 
 ```bash
 PYTHONPATH=src python3 -m openclaw_capture_workflow.cli serve --config config.json
 ```
 
-4. Install the bundled OpenClaw skill into your local state:
+5. Install the bundled OpenClaw skill into your local state:
 
 ```bash
 bash scripts/install_skill.sh
 ```
 
-5. Ask OpenClaw to use the `knowledge-capture` skill when you want a link, text, image, or video archived into Obsidian.
+6. Ask OpenClaw to use the `knowledge-capture` skill when you want a link, text, image, or video archived into Obsidian.
+
+### Analyze a URL directly
+
+Once the analyzer runtime dependencies are installed, you can run the new CLI:
+
+```bash
+PYTHONPATH=src .venv-runtime/bin/python -m openclaw_capture_workflow.cli analyze-url \
+  --config config.json \
+  --url https://example.com
+```
+
+This prints a structured JSON document containing:
+
+- `title`
+- `summary`
+- `sections`
+- `images`
+- `videos`
+- `tables`
+
+Temporary screenshots, downloaded images, downloaded videos, and sampled frames
+are stored under `state/tmp/<job_id>/` during analysis and deleted automatically
+before the command exits.
+
+### Iterative recognition loop
+
+The project also includes an iterative evaluation loop for recognition quality.
+It can:
+
+- run baseline recognition on a case set
+- search the web for every case using the OpenClaw browser CLI
+- regenerate a searched variant
+- compare baseline vs searched
+- write per-case previews plus a summary report
+
+Run the mixed manual/auto loop:
+
+```bash
+PYTHONPATH=src .venv-runtime/bin/python scripts/run_iterative_recognition.py \
+  --config config.json \
+  --cases scripts/iterative_recognition_cases.json \
+  --case-source mixed
+```
+
+Merge the auto inbox into a deduplicated JSON file:
+
+```bash
+PYTHONPATH=src python3 scripts/merge_auto_cases.py
+```
+
+Outputs:
+
+- per-case previews:
+  - `state/previews/iter-<case_id>-baseline.md`
+  - `state/previews/iter-<case_id>-searched.md`
+  - `state/previews/iter-<case_id>-final.md`
+- summary reports:
+  - `state/reports/iterative_recognition_<timestamp>.md`
+  - `state/reports/iterative_recognition_<timestamp>.json`
+
+### Serve the analyzer over HTTP
+
+The analyzer can also run as a thin HTTP wrapper around the same core:
+
+```bash
+PYTHONPATH=src .venv-runtime/bin/python -m openclaw_capture_workflow.cli serve-api \
+  --config config.json \
+  --host 127.0.0.1 \
+  --port 8775
+```
+
+Available endpoints:
+
+- `GET /health`
+- `POST /analyze-url`
+
+Example request:
+
+```bash
+curl -s http://127.0.0.1:8775/analyze-url \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","requested_output_lang":"zh-CN"}'
+```
+
+### Optional: enable PinchTab as an alternate browser backend
+
+If you want the analyzer to use PinchTab for difficult or login-heavy sites:
+
+```bash
+npm install -g --prefix "$PWD/.npm-global" pinchtab
+"$PWD/.npm-global/bin/pinchtab"
+```
+
+Then set in `config.json`:
+
+```json
+{
+  "analysis": {
+    "browser_backend": "playwright",
+    "pinchtab_base_url": "http://127.0.0.1:9867"
+  }
+}
+```
+
+With this configuration, the analyzer keeps Playwright as the default backend
+and can fall back to PinchTab when Playwright rendering fails or yields too
+little body text.
 
 ## Config notes
 
