@@ -1,6 +1,6 @@
 # Next Session Handoff
 
-Last updated: 2026-03-12
+Last updated: 2026-03-15
 
 ## Current Goal
 
@@ -153,10 +153,12 @@ Confirmed:
 
 - AIHub ASR works with current OpenAI-compatible `/audio/transcriptions` path
 - no SiliconFlow switch is required just to make ASR functional
+- macOS 26+ now has a second path: local Apple `SpeechTranscriber` can be used before remote STT
 
 Current status:
 
 - AIHub ASR = working
+- Apple local ASR = working on this machine and can run without `STT_API_KEY`
 - remote OCR API = not yet integrated
 - local OCR is still used for image/keyframe OCR unless replaced by `image_ocr_command`
 

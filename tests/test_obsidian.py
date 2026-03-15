@@ -995,7 +995,90 @@ class ObsidianWriterTest(unittest.TestCase):
             content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
             self.assertIn("keyword_l1: 网络安全", content)
             self.assertIn("keyword_l2: IoT安全,逆向工程,DCS935L,0day", content)
+            self.assertIn("tags:\n  - \"0day\"\n  - \"网络安全\"\n  - \"IoT安全\"\n  - \"逆向工程\"\n  - \"DCS935L\"", content)
             self.assertTrue((writer.vault_path / "Topics/_Keywords/网络安全/IoT安全.md").exists())
+
+    def test_note_frontmatter_tags_dedupe_and_preserve_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = _writer(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI", "股票"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            note = writer.write(
+                SummaryResult(
+                    title="标签顺序检查",
+                    primary_topic="AI",
+                    secondary_topics=["股票"],
+                    entities=[],
+                    conclusion="测试结论。",
+                    bullets=["AI 产品更新", "资本市场反应"],
+                    evidence_quotes=[],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=["AI", "股票", "AI", "0day"],
+                    follow_up_actions=[],
+                ),
+                EvidenceBundle(
+                    source_kind="url",
+                    source_url="https://example.com/x",
+                    platform_hint="web",
+                    title="原始标题",
+                    text="正文",
+                    evidence_type="visible_page_text",
+                    coverage="full",
+                ),
+            )
+            content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
+            self.assertIn("tags:\n  - \"AI\"\n  - \"股票\"\n  - \"0day\"\n  - \"网络安全\"", content)
+
+    def test_note_frontmatter_omits_tags_when_no_note_or_keyword_tags_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=[],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                ),
+                renderer=_StaticNoteRenderer("# 无标签\n\n正文\n"),
+                materials_root=Path(tmp) / "_materials",
+            )
+            note = writer.write(
+                SummaryResult(
+                    title="无标签",
+                    primary_topic="未分类",
+                    secondary_topics=[],
+                    entities=[],
+                    conclusion="测试结论。",
+                    bullets=["普通内容"],
+                    evidence_quotes=[],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=[],
+                    follow_up_actions=[],
+                ),
+                EvidenceBundle(
+                    source_kind="url",
+                    source_url="https://example.com/no-tags",
+                    platform_hint="web",
+                    title="原始标题",
+                    text="正文",
+                    evidence_type="visible_page_text",
+                    coverage="full",
+                ),
+            )
+            content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
+            self.assertNotIn("\ntags:\n", content)
 
     def test_blocked_video_preview_hides_raw_debug_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -132,12 +132,14 @@ These fields help distinguish:
 - payload normalization and routing visibility
 - dry-run preview workflow
 - note structure is much more front-loaded than the old layout
+- macOS 26+ local Apple ASR can now provide video speech evidence without requiring an external STT key
 
 ## Current Weak Areas
 
 - XHS dynamic extraction still depends heavily on browser-readable evidence
 - some skill/install notes still produce verbose skill naming instead of perfectly normalized short names
 - video quality still depends on subtitle/ASR/keyframe availability and external platform restrictions
+- Apple local ASR is machine-dependent and currently only available on macOS 26+ with `swift` + `SpeechTranscriber`
 - real robot end-to-end validation is not yet re-run after the newest structure changes
 
 ## Recommended Validation Order For Future Work

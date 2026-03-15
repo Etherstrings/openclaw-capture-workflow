@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, ObsidianConfig, SummarizerConfig, TelegramConfig
 from openclaw_capture_workflow.models import EvidenceBundle, IngestRequest, SummaryResult
-from openclaw_capture_workflow.processor import WorkflowProcessor, _extract_steps_from_text
+from openclaw_capture_workflow.processor import WorkflowProcessor, _build_fallback_summary, _extract_steps_from_text
 from openclaw_capture_workflow.storage import JobStore
 
 
@@ -97,6 +97,60 @@ class StaticExtractor:
 
 
 class WorkflowProcessorTest(unittest.TestCase):
+    def test_video_fallback_summary_uses_story_blocks_instead_of_metadata_only(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+            platform_hint="bilibili",
+            title="OpenClaw你虾哥每天股票量化交易推荐",
+            text="视频证据",
+            transcript="把自选股交给 OpenClaw，在开盘前给出买入或者持有建议。",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={
+                "tracks": {"has_transcript": True, "has_subtitle": False, "has_keyframes": True, "has_keyframe_ocr": True},
+                "video_story_blocks": [
+                    {
+                        "label": "core_topic",
+                        "summary": "视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。",
+                        "evidence": ["标题: OpenClaw你虾哥每天股票量化交易推荐"],
+                    },
+                    {
+                        "label": "workflow",
+                        "summary": "流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。",
+                        "evidence": ["[00:15] 开盘之前给你买入或者持有建议"],
+                    },
+                    {
+                        "label": "implementation",
+                        "summary": "实现上依赖 GitHub、服务器或自动化工作流，把整套分析流程持续跑起来。",
+                        "evidence": ["[03:18] 我把我的 github 部署到上面"],
+                    },
+                    {
+                        "label": "risk",
+                        "summary": "视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。",
+                        "evidence": ["简介: 图一乐 别真跟着买 当然我跟着买了"],
+                    },
+                    {
+                        "label": "viewer_feedback",
+                        "summary": "评论区一边在讨论信号准度，一边也拿回本和涨跌结果来检验这套方法是否靠谱。",
+                        "evidence": ["有人讨论回本", "有人追问自动化扩展"],
+                    },
+                ],
+                "viewer_feedback": ["有人讨论回本", "有人追问自动化扩展"],
+            },
+        )
+
+        summary = _build_fallback_summary(evidence)
+
+        self.assertIn("OpenClaw", summary.conclusion)
+        self.assertIn("开盘前", summary.conclusion)
+        self.assertGreaterEqual(len(summary.bullets), 4)
+        self.assertIn("视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。", summary.bullets[0])
+        self.assertTrue(any("GitHub" in item or "自动化工作流" in item for item in summary.bullets))
+        self.assertTrue(any("盲目跟单" in item for item in summary.bullets))
+        self.assertTrue(any("评论区" in item for item in summary.bullets))
+        self.assertEqual(len(summary.follow_up_actions), 2)
+
     def test_extract_steps_from_text_skips_overlong_command_block(self) -> None:
         text = (
             "命令：/install-skill https://example.com/a.skill 方法二：手动下载安装 "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from typing import Dict, List
@@ -161,6 +162,7 @@ class ObsidianWriter:
         use_model_render: bool = False,
     ) -> tuple[str | None, str | None, str]:
         canonical_source_url = self._canonical_source_url(evidence.source_url)
+        frontmatter_tags = self._build_frontmatter_tags(summary, keyword_l1, keyword_l2)
         frontmatter = [
             "---",
             f"title: {summary.title}",
@@ -171,9 +173,11 @@ class ObsidianWriter:
             f"content_profile: {evidence.metadata.get('content_profile', {}).get('kind', '') if isinstance(evidence.metadata, dict) else ''}",
             f"keyword_l1: {keyword_l1 or ''}",
             f"keyword_l2: {','.join(keyword_l2)}",
-            "---",
-            "",
         ]
+        if frontmatter_tags:
+            frontmatter.append("tags:")
+            frontmatter.extend([f"  - {json.dumps(tag, ensure_ascii=False)}" for tag in frontmatter_tags])
+        frontmatter.extend(["---", ""])
         materials = build_note_materials(
             summary=summary,
             evidence=evidence,
@@ -200,6 +204,26 @@ class ObsidianWriter:
         polished_body = self._polish_rendered_body(str(body), summary, evidence, materials)
         content = "\n".join(frontmatter) + polished_body.rstrip() + "\n"
         return content, None, materials_file
+
+    def _build_frontmatter_tags(
+        self,
+        summary: SummaryResult,
+        keyword_l1: str | None,
+        keyword_l2: List[str],
+    ) -> List[str]:
+        ordered: List[str] = []
+        seen: set[str] = set()
+        candidates = [*(summary.note_tags or []), keyword_l1 or "", *keyword_l2]
+        for raw in candidates:
+            text = re.sub(r"\s+", " ", str(raw).strip())
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(text)
+        return ordered
 
     def _polish_rendered_body(
         self,

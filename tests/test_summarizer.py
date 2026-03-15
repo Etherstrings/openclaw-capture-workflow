@@ -9,11 +9,12 @@ from openclaw_capture_workflow.summarizer import PROMPT, _extract_explicit_video
 
 
 class SummarizerPostprocessTest(unittest.TestCase):
-    def test_prompt_uses_jarvis_role(self) -> None:
-        self.assertIn("J.A.R.V.I.S.", PROMPT)
-        self.assertIn("Tony Stark", PROMPT)
-        self.assertIn("Sir", PROMPT)
-        self.assertIn("large tech company", PROMPT)
+    def test_prompt_uses_direct_analyst_style(self) -> None:
+        self.assertIn("Direct Analyst", PROMPT)
+        self.assertIn("direct, useful answer", PROMPT)
+        self.assertNotIn("J.A.R.V.I.S.", PROMPT)
+        self.assertNotIn("Tony Stark", PROMPT)
+        self.assertNotIn("Sir", PROMPT)
 
     def test_signal_facts_are_prioritized_and_generic_bullets_removed(self) -> None:
         evidence = EvidenceBundle(
@@ -518,8 +519,6 @@ class SummarizerPostprocessTest(unittest.TestCase):
             [
                 "尝试下载并运行推荐的Hello项目",
                 "记录学习过程中遇到的问题以便后续解决",
-                "先确认项目是干什么的、关键技术点是什么，再决定是否继续投入",
-                "挑一个示例项目先下载并跑起来",
             ],
         )
 

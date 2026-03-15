@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download video audio, transcribe with OpenAI-compatible STT, print normalized JSON."""
+"""Download video audio and transcribe with Apple local speech or remote STT."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -19,6 +20,58 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 BVID_RE = re.compile(r"\b(BV[0-9A-Za-z]{10,})\b", re.IGNORECASE)
+SUPPORTED_BACKENDS = {"auto", "apple", "remote"}
+APPLE_LANGUAGE_TO_LOCALE = {
+    "": "zh_CN",
+    "zh": "zh_CN",
+    "zh-cn": "zh_CN",
+    "zh-hans": "zh_CN",
+    "zh-hans-cn": "zh_CN",
+    "zh-sg": "zh_CN",
+    "zh-tw": "zh_TW",
+    "zh-hk": "zh_HK",
+    "yue": "yue_CN",
+    "yue-cn": "yue_CN",
+    "en": "en_US",
+    "en-us": "en_US",
+    "en-gb": "en_GB",
+    "en-au": "en_AU",
+    "en-ca": "en_CA",
+    "en-ie": "en_IE",
+    "en-in": "en_IN",
+    "en-nz": "en_NZ",
+    "en-sg": "en_SG",
+    "en-za": "en_ZA",
+    "fr": "fr_FR",
+    "fr-fr": "fr_FR",
+    "fr-ca": "fr_CA",
+    "fr-be": "fr_BE",
+    "fr-ch": "fr_CH",
+    "de": "de_DE",
+    "de-de": "de_DE",
+    "de-at": "de_AT",
+    "de-ch": "de_CH",
+    "es": "es_ES",
+    "es-es": "es_ES",
+    "es-mx": "es_MX",
+    "es-us": "es_US",
+    "es-cl": "es_CL",
+    "it": "it_IT",
+    "it-it": "it_IT",
+    "it-ch": "it_CH",
+    "ja": "ja_JP",
+    "ja-jp": "ja_JP",
+    "ko": "ko_KR",
+    "ko-kr": "ko_KR",
+    "pt": "pt_BR",
+    "pt-br": "pt_BR",
+    "pt-pt": "pt_PT",
+}
+
+
+def _default_backend() -> str:
+    value = str(os.getenv("VIDEO_ASR_BACKEND", "auto")).strip().lower()
+    return value if value in SUPPORTED_BACKENDS else "auto"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -31,6 +84,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default=os.getenv("STT_LANGUAGE", ""))
     parser.add_argument("--cookies-from-browser", default=os.getenv("VIDEO_COOKIES_FROM_BROWSER", ""))
     parser.add_argument("--cookies", default=os.getenv("VIDEO_COOKIES_PATH", ""))
+    parser.add_argument("--backend", choices=sorted(SUPPORTED_BACKENDS), default=_default_backend())
     return parser.parse_args()
 
 
@@ -42,6 +96,17 @@ def _run(args: list[str]) -> None:
         stdout = (exc.stdout or "").strip()
         msg = stderr or stdout or str(exc)
         raise RuntimeError(f"command failed: {' '.join(args)} | {msg}") from exc
+
+
+def _run_output(args: list[str]) -> str:
+    try:
+        result = subprocess.run(args, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        msg = stderr or stdout or str(exc)
+        raise RuntimeError(f"command failed: {' '.join(args)} | {msg}") from exc
+    return (result.stdout or "").strip()
 
 
 def _python_candidates() -> list[str]:
@@ -96,6 +161,15 @@ def _python_imageio_ffmpeg_path(python_bin: str) -> str | None:
     return None
 
 
+def _find_existing_binary(*candidates: str | None) -> str | None:
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if Path(candidate).exists():
+            return str(candidate)
+    return None
+
+
 def _yt_dlp_cmd() -> list[str]:
     binary = shutil.which("yt-dlp")
     if binary:
@@ -107,9 +181,9 @@ def _yt_dlp_cmd() -> list[str]:
 
 
 def _ffmpeg_cmd() -> list[str]:
-    for candidate in [shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
-        if candidate and Path(candidate).exists():
-            return [str(candidate)]
+    binary = _find_existing_binary(shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+    if binary:
+        return [binary]
     for python_bin in _python_candidates():
         if not _python_has_module(python_bin, "imageio_ffmpeg"):
             continue
@@ -117,6 +191,13 @@ def _ffmpeg_cmd() -> list[str]:
         if ffmpeg_path:
             return [ffmpeg_path]
     raise RuntimeError("ffmpeg not found and imageio-ffmpeg unavailable")
+
+
+def _swift_cmd() -> list[str]:
+    binary = _find_existing_binary(shutil.which("swift"), "/usr/bin/swift")
+    if not binary:
+        raise RuntimeError("swift not found")
+    return [binary]
 
 
 def _extract_bvid(source_url: str) -> str | None:
@@ -339,7 +420,7 @@ def _build_multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, st
     return body, boundary
 
 
-def _transcribe(audio_path: Path, *, api_base_url: str, api_key: str, model: str, language: str) -> dict[str, Any]:
+def _transcribe_remote(audio_path: Path, *, api_base_url: str, api_key: str, model: str, language: str) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("missing STT api key (set STT_API_KEY or AIHUBMIX_API_KEY)")
     endpoint = api_base_url.rstrip("/") + "/audio/transcriptions"
@@ -407,6 +488,222 @@ def _estimate_duration_from_segments(segments: list[dict[str, float | str]]) -> 
     return round(max(end_points), 3)
 
 
+def _normalize_transcription_payload(raw: dict[str, Any], *, default_model: str) -> dict[str, Any]:
+    text = str(raw.get("text", "")).strip()
+    segments = _normalize_segments(raw.get("segments"))
+    if not text and segments:
+        text = " ".join(str(item.get("text", "")).strip() for item in segments if str(item.get("text", "")).strip())
+    duration_value = None
+    for field in ("duration_seconds", "duration", "duration_sec"):
+        duration = raw.get(field)
+        try:
+            duration_value = round(float(duration), 3) if duration is not None else None
+        except (TypeError, ValueError):
+            duration_value = None
+        if duration_value is not None:
+            break
+    if duration_value is None:
+        duration_ms = raw.get("duration_ms")
+        try:
+            duration_value = round(float(duration_ms) / 1000.0, 3) if duration_ms is not None else None
+        except (TypeError, ValueError):
+            duration_value = None
+    if duration_value is None:
+        duration_value = _estimate_duration_from_segments(segments)
+    return {
+        "text": re.sub(r"\s+", " ", text).strip()[:220000],
+        "language": str(raw.get("language", "")).strip().lower(),
+        "duration_seconds": duration_value,
+        "segments": segments[:1200],
+        "model": str(raw.get("model", "")).strip() or default_model,
+    }
+
+
+def _parse_version_tuple(value: str) -> tuple[int, ...]:
+    if not value:
+        return ()
+    parts: list[int] = []
+    for item in value.split("."):
+        if not item.isdigit():
+            break
+        parts.append(int(item))
+    return tuple(parts)
+
+
+def _macos_version() -> tuple[int, ...]:
+    if sys.platform != "darwin":
+        return ()
+    value = (platform.mac_ver()[0] or "").strip()
+    if value:
+        return _parse_version_tuple(value)
+    try:
+        raw = _run_output(["sw_vers", "-productVersion"])
+    except Exception:
+        return ()
+    return _parse_version_tuple(raw)
+
+
+def _is_macos_26_or_newer() -> bool:
+    version = _macos_version()
+    return bool(version) and version >= (26,)
+
+
+def _canonical_language_key(language: str) -> str:
+    return str(language or "").strip().lower().replace("_", "-")
+
+
+def _apple_locale_for_language(language: str) -> str | None:
+    key = _canonical_language_key(language)
+    if key in APPLE_LANGUAGE_TO_LOCALE:
+        return APPLE_LANGUAGE_TO_LOCALE[key]
+    if not key:
+        return APPLE_LANGUAGE_TO_LOCALE[""]
+    return None
+
+
+def _apple_helper_script_path() -> Path:
+    return Path(__file__).with_name("video_audio_asr_apple.swift")
+
+
+def _apple_backend_support_status(language: str) -> tuple[bool, str]:
+    if sys.platform != "darwin":
+        return False, "apple speech backend requires macOS"
+    if not _is_macos_26_or_newer():
+        version = ".".join(str(item) for item in _macos_version()) or "unknown"
+        return False, f"apple speech backend requires macOS 26+, got {version}"
+    try:
+        _swift_cmd()
+    except Exception as exc:
+        return False, str(exc)
+    helper_path = _apple_helper_script_path()
+    if not helper_path.exists():
+        return False, f"apple speech helper missing: {helper_path}"
+    locale = _apple_locale_for_language(language)
+    if not locale:
+        normalized = _canonical_language_key(language) or "<empty>"
+        return False, f"language not supported by apple speech backend: {normalized}"
+    return True, locale
+
+
+def _prepare_apple_audio_input(audio_file: Path, *, tmp: Path, max_seconds: float) -> Path:
+    if max_seconds <= 0:
+        return audio_file
+    output = tmp / "audio-apple.m4a"
+    ffmpeg_args = [
+        *_ffmpeg_cmd(),
+        "-y",
+        "-i",
+        str(audio_file),
+        "-vn",
+        "-t",
+        str(max_seconds),
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    _run(ffmpeg_args)
+    if not output.exists() or not output.is_file():
+        raise RuntimeError("apple audio preparation failed")
+    return output
+
+
+def _prepare_remote_audio_input(audio_file: Path, *, tmp: Path, max_seconds: float) -> Path:
+    asr_input = tmp / "audio-normalized.mp3"
+    ffmpeg_args = [
+        *_ffmpeg_cmd(),
+        "-y",
+        "-i",
+        str(audio_file),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+    ]
+    if max_seconds > 0:
+        ffmpeg_args.extend(["-t", str(max_seconds)])
+    ffmpeg_args.append(str(asr_input))
+    _run(ffmpeg_args)
+    if not asr_input.exists() or not asr_input.is_file():
+        raise RuntimeError("audio normalization failed")
+    return asr_input
+
+
+def _transcribe_with_apple(audio_path: Path, *, language: str) -> dict[str, Any]:
+    available, detail = _apple_backend_support_status(language)
+    if not available:
+        raise RuntimeError(detail)
+    helper_path = _apple_helper_script_path()
+    raw = _run_output(
+        [
+            *_swift_cmd(),
+            str(helper_path),
+            "--input-path",
+            str(audio_path),
+            "--locale",
+            detail,
+        ]
+    )
+    if not raw:
+        raise RuntimeError("apple speech helper returned no output")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("apple speech helper returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("apple speech helper returned unexpected payload")
+    return payload
+
+
+def _transcribe_downloaded_audio(
+    audio_file: Path,
+    *,
+    backend: str,
+    max_seconds: float,
+    api_base_url: str,
+    api_key: str,
+    model: str,
+    language: str,
+    temp_dir: Path,
+) -> dict[str, Any]:
+    normalized_backend = backend if backend in SUPPORTED_BACKENDS else "auto"
+    apple_error = ""
+    if normalized_backend in {"auto", "apple"}:
+        available, detail = _apple_backend_support_status(language)
+        if available:
+            try:
+                apple_input = _prepare_apple_audio_input(audio_file, tmp=temp_dir, max_seconds=max_seconds)
+                apple_raw = _transcribe_with_apple(apple_input, language=language)
+                payload = _normalize_transcription_payload(apple_raw, default_model="apple_speechtranscriber")
+                if not payload["text"] and not payload["segments"]:
+                    raise RuntimeError("apple speech transcription returned no usable text")
+                payload["backend"] = "apple"
+                return payload
+            except Exception as exc:
+                apple_error = str(exc)
+                if normalized_backend == "apple":
+                    raise RuntimeError(apple_error) from exc
+        else:
+            apple_error = detail
+            if normalized_backend == "apple":
+                raise RuntimeError(apple_error)
+
+    remote_input = _prepare_remote_audio_input(audio_file, tmp=temp_dir, max_seconds=max_seconds)
+    remote_raw = _transcribe_remote(
+        remote_input,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        model=model,
+        language=language.strip(),
+    )
+    payload = _normalize_transcription_payload(remote_raw, default_model=model)
+    payload["backend"] = "remote"
+    if apple_error and normalized_backend == "auto":
+        payload["fallback_reason"] = apple_error[:600]
+    return payload
+
+
 def main() -> int:
     args = _parse_args()
     with tempfile.TemporaryDirectory(prefix="oc-audio-") as tmp_dir:
@@ -441,47 +738,16 @@ def main() -> int:
         if not audio_file:
             raise RuntimeError("audio download failed: no audio file found")
 
-        asr_input = tmp / "audio-normalized.mp3"
-        ffmpeg_args = [
-            *_ffmpeg_cmd(),
-            "-y",
-            "-i",
-            str(audio_file),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-        ]
-        if args.max_seconds > 0:
-            ffmpeg_args.extend(["-t", str(max(1, int(args.max_seconds)))])
-        ffmpeg_args.append(str(asr_input))
-        _run(ffmpeg_args)
-        if not asr_input.exists() or not asr_input.is_file():
-            raise RuntimeError("audio normalization failed")
-
-        raw = _transcribe(
-            asr_input,
+        payload = _transcribe_downloaded_audio(
+            audio_file,
+            backend=args.backend,
+            max_seconds=args.max_seconds,
             api_base_url=args.api_base_url,
             api_key=args.api_key,
             model=args.model,
             language=args.language.strip(),
+            temp_dir=tmp,
         )
-        text = str(raw.get("text", "")).strip()
-        segments = _normalize_segments(raw.get("segments"))
-        duration = raw.get("duration")
-        try:
-            duration_value = round(float(duration), 3) if duration is not None else None
-        except (TypeError, ValueError):
-            duration_value = None
-        if duration_value is None:
-            duration_value = _estimate_duration_from_segments(segments)
-        payload = {
-            "text": re.sub(r"\s+", " ", text).strip()[:220000],
-            "language": str(raw.get("language", "")).strip().lower(),
-            "duration_seconds": duration_value,
-            "segments": segments[:1200],
-            "model": args.model,
-        }
         print(json.dumps(payload, ensure_ascii=False))
     return 0
 

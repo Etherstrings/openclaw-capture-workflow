@@ -22,8 +22,12 @@ from .models import IngestRequest, JobRecord, SummaryResult
 from .obsidian import ObsidianWriter
 from .note_renderer import OpenAICompatibleNoteRenderer
 from .storage import JobStore
-from .summarizer import OpenAICompatibleSummarizer, SummaryEngine, PROMPT_VERSION
+from .summarizer import OpenAICompatibleSummarizer, SummaryEngine, PROMPT_VERSION, _validate_and_normalize_summary
 from .telegram import TelegramNotifier
+from .video_story_blocks import get_qualified_video_story_blocks, get_viewer_feedback
+
+
+FALLBACK_SUMMARY_VERSION = "20260315-video-story-v1"
 
 
 def _has_sufficient_evidence_text(
@@ -138,6 +142,7 @@ def _evidence_fingerprint(evidence) -> str:
         "transcript": transcript[:12000],
         "tracks": tracks,
         "prompt_version": PROMPT_VERSION,
+        "fallback_summary_version": FALLBACK_SUMMARY_VERSION,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -521,6 +526,81 @@ def _clean_fallback_title(title: str | None) -> str:
 
 
 def _build_fallback_summary(evidence) -> SummaryResult:
+    if evidence.source_kind == "video_url":
+        blocks = get_qualified_video_story_blocks(evidence)
+        if blocks:
+            title = _clean_fallback_title(evidence.title)
+            block_map = {str(item.get("label", "")).strip(): item for item in blocks if isinstance(item, dict)}
+            ordered_bullets: list[str] = []
+            for label in ["core_topic", "workflow", "implementation", "risk", "viewer_feedback", "other"]:
+                block = block_map.get(label)
+                if not block:
+                    continue
+                summary = re.sub(r"\s+", " ", str(block.get("summary", "")).strip())
+                if summary and summary not in ordered_bullets:
+                    ordered_bullets.append(summary)
+            ordered_bullets = ordered_bullets[:5]
+
+            core_summary = re.sub(r"\s+", " ", str(block_map.get("core_topic", {}).get("summary", "")).strip())
+            workflow_summary = re.sub(r"\s+", " ", str(block_map.get("workflow", {}).get("summary", "")).strip())
+            risk_summary = re.sub(r"\s+", " ", str(block_map.get("risk", {}).get("summary", "")).strip())
+            if core_summary and workflow_summary:
+                conclusion = f"{core_summary.rstrip('。')}；同时{workflow_summary.rstrip('。')}。"
+            elif core_summary:
+                conclusion = core_summary if core_summary.endswith("。") else core_summary + "。"
+            elif ordered_bullets:
+                conclusion = ordered_bullets[0].rstrip("。") + "。"
+            else:
+                conclusion = f"视频主要围绕《{title}》展开。"
+            if risk_summary and "盲目跟单" in risk_summary and "技术展示" not in conclusion:
+                conclusion = conclusion.rstrip("。") + "，整体更偏技术展示而非直接投资建议。"
+
+            evidence_quotes: list[str] = []
+            for block in blocks:
+                for item in block.get("evidence", []) if isinstance(block.get("evidence", []), list) else []:
+                    text = re.sub(r"\s+", " ", str(item).strip())
+                    if not text or text in evidence_quotes:
+                        continue
+                    evidence_quotes.append(text)
+                    if len(evidence_quotes) >= 4:
+                        break
+                if len(evidence_quotes) >= 4:
+                    break
+            if not evidence_quotes:
+                evidence_quotes = [item for item in ordered_bullets[:2] if item]
+
+            viewer_feedback = get_viewer_feedback(evidence)
+            follow_up_actions: list[str] = []
+            if any(token in (evidence.text or "") for token in ["股票", "自选股", "买入", "持有", "量化"]):
+                follow_up_actions = [
+                    "回到原视频确认部署方式、触发入口和推送链路。",
+                    "如果准备实操，先自行复核信源、回测结果和风险边界。",
+                ]
+            elif viewer_feedback:
+                follow_up_actions = [
+                    "回看原视频确认观众争议点对应的上下文。",
+                    "把评论区里的扩展问题单独整理成后续验证项。",
+                ]
+
+            summary = SummaryResult(
+                title=title,
+                primary_topic="视频",
+                secondary_topics=["股票", "自动化"] if any(token in (evidence.text or "") for token in ["股票", "自选股"]) else [],
+                entities=["OpenClaw"] if "openclaw" in ((evidence.text or "") + " " + (evidence.title or "")).lower() else [],
+                conclusion=conclusion,
+                bullets=ordered_bullets or ["视频核心信息已提取。"],
+                evidence_quotes=evidence_quotes,
+                coverage=evidence.coverage or "partial",
+                confidence="high" if block_map.get("workflow") and block_map.get("implementation") else "medium",
+                note_tags=["video_fallback", "story_blocks"],
+                follow_up_actions=follow_up_actions,
+                recommendation_level="recommended" if ordered_bullets else "optional",
+                timeliness="medium",
+                effectiveness="high" if block_map.get("workflow") else "medium",
+                reader_judgment="从大厂程序员视角看，这条视频更像可复用工作流展示，值得按流程回看。",  # ensures WYSIWYG even without model
+            )
+            return _validate_and_normalize_summary(summary, evidence)
+
     title = _clean_fallback_title(evidence.title)
     primary_topic = "未分类"
     secondary_topics: list[str] = []
@@ -631,7 +711,7 @@ def _build_fallback_summary(evidence) -> SummaryResult:
     if not evidence_quotes:
         evidence_quotes = ["无可用摘录。"]
 
-    return SummaryResult(
+    summary = SummaryResult(
         title=title,
         primary_topic=primary_topic,
         secondary_topics=secondary_topics,
@@ -644,6 +724,7 @@ def _build_fallback_summary(evidence) -> SummaryResult:
         note_tags=[],
         follow_up_actions=[],
     )
+    return _validate_and_normalize_summary(summary, evidence)
 
 
 class WorkflowProcessor:
@@ -1129,13 +1210,25 @@ class WorkflowProcessor:
                     self.jobs.save(job)
                     job.notification = {"attempted": True, "ok": None, "error": None}
                     try:
-                        self.notifier.send_result(
-                            ingest,
-                            summary,
-                            str(note_meta["note_path"]),
-                            str(note_meta["structure_map"]),
-                            open_url,
-                        )
+                        try:
+                            self.notifier.send_result(
+                                ingest,
+                                summary,
+                                str(note_meta["note_path"]),
+                                str(note_meta["structure_map"]),
+                                open_url,
+                                evidence,
+                            )
+                        except TypeError as exc:
+                            if "positional arguments" not in str(exc) and "keyword" not in str(exc):
+                                raise
+                            self.notifier.send_result(
+                                ingest,
+                                summary,
+                                str(note_meta["note_path"]),
+                                str(note_meta["structure_map"]),
+                                open_url,
+                            )
                         job.notification = {"attempted": True, "ok": True, "error": None}
                         job.set_phase("notify", "done")
                     except Exception as exc:

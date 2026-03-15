@@ -38,6 +38,11 @@ brew install yt-dlp ffmpeg
 
 If you cannot install system binaries, the bundled scripts can fall back to Python packages (`yt-dlp`, `imageio-ffmpeg`).
 
+On macOS 26+, `scripts/video_audio_asr.py` now prefers Apple's local `SpeechTranscriber`
+for video ASR. This means local video transcription can work even when no external
+`STT_API_KEY` is configured. Other platforms, unsupported locales, or Apple ASR
+failures automatically fall back to the existing remote STT path.
+
 3. Install analyzer runtime dependencies for real URL understanding:
 
 ```bash
@@ -183,8 +188,13 @@ little body text.
   - `STT_API_KEY`
   - `STT_API_BASE_URL` (for AIHubMix: `https://aihubmix.com/v1`)
   - `STT_MODEL` (default `whisper-1`)
+  - `VIDEO_ASR_BACKEND` (`auto`, `apple`, or `remote`; default `auto`)
   - `VIDEO_COOKIES_FROM_BROWSER` (for YouTube/XHS/B站 anti-bot pages, e.g. `chrome`)
   - `VIDEO_COOKIES_PATH` (optional exported cookies file path)
+- `scripts/video_audio_asr.py` backend behavior:
+  - `auto`: prefer Apple local ASR on macOS 26+ when the locale is supported, otherwise fall back to remote STT.
+  - `apple`: require Apple local ASR and fail fast if unavailable.
+  - `remote`: always use the existing OpenAI-compatible `/audio/transcriptions` path.
 - `video_accuracy` controls video quality warnings and budget estimation:
   - `budget_rmb` default is `0.5` (10-minute target).
   - subtitles are used first; audio ASR runs only when subtitle text is too short (or `always_run_audio=true`).

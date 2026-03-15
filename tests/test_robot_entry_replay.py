@@ -10,6 +10,7 @@ from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, Obsidia
 from openclaw_capture_workflow.models import EvidenceBundle, IngestRequest, SummaryResult
 from openclaw_capture_workflow.processor import WorkflowProcessor
 from openclaw_capture_workflow.storage import JobStore
+from openclaw_capture_workflow.telegram import TelegramNotifier
 
 
 CASES_PATH = Path(__file__).resolve().parents[1] / "scripts" / "robot_ingest_regression_cases.json"
@@ -35,6 +36,23 @@ class ReplaySummarizer:
 class SilentNotifier:
     def send_result(self, ingest, summary, note_path, structure_map, open_url) -> None:
         return None
+
+
+class PreviewNotifier(TelegramNotifier):
+    def __init__(self) -> None:
+        super().__init__("token")
+        self.payloads: list[dict[str, str]] = []
+
+    def send_result(self, ingest, summary, note_path, structure_map, open_url, evidence=None) -> None:
+        payload = self.build_result_message_payload(
+            ingest,
+            summary,
+            note_path,
+            structure_map,
+            open_url,
+            evidence,
+        )
+        self.payloads.append(payload)
 
 
 class FakeNoteRenderer:
@@ -162,6 +180,37 @@ class RobotEntryReplayTest(unittest.TestCase):
                 self.assertEqual(job.status, "done")
                 self.assertEqual(job.result["entry_context"]["chat_target"], expected_target)
                 self.assertEqual(job.result["entry_context"]["source_kind"], ingest.source_kind)
+
+    def test_group_and_direct_replay_can_capture_telegram_preview_text(self) -> None:
+        cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))
+        group_case = next(item for item in cases if item["entry_context"]["chat_target"] == "group_chat")
+        direct_case = next(item for item in cases if item["entry_context"]["chat_target"] == "direct_chat")
+        for case in [group_case, direct_case]:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_dir = Path(tmp) / "state"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                jobs = JobStore(state_dir / "jobs")
+                processor = WorkflowProcessor(_config(tmp), jobs, ReplaySummarizer(), state_dir)
+                processor.extractor = StaticExtractor()
+                processor.writer.renderer = FakeNoteRenderer()
+                notifier = PreviewNotifier()
+                processor.notifier = notifier
+                processor.start()
+                ingest = IngestRequest.from_dict(case["payload"])
+                ingest.dry_run = False
+                processor.enqueue(ingest)
+                processor._queue.join()
+                processor.stop()
+                self.assertEqual(len(notifier.payloads), 1)
+                payload = notifier.payloads[0]
+                self.assertEqual(payload["chat_id"], str(ingest.chat_id))
+                if ingest.reply_to_message_id is not None:
+                    self.assertEqual(payload.get("reply_to_message_id"), str(ingest.reply_to_message_id))
+                else:
+                    self.assertNotIn("reply_to_message_id", payload)
+                self.assertIsInstance(payload.get("text"), str)
+                self.assertNotIn("{", payload["text"])
+                self.assertGreater(len(payload["text"].strip()), 20)
 
 
 if __name__ == "__main__":
