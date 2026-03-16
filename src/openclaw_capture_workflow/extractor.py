@@ -1751,7 +1751,11 @@ def _fetch_bilibili_viewer_feedback(
     snapshot_limit: int = 1600,
 ) -> tuple[list[str], dict[str, object]]:
     capture = {"attempted": True, "count": 0, "warning": None}
-    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
+    try:
+        tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
+    except Exception as exc:
+        capture["warning"] = str(exc)
+        return [], capture
     if not tab:
         capture["warning"] = "browser tab not found for bilibili viewer feedback"
         return [], capture

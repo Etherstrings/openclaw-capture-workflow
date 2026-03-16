@@ -466,9 +466,31 @@ def _render_video_direct_reply(
     return "\n".join(lines)
 
 
+def render_video_user_facing_text(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+    return _render_ranked_rant_video_reply(summary, evidence) or _render_video_direct_reply(
+        IngestRequest(chat_id="", reply_to_message_id=None, request_id="", source_kind="video_url"),
+        summary,
+        evidence,
+    )
+
+
 class TelegramNotifier:
     def __init__(self, bot_token: str) -> None:
         self.bot_token = bot_token
+
+    def _completion_line(self, summary_model: str | None, summary_elapsed_seconds: float | None) -> str:
+        label = re.sub(r"\s+", " ", str(summary_model or "").strip())
+        if not label:
+            return ""
+        if label == "fallback":
+            label = "fallback 规则总结器"
+        elif label == "cache":
+            label = "缓存结果"
+        try:
+            seconds = float(summary_elapsed_seconds if summary_elapsed_seconds is not None else 0.0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        return f"使用{label}模型经过{seconds:.1f}秒总结完成。"
 
     def build_result_message_payload(
         self,
@@ -478,9 +500,11 @@ class TelegramNotifier:
         structure_map: str,
         open_url: str,
         evidence: EvidenceBundle | None = None,
+        summary_model: str | None = None,
+        summary_elapsed_seconds: float | None = None,
     ) -> dict[str, str]:
         if _is_videoish(summary, ingest):
-            text = _render_ranked_rant_video_reply(summary, evidence) or _render_video_direct_reply(ingest, summary, evidence)
+            text = render_video_user_facing_text(summary, evidence)
         else:
             safe_note_path = _sanitize_for_telegram(note_path)
             bullets, link_lines = _display_bullets_for_telegram(summary, limit=5)
@@ -520,6 +544,9 @@ class TelegramNotifier:
                             compact_lines.append(f"{idx}. {clean}")
                 compact_lines.extend(["", f"归档：{safe_note_path}", f"打开：{open_url}"])
                 text = "\n".join(compact_lines)
+        completion_line = _sanitize_for_telegram(self._completion_line(summary_model, summary_elapsed_seconds))
+        if completion_line:
+            text = text.rstrip() + "\n\n" + completion_line
         payload: dict[str, str] = {
             "chat_id": str(ingest.chat_id),
             "text": text,
@@ -536,6 +563,8 @@ class TelegramNotifier:
         structure_map: str,
         open_url: str,
         evidence: EvidenceBundle | None = None,
+        summary_model: str | None = None,
+        summary_elapsed_seconds: float | None = None,
     ) -> None:
         payload = self.build_result_message_payload(
             ingest,
@@ -544,6 +573,8 @@ class TelegramNotifier:
             structure_map,
             open_url,
             evidence,
+            summary_model,
+            summary_elapsed_seconds,
         )
         data = urlparse.urlencode(payload).encode("utf-8")
         req = urlrequest.Request(

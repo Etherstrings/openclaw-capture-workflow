@@ -187,6 +187,40 @@ class TelegramFormatTest(unittest.TestCase):
         self.assertNotIn("reply_to_message_id", payload)
         self.assertIn("项目简报", payload["text"])
 
+    def test_build_result_message_payload_appends_model_and_elapsed_line(self) -> None:
+        ingest = IngestRequest(
+            chat_id="-1001",
+            reply_to_message_id="42",
+            request_id="tg-payload-meta",
+            source_kind="url",
+            source_url="https://docs.openclaw.ai/",
+            raw_text="https://docs.openclaw.ai/",
+        )
+        summary = SummaryResult(
+            title="OpenClaw 安装指南",
+            primary_topic="OpenClaw",
+            secondary_topics=[],
+            entities=[],
+            conclusion="OpenClaw 提供跨多个平台的 AI 代理服务，安装过程简单明了。",
+            bullets=["关键链接: https://docs.openclaw.ai/", "支持多平台", "安装服务并配对 WhatsApp"],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=["访问官方文档开始安装"],
+        )
+        payload = TelegramNotifier("token").build_result_message_payload(
+            ingest,
+            summary,
+            "Inbox/OpenClaw/test.md",
+            "",
+            "obsidian://open",
+            None,
+            "gpt-4o-mini",
+            12.34,
+        )
+        self.assertIn("使用gpt-4o-mini模型经过12.3秒总结完成。", payload["text"])
+
     def test_video_reply_matches_direct_answer_style(self) -> None:
         ingest = IngestRequest(
             chat_id="-1",

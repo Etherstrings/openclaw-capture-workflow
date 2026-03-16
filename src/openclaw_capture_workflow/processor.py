@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import threading
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.parse import quote
@@ -1025,6 +1026,7 @@ class WorkflowProcessor:
                 summary_mode = "normal"
                 summary_error = ""
                 summary_attempts = 0
+                summary_started_at = time.perf_counter()
                 summary = None
                 cache_key = ""
                 cache_hit = False
@@ -1141,6 +1143,7 @@ class WorkflowProcessor:
                         ):
                             cache_key = self._save_summary_cache(evidence, summary)
                 assert summary is not None
+                summary_elapsed_seconds = round(max(0.0, time.perf_counter() - summary_started_at), 3)
                 quality_score, quality_reasons, signal_coverage = _summary_quality_score(summary, evidence)
                 final_quality = {
                     "quality_score": round(quality_score, 4),
@@ -1218,6 +1221,8 @@ class WorkflowProcessor:
                                 str(note_meta["structure_map"]),
                                 open_url,
                                 evidence,
+                                summary_model_used,
+                                summary_elapsed_seconds,
                             )
                         except TypeError as exc:
                             if "positional arguments" not in str(exc) and "keyword" not in str(exc):
@@ -1249,6 +1254,7 @@ class WorkflowProcessor:
                     "summary_attempts": summary_attempts,
                     "summary_model": summary_model_used,
                     "summary_model_chain": summary_model_chain,
+                    "summary_elapsed_seconds": summary_elapsed_seconds,
                     "entry_context": _infer_entry_context(ingest),
                     "content_profile": evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {},
                     "signal_requirements": evidence.metadata.get("signal_requirements", {}) if isinstance(evidence.metadata, dict) else {},

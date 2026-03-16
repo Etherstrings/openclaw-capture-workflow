@@ -13,6 +13,7 @@ from .config import ObsidianConfig
 from .models import EvidenceBundle, SummaryResult
 from .note_renderer import NoteRenderEngine, build_note_materials, save_materials_file
 from .note_graph import build_structure_map, safe_name, unique_topics
+from .telegram import render_video_user_facing_text
 
 
 class ObsidianWriter:
@@ -193,6 +194,12 @@ class ObsidianWriter:
             self.materials_root,
             summary.title,
         )
+        if self._should_use_direct_video_body(summary, evidence, materials):
+            body = render_video_user_facing_text(summary, evidence).strip()
+            if not body:
+                return None, "video note renderer returned empty content", materials_file
+            content = "\n".join(frontmatter) + body.rstrip() + "\n"
+            return content, None, materials_file
         if self.renderer is None:
             return None, "note renderer unavailable", materials_file
         try:
@@ -204,6 +211,29 @@ class ObsidianWriter:
         polished_body = self._polish_rendered_body(str(body), summary, evidence, materials)
         content = "\n".join(frontmatter) + polished_body.rstrip() + "\n"
         return content, None, materials_file
+
+    def _should_use_direct_video_body(
+        self,
+        summary: SummaryResult,
+        evidence: EvidenceBundle,
+        materials: Dict[str, object],
+    ) -> bool:
+        if evidence.source_kind != "video_url":
+            return False
+        context = materials.get("context", {}) if isinstance(materials, dict) else {}
+        capture_status = context.get("capture_status", {}) if isinstance(context, dict) else {}
+        if not isinstance(capture_status, dict):
+            capture_status = {}
+        if str(capture_status.get("kind", "normal")).strip() != "normal":
+            return False
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        story_blocks = metadata.get("video_story_blocks", []) if isinstance(metadata.get("video_story_blocks"), list) else []
+        if len(story_blocks) >= 3:
+            return True
+        transcript = re.sub(r"\s+", " ", (evidence.transcript or "").strip())
+        if len(transcript) >= 400:
+            return True
+        return False
 
     def _build_frontmatter_tags(
         self,
@@ -466,6 +496,7 @@ class ObsidianWriter:
             return lowered in corpus
 
         category_rules = [
+            ("产品体验", ["交互设计", "用户体验", "产品经理", "kpi驱动", "kpi", "平台行为", "简中互联网", "反模式"]),
             ("网络安全", ["0day", "漏洞", "二进制", "逆向", "摄像头", "iot", "安全", "exploit", "kali", "ida"]),
             ("游戏", ["杀戮尖塔", "游戏", "卡牌", "流派", "攻略", "boss", "肉鸽", "steam"]),
             ("股票投资", ["股票", "财报", "量化", "交易", "自选股", "美股", "投资", "大盘", "行情"]),

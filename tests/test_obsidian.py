@@ -1080,6 +1080,101 @@ class ObsidianWriterTest(unittest.TestCase):
             content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
             self.assertNotIn("\ntags:\n", content)
 
+    def test_video_note_bypasses_generic_renderer_and_uses_direct_video_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ObsidianWriter(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI", "股票", "产品体验"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                ),
+                renderer=_StaticNoteRenderer("# 模板化失败内容\n\n这段视频详细盘点了..."),
+                materials_root=Path(tmp) / "_materials",
+            )
+            note = writer.write(
+                SummaryResult(
+                    title="OpenClaw你虾哥每天股票量化交易推荐",
+                    primary_topic="视频",
+                    secondary_topics=[],
+                    entities=["OpenClaw"],
+                    conclusion="视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议；同时流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议，整体更偏技术展示而非直接投资建议。",
+                    bullets=[
+                        "1. 视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。",
+                        "2. 流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。",
+                        "3. 实现上依赖 GitHub、服务器或自动化工作流，把整套分析流程持续跑起来。",
+                    ],
+                    evidence_quotes=[],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=["OpenClaw", "量化交易"],
+                    follow_up_actions=[],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1bFPMzFEnd",
+                    platform_hint="bilibili",
+                    title="OpenClaw你虾哥每天股票量化交易推荐",
+                    text="视频证据",
+                    transcript="把自选股交给 OpenClaw，在开盘前给出买入或者持有建议。",
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    metadata={
+                        "video_story_blocks": [
+                            {"label": "core_topic", "summary": "视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。", "evidence": []},
+                            {"label": "workflow", "summary": "流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。", "evidence": []},
+                            {"label": "implementation", "summary": "实现上依赖 GitHub、服务器或自动化工作流，把整套分析流程持续跑起来。", "evidence": []},
+                        ],
+                    },
+                ),
+            )
+            content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
+            self.assertIn("这个视频大意是在演示：作者怎么把 OpenClaw 改造成一个", content)
+            self.assertNotIn("这段视频详细盘点了", content)
+
+    def test_keyword_hierarchy_prefers_product_experience_for_interaction_design_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = _writer(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["产品体验"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            note = writer.write(
+                SummaryResult(
+                    title="简中互联网十大糟糕交互设计盘点",
+                    primary_topic="视频",
+                    secondary_topics=["用户体验"],
+                    entities=[],
+                    conclusion="这是一条交互设计吐槽视频。",
+                    bullets=["交互设计反模式", "产品经理为了 KPI 牺牲用户体验"],
+                    evidence_quotes=[],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=["交互设计", "产品经理", "KPI驱动", "简中互联网"],
+                    follow_up_actions=[],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1WAcQzKEW8",
+                    platform_hint="bilibili",
+                    title="简中互联网十大糟糕交互设计盘点",
+                    text="简中互联网 交互设计 用户体验 产品经理 KPI驱动",
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                ),
+            )
+            content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
+            self.assertIn("keyword_l1: 产品体验", content)
+
     def test_blocked_video_preview_hides_raw_debug_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = ObsidianConfig(

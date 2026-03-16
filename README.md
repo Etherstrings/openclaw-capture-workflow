@@ -1,49 +1,529 @@
 # OpenClaw Capture Workflow
 
-Local workflow service for `OpenClaw` that:
+`openclaw_capture_workflow` 是 OpenClaw 机器人的本地知识采集后端。
 
-- receives normalized ingestion payloads
-- extracts or accepts evidence text
-- generates a conservative summary with an OpenAI-compatible API
-- writes a main note plus topic/entity links into an Obsidian vault
-- sends a result message through a Telegram bot token
+它解决的问题不是“怎么聊天”，而是：
 
-## What this project includes
+- 用户把链接、视频、图文、截图发给机器人后
+- 本地系统如何真正理解内容
+- 如何把结果写进 Obsidian
+- 如何把人能看懂的结果回到 Telegram
 
-- A local HTTP service with `POST /ingest`, `GET /health`, and `GET /jobs/<id>`
-- A background worker with JSON-file job storage
-- A configurable extractor adapter layer for text, image OCR, subtitles, audio, and keyframes
-- A conservative summarizer client for OpenAI-compatible chat endpoints
-- Obsidian note generation with:
-  - one main note in `Inbox/OpenClaw/YYYY/MM/`
-  - topic index pages
-  - entity pages
-  - ASCII structure map at the top
-- An OpenClaw skill template plus install script
+如果你只想一句话理解它：
 
-## Quick start
+> OpenClaw 负责收消息，这个项目负责看懂内容、写入笔记、把结果发回去。
 
-1. Copy the example config and adjust paths and tokens:
+---
+
+## 1. 这个项目到底做什么
+
+输入：
+
+- Telegram 群聊 / 私聊里发给 OpenClaw 的消息
+- 支持文本、URL、视频 URL、图片、混合输入
+
+输出：
+
+- 结构化 summary
+- Obsidian 笔记
+- Telegram 返回消息
+
+主要目标：
+
+- 替用户先看一遍内容
+- 快速告诉用户“这是什么、值不值得继续看、最重要的点是什么”
+- 把结果落到可复用的知识库里
+
+---
+
+## 2. 整体架构
+
+详细版本见 [docs/ARCHITECTURE.md](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/ARCHITECTURE.md)。
+
+先看最核心的端到端流程：
+
+```mermaid
+flowchart LR
+    A["Telegram User"] --> B["OpenClaw Robot"]
+    B --> C["knowledge-capture skill"]
+    C --> D["POST /ingest"]
+    D --> E["WorkflowProcessor"]
+    E --> F["EvidenceExtractor"]
+    F --> G["OpenAICompatibleSummarizer"]
+    G --> H["ObsidianWriter"]
+    G --> I["TelegramNotifier"]
+    H --> J["Obsidian Vault"]
+    I --> K["Telegram Result Message"]
+```
+
+分层职责：
+
+1. 机器人入口：把消息变成标准 payload
+2. 本地处理：抽取证据、做总结
+3. 落库：写 Obsidian
+4. 回执：发 Telegram 消息
+
+---
+
+## 3. 目录结构
+
+```text
+openclaw_capture_workflow/
+├─ src/openclaw_capture_workflow/
+│  ├─ server.py              # /ingest HTTP 入口
+│  ├─ processor.py           # 主处理管线
+│  ├─ extractor.py           # 证据抽取
+│  ├─ summarizer.py          # 结构化总结
+│  ├─ obsidian.py            # 写入 Obsidian
+│  ├─ telegram.py            # 生成并发送 Telegram 返回
+│  ├─ analyzer/              # URL 分析与浏览器抓取
+│  └─ ...
+├─ scripts/
+│  ├─ video_subtitle_extract.py
+│  ├─ video_audio_asr.py
+│  ├─ video_audio_asr_apple.swift
+│  ├─ video_keyframes_extract.py
+│  ├─ run_robot_payload_replay.py
+│  └─ run_live_validation.py
+├─ docs/
+│  ├─ ARCHITECTURE.md
+│  ├─ LIVE_VALIDATION.md
+│  ├─ NEXT_SESSION_HANDOFF.md
+│  └─ TECHNICAL_HANDOFF.md
+├─ openclaw-skill/
+│  └─ knowledge-capture/
+└─ tests/
+```
+
+---
+
+## 4. 每一层用什么，优缺点是什么
+
+### 4.1 机器人入口层
+
+文件：
+
+- [openclaw-skill/knowledge-capture/SKILL.md](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/openclaw-skill/knowledge-capture/SKILL.md)
+
+做什么：
+
+- 读取 Telegram 消息
+- 归一化成 payload
+
+输出字段：
+
+- `chat_id`
+- `reply_to_message_id`
+- `request_id`
+- `source_kind`
+- `source_url`
+- `raw_text`
+- `image_refs`
+- `platform_hint`
+- `requested_output_lang`
+
+优点：
+
+- 入口统一
+- 后端只处理一种 payload 格式
+
+缺点：
+
+- 如果这里把内容分错类，后面都跟着偏
+
+### 4.2 HTTP 入口层
+
+文件：
+
+- [src/openclaw_capture_workflow/server.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/server.py)
+
+技术：
+
+- Python 内置 `http.server`
+
+做什么：
+
+- 提供 `POST /ingest`
+- 提供 `GET /jobs/<id>`
+- 提供 `GET /health`
+
+优点：
+
+- 轻量
+- 本地启动简单
+
+缺点：
+
+- 不适合高并发生产服务
+
+### 4.3 处理总管 WorkflowProcessor
+
+文件：
+
+- [src/openclaw_capture_workflow/processor.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/processor.py)
+
+做什么：
+
+- 控制 4 个阶段：
+  - `extract`
+  - `summarize`
+  - `write_note`
+  - `notify`
+- 记录 job 状态、warning、错误
+
+优点：
+
+- 可观测性强
+- 失败点好定位
+
+缺点：
+
+- 分支多
+- 视频链路比较复杂
+
+### 4.4 抽取层 EvidenceExtractor
+
+文件：
+
+- [src/openclaw_capture_workflow/extractor.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/extractor.py)
+
+按输入类型分流：
+
+- `pasted_text`
+- `image`
+- `video_url`
+- `url`
+- `mixed`
+
+#### 网页 / 文本
+
+主要依赖：
+
+- 页面可见正文
+- GitHub API
+- 浏览器快照
+
+优点：
+
+- 对 README、文档站、普通网页效果稳定
+
+缺点：
+
+- 动态站和反爬站不稳定
+
+#### 图片 / OCR
+
+主要依赖：
+
+- 本地 OCR
+- 默认 Swift OCR
+
+优点：
+
+- 截图兜底能力好
+
+缺点：
+
+- OCR 一旦脏，后面 summary 也会被带歪
+
+#### 视频
+
+当前视频抽取组合：
+
+1. 平台元数据
+2. 字幕
+3. 音轨转写
+4. 关键帧
+5. 关键帧 OCR
+6. 评论补充
+
+优点：
+
+- 不依赖单一字幕
+- B站 / 小红书效果已经明显好于早期版本
+
+缺点：
+
+- YouTube 容易被 bot check
+- 小红书页面形态波动大
+- 评论抓取依赖浏览器环境
+
+### 4.5 总结层 Summarizer
+
+文件：
+
+- [src/openclaw_capture_workflow/summarizer.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/summarizer.py)
+
+当前配置：
+
+- 默认 `gpt-4o-mini`
+- 通过 AIHubMix OpenAI-compatible API 调用
+
+做什么：
+
+- 把证据变成结构化 summary
+- 输出：
+  - `title`
+  - `conclusion`
+  - `bullets`
+  - `coverage`
+  - `confidence`
+  - `follow_up_actions`
+
+优点：
+
+- 输出结构稳定
+- 有 fallback 和质量检查
+
+缺点：
+
+- 如果抽取阶段信息太差，总结层很难完全救回来
+
+### 4.6 ObsidianWriter
+
+文件：
+
+- [src/openclaw_capture_workflow/obsidian.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/obsidian.py)
+
+做什么：
+
+- 写笔记到 `Inbox/OpenClaw`
+- 更新关键词索引
+- 写 frontmatter
+
+现在 frontmatter 会写：
+
+- `source_url`
+- `content_profile`
+- `keyword_l1`
+- `keyword_l2`
+- 原生 `tags:`
+
+优点：
+
+- 归档路径稳定
+- 支持 Obsidian 原生标签和项目自定义关键词索引双写
+
+缺点：
+
+- `keyword_l1` 规则还会误判，需持续修正
+
+### 4.7 TelegramNotifier
+
+文件：
+
+- [src/openclaw_capture_workflow/telegram.py](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/telegram.py)
+
+做什么：
+
+- 生成用户最终看到的消息文本
+- 真正发送到 Telegram
+
+现在已经拆成两层：
+
+- `build_result_message_payload()`：纯渲染
+- `send_result()`：真实发送
+
+优点：
+
+- 可无副作用预览返回效果
+- group / direct 都能测
+
+缺点：
+
+- 模板容易“回退成系统味”
+- 视频类和普通网页类不能共用一套口吻
+
+---
+
+## 5. 现在到底用什么技术
+
+### Playwright
+
+用在：
+
+- 浏览器渲染
+- 动态网页抓取
+
+优点：
+
+- 稳
+- 成熟
+
+缺点：
+
+- 重
+- 对某些站点正文仍可能太短
+
+### PinchTab
+
+用在：
+
+- Playwright 抓不到正文时的可选后端
+
+优点：
+
+- 可以做备用浏览器抓取层
+
+缺点：
+
+- 目前不是主路径
+- 还没成为默认稳定方案
+
+### yt-dlp
+
+用在：
+
+- YouTube / 小红书 / B站 视频下载
+- 音频和关键帧前置处理
+
+优点：
+
+- 平台覆盖广
+
+缺点：
+
+- 对 YouTube 反 bot 很敏感
+- 经常需要 cookies
+
+### Apple SpeechTranscriber
+
+用在：
+
+- macOS 26+ 本地音轨转写
+
+优点：
+
+- 不依赖外部 STT key
+- 对中文视频效果明显更稳
+
+缺点：
+
+- 机器依赖强
+- 不是跨平台能力
+
+### AIHubMix
+
+用在：
+
+- Summary 模型
+- STT fallback
+- note renderer
+
+优点：
+
+- 接 OpenAI-compatible 很方便
+
+缺点：
+
+- 外部依赖
+- 成本和可用性受网络影响
+
+### Obsidian
+
+用在：
+
+- 最终知识归档
+
+优点：
+
+- 最终结果可沉淀
+
+缺点：
+
+- 真跑测试时会污染真实 vault
+
+### Telegram
+
+用在：
+
+- 返回最终处理结果
+
+优点：
+
+- 用户即时可见
+
+缺点：
+
+- 真发消息会污染真实群聊 / 私聊
+
+---
+
+## 6. 平台维度说明
+
+### B站
+
+当前情况：
+
+- 效果最好
+- 公开音轨 + 元数据 + 关键帧组合比较稳定
+
+主要风险：
+
+- 不一定有公开字幕
+- 评论补充抓取会受浏览器环境影响
+
+### 小红书视频
+
+当前情况：
+
+- 已经比之前强很多
+- 音轨 + 关键帧 + OCR 组合能出 usable 结果
+
+主要风险：
+
+- 页面形态波动大
+- 音频下载不一定稳定
+
+### 小红书图文
+
+当前情况：
+
+- 可以走 URL / 网页链路
+- 对“图文 note”是必须单独测的一条路径
+
+主要风险：
+
+- URL 是否真的是图文 note 而不是视频页，需要单独核
+
+### YouTube
+
+当前情况：
+
+- 是最脆弱的平台
+
+主要风险：
+
+- `yt-dlp` 403
+- `Sign in to confirm you’re not a bot`
+- cookies 环境强依赖
+
+---
+
+## 7. 如何启动
+
+### 7.1 配置
 
 ```bash
 cp config.example.json config.json
 cp .env.example .env
 ```
 
-2. Install local media dependencies (required for high-quality video extraction):
+必须关注：
+
+- `obsidian.vault_path`
+- `telegram.result_bot_token`
+- `summarizer.api_key`
+
+### 7.2 安装依赖
+
+系统依赖：
 
 ```bash
 brew install yt-dlp ffmpeg
 ```
 
-If you cannot install system binaries, the bundled scripts can fall back to Python packages (`yt-dlp`, `imageio-ffmpeg`).
-
-On macOS 26+, `scripts/video_audio_asr.py` now prefers Apple's local `SpeechTranscriber`
-for video ASR. This means local video transcription can work even when no external
-`STT_API_KEY` is configured. Other platforms, unsupported locales, or Apple ASR
-failures automatically fall back to the existing remote STT path.
-
-3. Install analyzer runtime dependencies for real URL understanding:
+运行时依赖：
 
 ```bash
 uv venv .venv-runtime
@@ -51,256 +531,98 @@ uv pip install --python .venv-runtime/bin/python beautifulsoup4 playwright fasta
 .venv-runtime/bin/python -m playwright install chromium
 ```
 
-4. Start the local service:
+### 7.3 启服务
 
 ```bash
 PYTHONPATH=src python3 -m openclaw_capture_workflow.cli serve --config config.json
 ```
 
-5. Install the bundled OpenClaw skill into your local state:
+---
 
-```bash
-bash scripts/install_skill.sh
-```
+## 8. 怎么验证它真的能跑
 
-6. Ask OpenClaw to use the `knowledge-capture` skill when you want a link, text, image, or video archived into Obsidian.
-
-### Analyze a URL directly
-
-Once the analyzer runtime dependencies are installed, you can run the new CLI:
-
-```bash
-PYTHONPATH=src .venv-runtime/bin/python -m openclaw_capture_workflow.cli analyze-url \
-  --config config.json \
-  --url https://example.com
-```
-
-This prints a structured JSON document containing:
-
-- `title`
-- `summary`
-- `sections`
-- `images`
-- `videos`
-- `tables`
-
-Temporary screenshots, downloaded images, downloaded videos, and sampled frames
-are stored under `state/tmp/<job_id>/` during analysis and deleted automatically
-before the command exits.
-
-### Iterative recognition loop
-
-The project also includes an iterative evaluation loop for recognition quality.
-It can:
-
-- run baseline recognition on a case set
-- search the web for every case using the OpenClaw browser CLI
-- regenerate a searched variant
-- compare baseline vs searched
-- write per-case previews plus a summary report
-
-Run the mixed manual/auto loop:
-
-```bash
-PYTHONPATH=src .venv-runtime/bin/python scripts/run_iterative_recognition.py \
-  --config config.json \
-  --cases scripts/iterative_recognition_cases.json \
-  --case-source mixed
-```
-
-Merge the auto inbox into a deduplicated JSON file:
-
-```bash
-PYTHONPATH=src python3 scripts/merge_auto_cases.py
-```
-
-Outputs:
-
-- per-case previews:
-  - `state/previews/iter-<case_id>-baseline.md`
-  - `state/previews/iter-<case_id>-searched.md`
-  - `state/previews/iter-<case_id>-final.md`
-- summary reports:
-  - `state/reports/iterative_recognition_<timestamp>.md`
-  - `state/reports/iterative_recognition_<timestamp>.json`
-
-### Serve the analyzer over HTTP
-
-The analyzer can also run as a thin HTTP wrapper around the same core:
-
-```bash
-PYTHONPATH=src .venv-runtime/bin/python -m openclaw_capture_workflow.cli serve-api \
-  --config config.json \
-  --host 127.0.0.1 \
-  --port 8775
-```
-
-Available endpoints:
-
-- `GET /health`
-- `POST /analyze-url`
-
-Example request:
-
-```bash
-curl -s http://127.0.0.1:8775/analyze-url \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.com","requested_output_lang":"zh-CN"}'
-```
-
-### Optional: enable PinchTab as an alternate browser backend
-
-If you want the analyzer to use PinchTab for difficult or login-heavy sites:
-
-```bash
-npm install -g --prefix "$PWD/.npm-global" pinchtab
-"$PWD/.npm-global/bin/pinchtab"
-```
-
-Then set in `config.json`:
-
-```json
-{
-  "analysis": {
-    "browser_backend": "playwright",
-    "pinchtab_base_url": "http://127.0.0.1:9867"
-  }
-}
-```
-
-With this configuration, the analyzer keeps Playwright as the default backend
-and can fall back to PinchTab when Playwright rendering fails or yields too
-little body text.
-
-## Config notes
-
-- `obsidian.vault_path` must point to your local vault.
-- `telegram.result_bot_token` should be bot B's token (supports `${ENV_VAR}` placeholders in `config.json`).
-- `summarizer.api_base_url` can target any OpenAI-compatible endpoint, including AIHubMix or OpenAI direct.
-- `config.json` supports `${ENV_VAR}` placeholders. The loader auto-reads `.env` in the same folder.
-- `extractors.*_command` are optional shell command templates. Use `{url}`, `{input_path}`, `{output_path}`, `{max_seconds}`, `{api_key}`, `{api_base_url}` placeholders.
-- The default `config.example.json` wires three local scripts for video:
-  - `scripts/video_subtitle_extract.py` (subtitle-first)
-  - `scripts/video_audio_asr.py` (ASR fallback, OpenAI-compatible STT endpoint)
-  - `scripts/video_keyframes_extract.py` (visual keyframes)
-- For Bilibili URLs, scripts try Bilibili public APIs first (view/playurl/subtitle), then fall back to `yt-dlp`.
-- For STT scripts, define `.env` values:
-  - `STT_API_KEY`
-  - `STT_API_BASE_URL` (for AIHubMix: `https://aihubmix.com/v1`)
-  - `STT_MODEL` (default `whisper-1`)
-  - `VIDEO_ASR_BACKEND` (`auto`, `apple`, or `remote`; default `auto`)
-  - `VIDEO_COOKIES_FROM_BROWSER` (for YouTube/XHS/B站 anti-bot pages, e.g. `chrome`)
-  - `VIDEO_COOKIES_PATH` (optional exported cookies file path)
-- `scripts/video_audio_asr.py` backend behavior:
-  - `auto`: prefer Apple local ASR on macOS 26+ when the locale is supported, otherwise fall back to remote STT.
-  - `apple`: require Apple local ASR and fail fast if unavailable.
-  - `remote`: always use the existing OpenAI-compatible `/audio/transcriptions` path.
-- `video_accuracy` controls video quality warnings and budget estimation:
-  - `budget_rmb` default is `0.5` (10-minute target).
-  - subtitles are used first; audio ASR runs only when subtitle text is too short (or `always_run_audio=true`).
-  - missing tracks do not hard-fail by default; the job is completed with warnings for manual review.
-  - each video job returns `video_cost_estimate` in `/jobs/<id>`.
-- `evidence_gate` and `routing` make behavior shareable by config:
-  - evidence gate thresholds (short text acceptance) are configurable.
-  - network-search fallback policy is configurable without code changes.
-- `execution` controls cost-sensitive behavior:
-  - `dry_run_skip_model_call=true` avoids LLM calls during dry-run.
-  - `enable_summary_cache=true` reuses summaries for the same source URL + evidence fingerprint.
-  - `summary_cache_ttl_hours` controls cache validity window.
-  - `dry_run_video_probe_seconds=90` limits dry-run video extraction to a short probe window.
-  - `dry_run_skip_video_audio=true` and `dry_run_skip_video_keyframes=true` avoid expensive media tracks in dry-run.
-  - extractor command templates can consume `{max_seconds}` to implement partial extraction.
-- `summary_routing` controls automatic model upgrade:
-  - default path can stay on `gpt-4o-mini`.
-  - when enabled, low-quality outputs or model errors can auto-upgrade to `upgrade_model` (for example `gpt-4.1`).
-  - quality trigger uses `low_quality_threshold` and `min_signal_coverage`.
-  - `apply_on_dry_run=false` avoids extra cost during dry-run.
-
-## Verification
-
-Run the built-in unit tests:
+### 单元 / 集成测试
 
 ```bash
 python3 -m unittest discover -s tests
 ```
 
-## Handoff docs
-
-For future sessions, read:
-
-- `docs/NEXT_SESSION_HANDOFF.md`
-- `docs/TECHNICAL_HANDOFF.md`
-- `docs/ACCURACY_BASELINE.md`
-
-For saved robot-entry payload replay:
+### 回放机器人入口
 
 ```bash
 python3 scripts/run_robot_payload_replay.py --limit 2
 ```
 
-## Accuracy evaluation module
-
-Use the built-in evaluator to identify exactly which step is failing (`extract`, `signals`, `summary`, `renderer`) for each real link/video case.
-
-1. Edit or copy case definitions:
+### 真实链路验证
 
 ```bash
-cp scripts/accuracy_eval_cases.example.json scripts/accuracy_eval_cases.local.json
+python3 scripts/run_live_validation.py --config config.json
 ```
 
-2. Run low-cost rule evaluation (no summary model calls):
+这个脚本会：
 
-```bash
-python3 scripts/run_accuracy_eval.py \
-  --config config.json \
-  --cases scripts/accuracy_eval_cases.local.json \
-  --summary-mode fallback
-```
+- 备份并清空 OpenClaw 托管的 Obsidian 区域
+- 用真实配置跑样本
+- 真写 Obsidian
+- 真发 Telegram
+- 输出 JSON 报告
+- 更新 `docs/LIVE_VALIDATION.md`
 
-3. Run model-backed evaluation (higher accuracy, costs money):
+---
 
-```bash
-python3 scripts/run_accuracy_eval.py \
-  --config config.json \
-  --cases scripts/accuracy_eval_cases.local.json \
-  --summary-mode model \
-  --summary-model gpt-4.1 \
-  --summary-price-in 0.15 \
-  --summary-price-out 0.60
-```
+## 9. 失败排查
 
-4. Optional: add a judge model for stricter QA scoring:
+### 问题：B站 / 小红书视频效果突然变差
 
-```bash
-python3 scripts/run_accuracy_eval.py \
-  --config config.json \
-  --cases scripts/accuracy_eval_cases.local.json \
-  --summary-mode model \
-  --enable-judge \
-  --judge-model gpt-4.1-mini
-```
+优先检查：
 
-The tool writes:
+- 字幕是否可用
+- 音轨是否下载成功
+- ASR 是否跑起来
+- `video_story_blocks` 是否为空
 
-- JSON report: `state/reports/accuracy_eval_*.json`
-- Markdown report: `state/reports/accuracy_eval_*.md`
-- Per-case preview notes: `state/previews/acc-*.md`
+### 问题：YouTube 失败
 
-### Multi-type progressive validation
+优先检查：
 
-Run staged verification across mixed sources (XHS 图文/纯文字、B站视频、GitHub无README、GitHub Markdown文档、YouTube):
+- `VIDEO_COOKIES_FROM_BROWSER`
+- 本机浏览器 cookies 是否存在
+- `yt-dlp` 是否被 bot check
 
-```bash
-python3 scripts/run_progressive_validation.py \
-  --config config.json \
-  --cases scripts/accuracy_eval_cases.multitype.json \
-  --mini-model gpt-4o-mini \
-  --strong-model gpt-4.1
-```
+### 问题：Obsidian 写出来又变官样文章
 
-Outputs:
+优先检查：
 
-- stage reports: `state/reports/progressive_fallback_*.{json,md}`
-- stage reports: `state/reports/progressive_mini_*.{json,md}`
-- stage reports: `state/reports/progressive_strong_*.{json,md}`
-- combined matrix: `state/reports/progressive_combined_*.{json,md}`
+- 是否错误走回了旧 note renderer
+- 视频笔记是否触发了“强证据直出正文”逻辑
+
+### 问题：Telegram 返回又有模板味
+
+优先检查：
+
+- 是否走了视频专用渲染
+- 是否误走了普通网页消息模板
+
+---
+
+## 10. 当前最真实的限制
+
+- YouTube 仍然是最不稳定的平台
+- 小红书图文 / 视频边界样本还不够多
+- `keyword_l1` 分类规则还需要继续修
+- “回给用户的文本”和“写进 Obsidian 的正文”必须持续保证同风格，否则很容易再次分叉
+
+---
+
+## 11. 下一步最值得做什么
+
+如果只按优先级排：
+
+1. 保证 Telegram 返回和 Obsidian 正文始终同风格
+2. 做更多真实平台样本验证，尤其 YouTube 和小红书图文
+3. 把关键词分类从启发式规则继续收紧
+
+如果你要完整看链路设计，继续读：
+
+- [docs/ARCHITECTURE.md](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/ARCHITECTURE.md)
+- [docs/LIVE_VALIDATION.md](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/docs/LIVE_VALIDATION.md)

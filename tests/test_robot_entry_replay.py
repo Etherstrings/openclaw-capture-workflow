@@ -43,7 +43,7 @@ class PreviewNotifier(TelegramNotifier):
         super().__init__("token")
         self.payloads: list[dict[str, str]] = []
 
-    def send_result(self, ingest, summary, note_path, structure_map, open_url, evidence=None) -> None:
+    def send_result(self, ingest, summary, note_path, structure_map, open_url, evidence=None, summary_model=None, summary_elapsed_seconds=None) -> None:
         payload = self.build_result_message_payload(
             ingest,
             summary,
@@ -51,6 +51,8 @@ class PreviewNotifier(TelegramNotifier):
             structure_map,
             open_url,
             evidence,
+            summary_model,
+            summary_elapsed_seconds,
         )
         self.payloads.append(payload)
 
