@@ -1,18 +1,14 @@
 # Live Validation
 
-- 生成时间: 2026-03-16T23:44:07
-- JSON 报告: `state/reports/live_validation_20260316_233054.json`
+- 生成时间: 2026-03-17T00:37:04
+- JSON 报告: `state/reports/live_validation_20260317_002230.json`
 - Obsidian 备份:
-  - `inbox_backup` -> `/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/obsidian_cleanup_backup_20260316_233054/Inbox_OpenClaw`
-  - `keywords_backup` -> `/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/obsidian_cleanup_backup_20260316_233054/Topics__Keywords`
+  - `inbox_backup` -> `/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/obsidian_cleanup_backup_20260317_002230/Inbox_OpenClaw`
+  - `keywords_backup` -> `/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/obsidian_cleanup_backup_20260317_002230/Topics__Keywords`
 
 ## Summary
 
-- 成功样本: `7/10`
-- 失败样本:
-  - `xhs_note_1` -> `https://www.xiaohongshu.com/explore/68e10f380000000007008c4b`
-  - `xhs_note_2` -> `https://www.xiaohongshu.com/explore/69a3032400000000150305bb`
-  - `xhs_note_3` -> `https://www.xiaohongshu.com/explore/69b41a4c000000002103b520`
+- 成功样本: `10/10`
 
 ## Cases
 
@@ -22,8 +18,8 @@
 - 最终 URL: `https://www.bilibili.com/video/BV1WAcQzKEW8/`
 - 尝试: `https://www.bilibili.com/video/BV1WAcQzKEW8/`
   - job_status: `done` / `completed_with_warnings`
-  - model: `gpt-4.1` / elapsed: `24.364`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2331 简中互联网十大糟糕交互设计盘点.md`
+  - model: `gpt-4.1` / elapsed: `17.517`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0023 简中互联网十大反人类交互设计盘点.md`
   - telegram_ok: `True`
   - warnings:
     - `summary_model_upgrade_low_quality: primary=gpt-4o-mini -> upgrade=gpt-4.1`
@@ -67,7 +63,7 @@
 
 我这次是结合视频页信息、公开音轨转写交叉整理的；评论区这轮抓取有平台限制，但光靠音轨已经足够把主线和 10 个条目核实清楚。
 
-使用gpt-4.1模型经过24.4秒总结完成。
+使用gpt-4.1模型经过17.5秒总结完成。
 ```
 
 ### B站视频 2
@@ -76,8 +72,8 @@
 - 最终 URL: `https://www.bilibili.com/video/BV1bFPMzFEnd/`
 - 尝试: `https://www.bilibili.com/video/BV1bFPMzFEnd/`
   - job_status: `done` / `completed_with_warnings`
-  - model: `gpt-4o-mini` / elapsed: `21.486`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2332 OpenClaw股票量化交易推荐.md`
+  - model: `gpt-4o-mini` / elapsed: `13.31`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0023 OpenClaw股票量化交易推荐.md`
   - telegram_ok: `True`
   - warnings:
     - `summary_model_upgrade_skipped: upgrade_score=0.1 < primary_score=0.15`
@@ -99,7 +95,7 @@
 一句话总结：
 这视频是在秀一个 OpenClaw + 自动化工作流 的炒股辅助玩法，核心卖点是“每天自动分析自选股并推送建议”，更像技术展示，不是严肃投资建议。
 
-使用gpt-4o-mini模型经过21.5秒总结完成。
+使用gpt-4o-mini模型经过13.3秒总结完成。
 ```
 
 ### 小红书视频 1
@@ -108,8 +104,8 @@
 - 最终 URL: `https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7`
 - 尝试: `https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7`
   - job_status: `done` / `completed_with_warnings`
-  - model: `gpt-4.1` / elapsed: `18.477`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2333 小红书页面已失效.md`
+  - model: `gpt-4.1` / elapsed: `8.772`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0024 小红书页面无法访问.md`
   - telegram_ok: `True`
   - warnings:
     - `video_recovery_not_improved: reasons 2 -> 2`
@@ -117,7 +113,7 @@
     - `summary_model_upgrade_low_quality: primary=gpt-4o-mini -> upgrade=gpt-4.1`
 
 ```text
-该小红书页面已失效，无法访问原视频内容，当前证据不完整。
+该小红书页面已失效，无法访问任何视频或内容，当前证据不完整。
 
 主要讲了这几件事：
 
@@ -126,9 +122,9 @@
 主题: 小红书 - 你访问的页面不见了。
 
 一句话总结：
-该小红书页面已失效，无法访问原视频内容，当前证据不完整。
+该小红书页面已失效，无法访问任何视频或内容，当前证据不完整。
 
-使用gpt-4.1模型经过18.5秒总结完成。
+使用gpt-4.1模型经过8.8秒总结完成。
 ```
 
 ### 小红书视频 2
@@ -137,8 +133,8 @@
 - 最终 URL: `https://www.xiaohongshu.com/explore/6895cd780000000025026d99`
 - 尝试: `https://www.xiaohongshu.com/explore/6895cd780000000025026d99`
   - job_status: `done` / `completed_with_warnings`
-  - model: `gpt-4.1` / elapsed: `16.956`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2333 小红书页面已失效.md`
+  - model: `gpt-4.1` / elapsed: `10.274`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0025 小红书页面无法访问.md`
   - telegram_ok: `True`
   - warnings:
     - `video_recovery_not_improved: reasons 2 -> 2`
@@ -146,7 +142,7 @@
     - `summary_model_upgrade_low_quality: primary=gpt-4o-mini -> upgrade=gpt-4.1`
 
 ```text
-该小红书页面已失效，无法访问原视频内容，当前证据不完整。
+该小红书页面已失效，无法访问或获取任何视频内容，当前证据不完整。
 
 主要讲了这几件事：
 
@@ -155,9 +151,9 @@
 主题: 小红书 - 你访问的页面不见了。
 
 一句话总结：
-该小红书页面已失效，无法访问原视频内容，当前证据不完整。
+该小红书页面已失效，无法访问或获取任何视频内容，当前证据不完整。
 
-使用gpt-4.1模型经过17.0秒总结完成。
+使用gpt-4.1模型经过10.3秒总结完成。
 ```
 
 ### YouTube 视频 1
@@ -166,26 +162,26 @@
 - 最终 URL: `https://www.youtube.com/watch?v=c7qJzG_swUE`
 - 尝试: `https://www.youtube.com/watch?v=c7qJzG_swUE`
   - job_status: `done` / `completed`
-  - model: `gpt-4o-mini` / elapsed: `10.991`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2335 偉迪的美國夢故事.md`
+  - model: `gpt-4o-mini` / elapsed: `6.081`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0026 偉迪的美國夢.md`
   - telegram_ok: `True`
 
 ```text
-偉迪分享了他從無家可歸到成功的美國夢故事。
+偉迪的故事展示了從困境中崛起的美國夢。
 
 主要讲了这几件事：
 
 视频链接: https://www.youtube.com/watch?v=c7qJzG_swUE。
 偉迪15年前隨父母移民美國，起初生活困難。
-在拉斯維加斯無家可歸，後來移居舊金山。
-為了補貼家用，偉迪在漁人碼頭表演魔術。
-他在美國海軍服役5年，利用GI Bill上學。
-退役後，偉迪獲得學費和生活津貼，繼續學業。
+在拉斯維加斯無家可歸，後轉至舊金山找到工作機會。
+他以變魔術為生，幫助家庭支付租金。
+後來加入美國海軍，服役5年，獲得教育資助。
+退役後利用GI Bill上學，獲得每月房屋津貼。
 
 一句话总结：
-偉迪分享了他從無家可歸到成功的美國夢故事。
+偉迪的故事展示了從困境中崛起的美國夢。
 
-使用gpt-4o-mini模型经过11.0秒总结完成。
+使用gpt-4o-mini模型经过6.1秒总结完成。
 ```
 
 ### YouTube 视频 2
@@ -199,59 +195,102 @@
   - telegram_ok: `None`
 - 尝试: `https://www.youtube.com/watch?v=jNQXAC9IVRw`
   - job_status: `done` / `completed`
-  - model: `gpt-4o-mini` / elapsed: `9.103`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2343 大象的长鼻子.md`
+  - model: `gpt-4o-mini` / elapsed: `4.082`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0034 大象的长鼻子.md`
   - telegram_ok: `True`
 
 ```text
-视频展示了大象的长鼻子，内容简单直接。
+视频展示了大象及其长鼻子的特点。
 
 主要讲了这几件事：
 
 视频链接: https://www.youtube.com/watch?v=jNQXAC9IVRw。
-大象的鼻子非常长。
-视频内容简单，几乎没有其他信息。
+大象以其非常长的鼻子而闻名。
+视频内容简单，主要介绍了大象的外观特征。
 
 一句话总结：
-视频展示了大象的长鼻子，内容简单直接。
+视频展示了大象及其长鼻子的特点。
 
-使用gpt-4o-mini模型经过9.1秒总结完成。
+使用gpt-4o-mini模型经过4.1秒总结完成。
 ```
 
 ### 小红书图文 1
 - 类型: `url`
-- 成功: `False`
+- 成功: `True`
 - 最终 URL: `https://www.xiaohongshu.com/explore/68e10f380000000007008c4b`
 - 尝试: `https://www.xiaohongshu.com/explore/68e10f380000000007008c4b`
-  - job_status: `failed` / `failed`
-  - model: `` / elapsed: `None`
-  - note_path: ``
-  - telegram_ok: `None`
+  - job_status: `done` / `completed`
+  - model: `gpt-4o-mini` / elapsed: `3.679`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0035 页面不可见.md`
+  - telegram_ok: `True`
+
+```text
+该小红书页面当前不可访问，可能是链接失效或访问限制。
+
+主要讲了这几件事：
+
+关键链接: https://www.xiaohongshu.com/explore/68e10f380000000007008c4b。
+页面返回“不可见/暂时无法浏览”的状态。
+链接本身存在，但无法抓取正文内容。
+可能是平台对该笔记实施了访问限制。
+
+一句话总结：
+该小红书页面当前不可访问，可能是链接失效或访问限制。
+
+使用gpt-4o-mini模型经过3.7秒总结完成。
+```
 
 ### 小红书图文 2
 - 类型: `url`
-- 成功: `False`
+- 成功: `True`
 - 最终 URL: `https://www.xiaohongshu.com/explore/69a3032400000000150305bb`
 - 尝试: `https://www.xiaohongshu.com/explore/69a3032400000000150305bb`
-  - job_status: `failed` / `failed`
-  - model: `` / elapsed: `None`
-  - note_path: ``
-  - telegram_ok: `None`
+  - job_status: `done` / `completed`
+  - model: `gpt-4o-mini` / elapsed: `4.549`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0036 页面不可见.md`
+  - telegram_ok: `True`
+
+```text
+当前小红书页面无法访问，内容不可见。
+
+主要讲了这几件事：
+
+关键链接: https://www.xiaohongshu.com/explore/69a3032400000000150305bb。
+页面返回'不可见/暂时无法浏览'提示。
+可能是原链接失效或访问限制。
+确认链接存在，但无法抓取正文内容。
+
+一句话总结：
+当前小红书页面无法访问，内容不可见。
+
+使用gpt-4o-mini模型经过4.5秒总结完成。
+```
 
 ### 小红书图文 3
 - 类型: `url`
-- 成功: `False`
-- 最终 URL: `https://www.xiaohongshu.com/explore/69b41a4c000000002103b520`
+- 成功: `True`
+- 最终 URL: `https://www.xiaohongshu.com/explore/69aea021000000001a028a59`
 - 尝试: `https://www.xiaohongshu.com/explore/69aea021000000001a028a59`
-  - job_status: `failed` / `failed`
-  - model: `` / elapsed: `None`
-  - note_path: ``
-  - telegram_ok: `None`
-- 尝试: `https://www.xiaohongshu.com/explore/69b41a4c000000002103b520`
-  - job_status: `failed` / `failed`
-  - model: `` / elapsed: `None`
-  - note_path: ``
-  - telegram_ok: `None`
+  - job_status: `done` / `completed`
+  - model: `gpt-4o-mini` / elapsed: `3.406`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0036 页面不可见.md`
+  - telegram_ok: `True`
+
+```text
+当前小红书页面无法访问，内容不可见。
+
+主要讲了这几件事：
+
+关键链接: https://www.xiaohongshu.com/explore/69aea021000000001a028a59。
+页面返回'不可见/暂时无法浏览'提示。
+可能是原链接失效或访问限制。
+确认链接存在，但无法抓取正文内容。
+
+一句话总结：
+当前小红书页面无法访问，内容不可见。
+
+使用gpt-4o-mini模型经过3.4秒总结完成。
+```
 
 ### 普通图文网页
 - 类型: `url`
@@ -259,29 +298,29 @@
 - 最终 URL: `https://docs.openclaw.ai/`
 - 尝试: `https://docs.openclaw.ai/`
   - job_status: `done` / `completed`
-  - model: `gpt-4o-mini` / elapsed: `9.502`
-  - note_path: `Inbox/OpenClaw/2026/03/2026-03-16 2343 OpenClaw 安装指南.md`
+  - model: `gpt-4o-mini` / elapsed: `4.989`
+  - note_path: `Inbox/OpenClaw/2026/03/2026-03-17 0036 OpenClaw 安装指南.md`
   - telegram_ok: `True`
 
 ```text
 OpenClaw 安装指南
 
-OpenClaw 提供跨多个消息平台的 AI 代理服务，安装过程简单。
+OpenClaw 提供了一个跨多个消息平台的 AI 代理网关，安装过程简单。
 
 主要内容：
 1. 支持 WhatsApp、Telegram、Discord、iMessage 等多个平台的 AI 代理
-2. 安装服务后，可以通过手机发送消息并获取代理响应
-3. 支持插件扩展，如 Mattermost
+2. 安装服务并配对 WhatsApp 开始使用网关
+3. 插件支持 Mattermost 等其他平台
 
 下一步：
 1. 访问 OpenClaw 文档以获取详细安装步骤
 2. 确保已准备好所需的消息平台账户
-3. 按照文档中的步骤进行服务配对和安装
+3. 按照文档中的步骤进行服务安装和配对
 
 https://docs.openclaw.ai/
 
-归档：Inbox/OpenClaw/2026/03/2026-03-16 2343 OpenClaw 安装指南 [md]
-打开：http://127.0.0.1:8765/open?path=Inbox%2FOpenClaw%2F2026%2F03%2F2026-03-16%202343%20OpenClaw%20%E5%AE%89%E8%A3%85%E6%8C%87%E5%8D%97.md
+归档：Inbox/OpenClaw/2026/03/2026-03-17 0036 OpenClaw 安装指南 [md]
+打开：http://127.0.0.1:8765/open?path=Inbox%2FOpenClaw%2F2026%2F03%2F2026-03-17%200036%20OpenClaw%20%E5%AE%89%E8%A3%85%E6%8C%87%E5%8D%97.md
 
-使用gpt-4o-mini模型经过9.5秒总结完成。
+使用gpt-4o-mini模型经过5.0秒总结完成。
 ```

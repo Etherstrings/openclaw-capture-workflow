@@ -879,6 +879,32 @@ class ExtractorTest(unittest.TestCase):
             self.assertFalse(tracks.get("has_transcript"))
             self.assertEqual(evidence.metadata.get("video_story_blocks"), [])
 
+    def test_xiaohongshu_url_generates_blocked_notice_when_page_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
+            with patch(
+                "openclaw_capture_workflow.extractor._fetch_openclaw_browser_snapshot",
+                side_effect=RuntimeError("browser tab not found for url"),
+            ), patch(
+                "openclaw_capture_workflow.extractor._fetch_html_document",
+                return_value=("小红书 - 你访问的页面不见了", "沪ICP备13030189号 | 营业执照 | 违法不良信息举报电话"),
+            ), patch(
+                "openclaw_capture_workflow.extractor._fetch_openclaw_browser_screenshot_ocr",
+                side_effect=RuntimeError("browser tab not found for screenshot OCR"),
+            ):
+                evidence = extractor.extract(
+                    IngestRequest(
+                        chat_id="-1",
+                        reply_to_message_id="1",
+                        request_id="xhs-web-blocked-1",
+                        source_kind="url",
+                        source_url="https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+                    )
+                )
+            self.assertEqual(evidence.coverage, "partial")
+            self.assertIn("小红书图文当前在本地环境下已经返回", evidence.text)
+            self.assertIn("web_blocked_notice", evidence.metadata.get("evidence_sources", []))
+
     def test_video_extract_adds_viewer_feedback_and_story_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")

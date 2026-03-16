@@ -72,6 +72,9 @@ def _has_sufficient_evidence_text(
         raw_signals = metadata.get("signals", {})
         if isinstance(raw_signals, dict):
             signals = raw_signals
+        evidence_sources = metadata.get("evidence_sources", [])
+        if isinstance(evidence_sources, list) and "web_blocked_notice" in evidence_sources:
+            return True
     has_signal = any(bool(signals.get(key)) for key in ["skills", "skill_ids", "commands", "links"])
     if has_signal and len(cleaned) >= min_chars_signal:
         return True

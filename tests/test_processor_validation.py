@@ -134,6 +134,60 @@ class ProcessorValidationTest(unittest.TestCase):
             self.assertEqual(job.status, "failed")
             self.assertIn("insufficient evidence", job.error)
 
+    def test_xiaohongshu_blocked_notice_can_continue_to_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AppConfig(
+                listen_host="127.0.0.1",
+                listen_port=8765,
+                state_dir="state",
+                obsidian=ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI", "股票"],
+                    auto_topic_blocklist=["测试", "总结", "路径"],
+                    auto_entity_pages=False,
+                ),
+                telegram=TelegramConfig(result_bot_token="token"),
+                summarizer=SummarizerConfig(api_base_url="https://example.com", api_key="k", model="m", timeout_seconds=30),
+                extractors=ExtractorConfig(),
+            )
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            jobs = JobStore(state_dir / "jobs")
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, StableSummarizer(), state_dir))
+            processor.notifier = SilentNotifier()
+            processor.extractor = StaticExtractor(
+                EvidenceBundle(
+                    source_kind="url",
+                    source_url="https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+                    platform_hint="xiaohongshu",
+                    title="小红书 - 你访问的页面不见了",
+                    text="这条小红书图文当前在本地环境下已经返回“页面不可见/暂时无法浏览”，所以拿不到正文内容。",
+                    evidence_type="visible_page_text",
+                    coverage="partial",
+                    metadata={"evidence_sources": ["web_blocked_notice"]},
+                )
+            )
+            processor.start()
+            ingest = IngestRequest(
+                chat_id="-1001",
+                reply_to_message_id="42",
+                request_id="job-xhs-blocked-web",
+                source_kind="url",
+                source_url="https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+                raw_text="https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+                dry_run=False,
+            )
+            processor.enqueue(ingest)
+            processor._queue.join()
+            job = jobs.load("job-xhs-blocked-web")
+            processor.stop()
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "done")
+            self.assertIn("note", job.result)
+
     def test_extract_steps_from_text_picks_numbered_steps(self) -> None:
         text = """
         一、安装nodejs

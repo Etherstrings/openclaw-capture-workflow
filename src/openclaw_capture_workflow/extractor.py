@@ -2136,6 +2136,30 @@ def _parse_keyframe_output(raw: str, output_dir: Path | None = None) -> tuple[li
     return _dedupe_strings(image_refs, limit=80), _dedupe_strings(text_hints, limit=80)
 
 
+def _build_blocked_web_text(
+    *,
+    source_url: str | None,
+    title: str | None,
+    warnings: list[str],
+) -> str:
+    lowered_url = (source_url or "").lower()
+    warning_text = " ".join(str(item) for item in warnings).lower()
+    if "xiaohongshu.com" in lowered_url:
+        if "页面不见了" in (title or "") or "无法浏览" in (title or ""):
+            return (
+                "这条小红书图文当前在本地环境下已经返回“页面不可见/暂时无法浏览”，"
+                "所以拿不到正文内容。更像是原链接失效或平台当前对这条笔记做了访问限制，"
+                "这次只能确认链接本身存在，暂时不能把正文当成已成功抓取。"
+            )
+        if "安全限制" in (title or "") or "ip存在风险" in warning_text or "安全限制" in warning_text:
+            return (
+                "这条小红书图文当前触发了平台安全限制，页面没有返回可用正文。"
+                "问题更像是平台风控或当前网络环境受限，而不是这条内容本身不存在；"
+                "如果要继续验证，优先考虑切换网络、浏览器环境或登录态后重试。"
+            )
+    return ""
+
+
 def _format_seconds_label(value: float) -> str:
     seconds = max(0, int(value))
     hours, remainder = divmod(seconds, 3600)
@@ -2857,6 +2881,15 @@ class EvidenceExtractor:
             request_metadata["signals"] = signals
         if _looks_like_legal_footer(text):
             text = ""
+        if not text:
+            blocked_text = _build_blocked_web_text(
+                source_url=request.source_url,
+                title=title,
+                warnings=fetch_warnings,
+            )
+            if blocked_text:
+                text = blocked_text
+                _add_evidence_source(request_metadata, "web_blocked_notice")
         request_metadata = _finalize_evidence_metadata(
             request_metadata,
             source_kind=request.source_kind,
@@ -2870,7 +2903,7 @@ class EvidenceExtractor:
             title=title,
             text=text,
             evidence_type="visible_page_text",
-            coverage="full" if text else "partial",
+            coverage="partial" if request_metadata.get("evidence_sources") == ["web_blocked_notice"] or "web_blocked_notice" in request_metadata.get("evidence_sources", []) else "full" if text else "partial",
             metadata=request_metadata,
         )
 
