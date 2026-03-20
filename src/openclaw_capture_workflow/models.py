@@ -21,6 +21,19 @@ def default_phase_status() -> Dict[str, str]:
     return {phase: "pending" for phase in JOB_PHASES}
 
 
+def _json_list_field(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return [value]
+
+
 @dataclass
 class IngestRequest:
     chat_id: str
@@ -53,6 +66,61 @@ class IngestRequest:
 
 
 @dataclass
+class EvidenceItem:
+    modality: str
+    source: str
+    provider: str
+    text: str
+    timestamp_start: Optional[float] = None
+    timestamp_end: Optional[float] = None
+    confidence: float = 0.0
+    artifact_ref: Optional[str] = None
+    is_primary: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CaptureRecord:
+    status: str = "empty"
+    provider: str = ""
+    reason: str = ""
+    artifact_refs: List[str] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+DEFAULT_CAPTURE_SLOTS = (
+    "page_metadata",
+    "subtitle",
+    "asr",
+    "keyframes",
+    "keyframe_ocr",
+    "github_repo",
+    "web_html",
+    "browser_render",
+    "comments",
+)
+
+
+@dataclass
+class CaptureManifest:
+    items: Dict[str, CaptureRecord] = field(default_factory=dict)
+
+    def ensure_defaults(self) -> None:
+        for name in DEFAULT_CAPTURE_SLOTS:
+            if name not in self.items or not isinstance(self.items[name], CaptureRecord):
+                self.items[name] = self.items.get(name) if isinstance(self.items.get(name), CaptureRecord) else CaptureRecord()
+
+    def to_dict(self) -> Dict[str, Any]:
+        self.ensure_defaults()
+        return {name: record.to_dict() for name, record in self.items.items()}
+
+
+@dataclass
 class EvidenceBundle:
     source_kind: str
     source_url: Optional[str]
@@ -64,9 +132,16 @@ class EvidenceBundle:
     transcript: Optional[str] = None
     keyframes: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    merged_text: str = ""
+    evidence_items: List[EvidenceItem] = field(default_factory=list)
+    capture_manifest: CaptureManifest = field(default_factory=CaptureManifest)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["evidence_items"] = [item.to_dict() for item in self.evidence_items]
+        payload["capture_manifest"] = self.capture_manifest.to_dict()
+        payload["merged_text"] = self.merged_text or self.text
+        return payload
 
 
 @dataclass
@@ -86,6 +161,13 @@ class SummaryResult:
     effectiveness: str = "medium"
     recommendation_level: str = "optional"
     reader_judgment: str = ""
+    outcome: str = "summarized"
+    evidence_basis: List[str] = field(default_factory=list)
+    timeline_sections: List[Dict[str, Any]] = field(default_factory=list)
+    uncertainties: List[str] = field(default_factory=list)
+    refusal_reason: str = ""
+    finance_matrix: List[Dict[str, Any]] = field(default_factory=list)
+    finance_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -96,19 +178,26 @@ class SummaryResult:
         return cls(
             title=data["title"],
             primary_topic=data["primary_topic"],
-            secondary_topics=list(data.get("secondary_topics", [])),
-            entities=list(data.get("entities", [])),
+            secondary_topics=[str(item) for item in _json_list_field(data.get("secondary_topics", [])) if str(item).strip()],
+            entities=[str(item) for item in _json_list_field(data.get("entities", [])) if str(item).strip()],
             conclusion=data["conclusion"],
-            bullets=list(data.get("bullets", [])),
-            evidence_quotes=list(data.get("evidence_quotes", [])),
+            bullets=[str(item) for item in _json_list_field(data.get("bullets", [])) if str(item).strip()],
+            evidence_quotes=[str(item) for item in _json_list_field(data.get("evidence_quotes", [])) if str(item).strip()],
             coverage=data.get("coverage", "partial"),
             confidence=data.get("confidence", "medium"),
-            note_tags=list(data.get("note_tags", [])),
-            follow_up_actions=list(data.get("follow_up_actions", [])),
+            note_tags=[str(item) for item in _json_list_field(data.get("note_tags", [])) if str(item).strip()],
+            follow_up_actions=[str(item) for item in _json_list_field(data.get("follow_up_actions", [])) if str(item).strip()],
             timeliness=data.get("timeliness", "medium"),
             effectiveness=data.get("effectiveness", "medium"),
             recommendation_level=data.get("recommendation_level", "optional"),
             reader_judgment=data.get("reader_judgment", ""),
+            outcome=data.get("outcome", "summarized"),
+            evidence_basis=[str(item) for item in _json_list_field(data.get("evidence_basis", [])) if str(item).strip()],
+            timeline_sections=[item for item in _json_list_field(data.get("timeline_sections", [])) if isinstance(item, dict)],
+            uncertainties=[str(item) for item in _json_list_field(data.get("uncertainties", [])) if str(item).strip()],
+            refusal_reason=data.get("refusal_reason", ""),
+            finance_matrix=[item for item in _json_list_field(data.get("finance_matrix", [])) if isinstance(item, dict)],
+            finance_snapshot=data.get("finance_snapshot", {}) if isinstance(data.get("finance_snapshot", {}), dict) else {},
         )
 
 

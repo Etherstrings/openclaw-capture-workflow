@@ -20,10 +20,9 @@ class NoteRendererTest(unittest.TestCase):
         self.assertIn("只根据给定物料总结", prompt)
         self.assertIn("不要编造", prompt)
         self.assertIn("直接返回 Markdown 正文", prompt)
-        self.assertIn("替用户写一份已经看完内容后的简报", prompt)
-        self.assertIn("有人味", prompt)
-        self.assertIn("贾维斯的思考", prompt)
-        self.assertNotIn("可直接做的下一步", prompt)
+        self.assertIn("直接信息简报", prompt)
+        self.assertIn("不要出现 `贾维斯`", prompt)
+        self.assertIn("不要把 blocked / unavailable 内容伪装成正常总结", prompt)
         self.assertNotIn("复习", prompt)
 
     def test_build_note_materials_contains_raw_inputs(self) -> None:

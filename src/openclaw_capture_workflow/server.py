@@ -6,7 +6,6 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
 import json
-import subprocess
 from typing import Callable
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -14,7 +13,6 @@ from .models import IngestRequest
 from .obsidian import ObsidianWriter
 from .processor import WorkflowProcessor
 from .storage import JobStore
-from .stock_pipeline import StockPipelineTrigger
 from .telegram import TelegramNotifier
 
 
@@ -22,7 +20,6 @@ class RequestHandler(BaseHTTPRequestHandler):
     processor: WorkflowProcessor
     job_store: JobStore
     obsidian_writer: ObsidianWriter
-    stock_trigger: StockPipelineTrigger
     telegram_notifier: TelegramNotifier
 
     def do_GET(self) -> None:  # noqa: N802
@@ -56,9 +53,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/stock-trigger":
-            self._handle_stock_trigger()
-            return
         if self.path != "/ingest":
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -76,46 +70,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "message": "已收到，开始处理",
                 },
             )
-        except Exception as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-
-    def _handle_stock_trigger(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length).decode("utf-8")
-            payload = json.loads(raw) if raw else {}
-            chat_id = str(payload["chat_id"])
-            reply_to_message_id = payload.get("reply_to_message_id")
-            try:
-                reply_to_message_id = int(reply_to_message_id) if reply_to_message_id is not None else None
-            except (TypeError, ValueError):
-                reply_to_message_id = None
-            action = str(payload.get("action", "trigger"))
-            mode = str(payload.get("mode", "full"))
-
-            if action == "inspect":
-                result = self.stock_trigger.inspect()
-            else:
-                result = self.stock_trigger.trigger(mode=mode)
-
-            self.telegram_notifier.send_text(
-                chat_id=chat_id,
-                text=result.message,
-                reply_to_message_id=reply_to_message_id,
-            )
-            self._json(
-                HTTPStatus.ACCEPTED,
-                {
-                    "ok": True,
-                    "message": result.message,
-                    "run_url": result.run_url,
-                    "status": result.status,
-                    "mode": result.mode,
-                },
-            )
-        except subprocess.CalledProcessError as exc:  # type: ignore[name-defined]
-            stderr = (exc.stderr or "").strip()
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": stderr or str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
@@ -213,6 +167,5 @@ def build_server(host: str, port: int, processor: WorkflowProcessor, job_store: 
     handler.processor = processor
     handler.job_store = job_store
     handler.obsidian_writer = processor.writer
-    handler.stock_trigger = StockPipelineTrigger()
     handler.telegram_notifier = processor.notifier
     return ThreadingHTTPServer((host, port), handler)

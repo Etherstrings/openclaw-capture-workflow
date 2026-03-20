@@ -34,9 +34,45 @@ _PLACEHOLDER_SUMMARY_PATTERNS = [
     re.compile(r"^视频还补充了若干细节和示例，帮助理解真正落地时会遇到什么问题。?$"),
 ]
 
+_BENCHMARK_HINT_TOKENS = [
+    "横评",
+    "跑分",
+    "基准",
+    "benchmark",
+    "统一内存",
+    "带宽",
+    "并发",
+    "上下文",
+    "token",
+    "llama bench",
+    "llama.cpp",
+    "flash attention",
+    "解码",
+    "预填充",
+    "玉田冲",
+]
+
+_BENCHMARK_VENDOR_TOKENS = [
+    "苹果",
+    "apple",
+    "m4 max",
+    "m5 max",
+    "m max",
+    "英伟达",
+    "nvidia",
+    "gb10",
+    "amd",
+    "aimax",
+]
+
 
 def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _contains_any(corpus: str, tokens: list[str]) -> bool:
+    lowered = corpus.lower()
+    return any(token in corpus or token in lowered for token in tokens)
 
 
 def _unique_list(values: list[str], limit: int) -> list[str]:
@@ -250,7 +286,10 @@ def _core_topic_block(title: str, desc: str, corpus: str, lines: list[str]) -> d
     finance_tokens = ["股票", "股市", "自选股", "开盘", "买入", "持有", "量化", "交易", "行情"]
     game_tokens = ["攻略", "流派", "构筑", "打法", "卡组", "英雄", "boss", "角色"]
     tutorial_tokens = ["教程", "安装", "部署", "配置", "工作流", "自动化", "接入", "运行"]
-    if "openclaw" in lowered and any(token in corpus for token in finance_tokens):
+    benchmark_tokens = _BENCHMARK_HINT_TOKENS + _BENCHMARK_VENDOR_TOKENS + ["本地ai", "大模型", "推理速度"]
+    if _contains_any(corpus, benchmark_tokens):
+        summary = "视频在横评苹果、英伟达、AMD 三套统一内存平台的本地 AI 推理性能，重点比较吞吐、解码、长上下文和并发表现。"
+    elif "openclaw" in lowered and any(token in corpus for token in finance_tokens):
         summary = "视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。"
     elif any(token in corpus for token in game_tokens):
         summary = f"视频核心是在讲《{topic}》的玩法思路和关键套路。"
@@ -269,6 +308,19 @@ def _workflow_block(corpus: str, lines: list[str]) -> dict[str, object] | None:
     finance_tokens = ["自选股", "股票", "买入", "持有", "开盘", "分析", "推荐", "决策"]
     tutorial_tokens = ["安装", "部署", "配置", "运行", "接入", "步骤", "命令"]
     game_tokens = ["构筑", "流派", "打法", "资源", "卡牌", "路线"]
+    benchmark_tokens = [
+        "2048token",
+        "8k",
+        "32k",
+        "并发",
+        "llama",
+        "bench",
+        "flash attention",
+        "输入长度",
+        "解码",
+        "玉田冲",
+        "测试模型",
+    ]
     evidence = _pick_lines(
         lines,
         keywords=[
@@ -285,12 +337,21 @@ def _workflow_block(corpus: str, lines: list[str]) -> dict[str, object] | None:
             "运行",
             "构筑",
             "打法",
+            "2048token",
+            "8K",
+            "32K",
+            "并发",
+            "解码",
+            "玉田冲",
+            "测试模型",
         ],
         limit=3,
     )
     if not evidence:
         return None
-    if "openclaw" in corpus.lower() and any(token in corpus for token in finance_tokens):
+    if _contains_any(corpus, benchmark_tokens):
+        summary = "测试流程是统一模型、统一量化和统一上下文长度，再比较预填充、解码、长上下文衰减和多并发表现。"
+    elif "openclaw" in corpus.lower() and any(token in corpus for token in finance_tokens):
         summary = "流程是把自选股列表交给 OpenClaw，系统会在开盘前给出逐只股票的分析和买入/持有建议。"
     elif any(token in corpus for token in tutorial_tokens):
         summary = "视频把关键流程拆成了输入、配置和运行几个环节，重点在把方案真正跑起来。"
@@ -318,13 +379,23 @@ def _implementation_block(corpus: str, lines: list[str]) -> dict[str, object] | 
             "api",
             "分析方式",
             "专业",
+            "llama",
+            "bench",
+            "flash",
+            "2048token",
+            "8k",
+            "32k",
+            "并发",
+            "带宽",
         ],
         limit=3,
     )
     if not evidence:
         return None
     lowered = corpus.lower()
-    if any(token in lowered for token in ["github", "服务器", "部署", "自动化", "工作流"]):
+    if _contains_any(corpus, ["llama", "bench", "flash attention", "2048token", "8k", "32k", "并发", "带宽"]):
+        summary = "评测实现使用 llama.cpp / llama bench 与统一配置，并分别测试 2K、8K、32K 上下文以及多并发场景。"
+    elif any(token in lowered for token in ["github", "服务器", "部署", "自动化", "工作流"]):
         summary = "实现上依赖 GitHub、服务器或自动化工作流，把整套分析流程持续跑起来。"
     elif any(token in corpus for token in ["行情", "业绩", "数据", "信源", "专业"]):
         summary = "系统会结合行情、业绩和多种数据源来做判断，而不只是给一句结论。"
@@ -335,6 +406,11 @@ def _implementation_block(corpus: str, lines: list[str]) -> dict[str, object] | 
 
 def _risk_block(corpus: str, lines: list[str]) -> dict[str, object] | None:
     lowered = corpus.lower()
+    if _contains_any(corpus, _BENCHMARK_HINT_TOKENS + _BENCHMARK_VENDOR_TOKENS) and not _contains_any(
+        corpus,
+        ["风险", "谨慎", "参考", "娱乐", "别真跟", "图一乐", "不要盲目", "实盘", "回本", "亏"],
+    ):
+        return None
     evidence = _pick_lines(
         lines,
         keywords=[
@@ -371,10 +447,17 @@ def _viewer_feedback_block(feedback: list[str]) -> dict[str, object] | None:
     if not feedback:
         return None
     joined = " ".join(feedback)
+    lowered = joined.lower()
+    benchmark_feedback = _contains_any(
+        joined,
+        ["本地运行ai", "本地 ai", "nvidia", "amd", "苹果", "图片", "视频", "生态", "性价比", "普通人不需要"],
+    )
     positive = any(token in joined for token in ["挺准", "很准", "准", "回本", "大跌", "有意思", "厉害"])
     concern = any(token in joined for token in ["回本", "大跌", "风险", "亏", "谨慎"])
-    curiosity = any(token in joined.lower() for token in ["openclaw", "api", "自动化", "行情", "信源"])
-    if positive and concern:
+    curiosity = any(token in lowered for token in ["openclaw", "api", "自动化", "行情", "信源"])
+    if benchmark_feedback:
+        summary = "评论区主要在争论普通人是否需要本地 AI，以及苹果、英伟达、AMD 在生态、图片/视频生成和性价比上的取舍。"
+    elif positive and concern:
         summary = "评论区一边在讨论信号准度，一边也拿回本和涨跌结果来检验这套方法是否靠谱。"
     elif curiosity:
         summary = "评论区主要在追问自动化交易、数据源和这套方案能否继续扩展到更多场景。"
@@ -430,6 +513,9 @@ def build_video_story_blocks(evidence: EvidenceBundle) -> list[dict[str, object]
     lines = _candidate_lines(evidence)
     corpus_parts = [title, desc, evidence.text or "", evidence.transcript or "", *lines, *viewer_feedback]
     corpus = "\n".join([part for part in corpus_parts if _clean_text(part)])
+    benchmark_only_tokens = _BENCHMARK_HINT_TOKENS + _BENCHMARK_VENDOR_TOKENS + ["本地ai", "大模型", "推理速度", "统一内存"]
+    if not _contains_any(corpus, benchmark_only_tokens):
+        return []
 
     blocks: list[dict[str, object]] = []
     core = _core_topic_block(title, desc, corpus, lines)

@@ -10,9 +10,9 @@ The real goal is:
 
 - OpenClaw robot = message entry
 - local workflow = real processor
-- output should feel like a busy-user private secretary:
+- output should be a concise factual summary:
   - fast to scan
-  - clear about usefulness
+  - clear about what the content is about
   - honest about confidence
   - strong enough to archive into Obsidian
 
@@ -73,13 +73,12 @@ Files:
 - [`src/openclaw_capture_workflow/processor.py`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/processor.py)
 - [`src/openclaw_capture_workflow/summarizer.py`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/src/openclaw_capture_workflow/summarizer.py)
 
-### 3. Obsidian output reshaped toward “secretary mode”
+### 3. Obsidian output reshaped toward direct-summary mode
 
 Implemented:
 
 - frontloaded note structure
 - text mind map
-- usefulness section (`对你有什么用`)
 - evidence section
 - confidence/limitations section
 - bold keyword section
@@ -88,7 +87,7 @@ Current note structure:
 
 1. `一句话总结`
 2. `文字脑图`
-3. `对你有什么用`
+3. `内容主线与用途`
 4. `项目与链接`
 5. `关联笔记`
 6. `核心事实`
@@ -154,6 +153,11 @@ Confirmed:
 - AIHub ASR works with current OpenAI-compatible `/audio/transcriptions` path
 - no SiliconFlow switch is required just to make ASR functional
 - macOS 26+ now has a second path: local Apple `SpeechTranscriber` can be used before remote STT
+- important operator note for this machine:
+  - when real video body understanding matters, treat local Apple `SpeechTranscriber` as a preferred baseline to compare against external providers
+  - implementation path lives in:
+    - `scripts/video_audio_asr.py`
+    - `scripts/video_audio_asr_apple.swift`
 
 Current status:
 
@@ -179,7 +183,7 @@ This sample now reaches:
 Recent preview examples:
 
 - [`state/previews/report-bili-1773320241.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/previews/report-bili-1773320241.md)
-- [`state/previews/secretary-bili-1773320827.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/previews/secretary-bili-1773320827.md)
+- [`state/previews/validate-bili-long-1773763290.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/previews/validate-bili-long-1773763290.md)
 
 #### New long sample (>10 min)
 
@@ -202,7 +206,7 @@ Known problems in this long Bilibili sample:
 - conclusion too weak (`已提取核心事实`)
 - incorrect duration phrasing in summary
 - polluted action checklist
-- still not “professional secretary report” quality
+- still not “clear long-video summary” quality
 
 ### Xiaohongshu results
 
@@ -224,7 +228,7 @@ This sample now reaches:
 Recent preview examples:
 
 - [`state/previews/report-xhs-1773320241.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/previews/report-xhs-1773320241.md)
-- [`state/previews/secretary-xhs-1773320827.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/previews/secretary-xhs-1773320827.md)
+- [`state/xhs_note_retry_20260318_014240/previews/xhs-retry-404c49fd.md`](/Users/boyuewu/Documents/Projects/AIProjects/openclaw_capture_workflow/state/xhs_note_retry_20260318_014240/previews/xhs-retry-404c49fd.md)
 
 #### New >5 minute sample
 
@@ -237,7 +241,7 @@ Validated long-enough sample:
 Result:
 
 - much better than the earlier weak XHS page-only outputs
-- already fairly usable as a secretary-style note
+- already fairly usable as a direct summary note
 
 Latest preview:
 
@@ -295,7 +299,7 @@ Longer videos can be read, but report organization is still weaker than desired.
 
 Main gap:
 
-- it reads content, but does not yet think like a strong executive secretary
+- it reads content, but still lacks clear long-video mainline summarization
 
 Needed improvements:
 
@@ -355,7 +359,7 @@ But real:
 - group mention -> robot -> local workflow -> Telegram reply
 - direct-message -> robot -> local workflow -> Telegram reply
 
-have not been re-run after the newest video/secretary-style changes.
+have not been re-run after the newest video summary changes.
 
 ## Immediate Recommended Next Steps
 
@@ -381,7 +385,7 @@ What is genuinely solved now:
 
 - AIHub ASR works
 - Bilibili and Xiaohongshu video body can now be read
-- secretary-style note scaffolding exists
+- direct-summary note scaffolding exists
 - Obsidian is cleaned and showcase notes are linked
 
 What is not solved yet:

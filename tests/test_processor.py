@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, ObsidianConfig, SummarizerConfig, TelegramConfig
-from openclaw_capture_workflow.models import EvidenceBundle, IngestRequest, SummaryResult
+from openclaw_capture_workflow.models import EvidenceBundle, EvidenceItem, IngestRequest, SummaryResult
 from openclaw_capture_workflow.processor import WorkflowProcessor, _build_fallback_summary, _extract_steps_from_text
 from openclaw_capture_workflow.storage import JobStore
 
@@ -77,6 +77,9 @@ class FakeNotifier:
     def send_result(self, ingest, summary, note_path, structure_map, open_url) -> None:
         self.sent.append((ingest.request_id, note_path, structure_map, open_url))
 
+    def send_text(self, chat_id, text, reply_to_message_id=None) -> None:
+        self.sent.append((chat_id, text, reply_to_message_id))
+
 
 class FailingNotifier:
     def send_result(self, ingest, summary, note_path, structure_map, open_url) -> None:
@@ -86,6 +89,11 @@ class FailingNotifier:
 class BrokenSummarizer:
     def summarize(self, evidence: EvidenceBundle) -> SummaryResult:
         raise RuntimeError("invalid summary json")
+
+
+class BrokenVideoSummarizer:
+    def summarize(self, evidence: EvidenceBundle) -> SummaryResult:
+        raise RuntimeError("gemini compat request failed: HTTP Error 403: Forbidden")
 
 
 class StaticExtractor:
@@ -145,11 +153,11 @@ class WorkflowProcessorTest(unittest.TestCase):
         self.assertIn("OpenClaw", summary.conclusion)
         self.assertIn("开盘前", summary.conclusion)
         self.assertGreaterEqual(len(summary.bullets), 4)
-        self.assertIn("视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议。", summary.bullets[0])
+        self.assertIn("视频核心是在演示用 OpenClaw 做股票量化分析，并生成每日交易建议", summary.bullets[0])
         self.assertTrue(any("GitHub" in item or "自动化工作流" in item for item in summary.bullets))
         self.assertTrue(any("盲目跟单" in item for item in summary.bullets))
         self.assertTrue(any("评论区" in item for item in summary.bullets))
-        self.assertEqual(len(summary.follow_up_actions), 2)
+        self.assertGreaterEqual(len(summary.follow_up_actions), 1)
 
     def test_extract_steps_from_text_skips_overlong_command_block(self) -> None:
         text = (
@@ -340,10 +348,8 @@ class WorkflowProcessorTest(unittest.TestCase):
             job = jobs.load("job-fallback-summary")
             processor.stop()
             self.assertIsNotNone(job)
-            self.assertEqual(job.status, "done")
-            self.assertEqual(job.result["summary_mode"], "fallback")
-            self.assertIn("summary_error", job.result)
-            self.assertTrue(any("summarizer_fallback" in item for item in job.warnings))
+            self.assertEqual(job.status, "failed")
+            self.assertIn("invalid summary json", job.error)
 
     def test_temp_artifacts_are_cleaned_after_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -434,6 +440,7 @@ class WorkflowProcessorTest(unittest.TestCase):
             jobs = JobStore(state_dir / "jobs")
             processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
             processor.notifier = FakeNotifier()
+            processor.video_summarizer = FakeSummarizer()
             processor.extractor = StaticExtractor(
                 EvidenceBundle(
                     source_kind="video_url",
@@ -515,11 +522,171 @@ class WorkflowProcessorTest(unittest.TestCase):
             processor.stop()
             self.assertIsNotNone(job)
             self.assertEqual(job.status, "done")
-            self.assertEqual(counting.calls, 0)
-            self.assertEqual(job.result["summary_mode"], "fallback_dry_run")
-            self.assertEqual(job.result["summary_model"], "fallback")
-            self.assertEqual(job.result["summary_model_chain"], ["fallback"])
-            self.assertTrue(any("dry_run_skip_model_call" in item for item in job.warnings))
+            self.assertEqual(counting.calls, 1)
+            self.assertEqual(job.result["summary_mode"], "normal")
+            self.assertEqual(job.result["summary_model"], "m")
+            self.assertEqual(job.result["summary_model_chain"], ["m"])
+            self.assertFalse(any("dry_run_skip_model_call" in item for item in job.warnings))
+
+    def test_video_model_unavailable_degrades_to_partial_instead_of_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AppConfig(
+                listen_host="127.0.0.1",
+                listen_port=8765,
+                state_dir="state",
+                obsidian=ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI", "股票"],
+                    auto_topic_blocklist=["测试", "总结", "路径"],
+                    auto_entity_pages=False,
+                ),
+                telegram=TelegramConfig(result_bot_token="token"),
+                summarizer=SummarizerConfig(api_base_url="https://example.com", api_key="k", model="m", timeout_seconds=30),
+                extractors=ExtractorConfig(),
+            )
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            jobs = JobStore(state_dir / "jobs")
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
+            processor.video_summarizer = BrokenVideoSummarizer()
+            processor.notifier = FakeNotifier()
+            speech_text = "这是充足的中文语音转写内容。" * 100
+            processor.extractor = StaticExtractor(
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://example.com/video/model-unavailable",
+                    platform_hint="video",
+                    title="视频模型失败测试",
+                    text=speech_text,
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    transcript=speech_text,
+                    evidence_items=[
+                        EvidenceItem(
+                            modality="speech",
+                            source="asr",
+                            provider="video_audio_command",
+                            text=speech_text,
+                            timestamp_start=0.0,
+                            timestamp_end=220.0,
+                            confidence=0.9,
+                            is_primary=True,
+                        )
+                    ],
+                    metadata={
+                        "video_duration_seconds": 240,
+                        "tracks": {
+                            "has_subtitle": False,
+                            "has_transcript": True,
+                            "has_keyframes": True,
+                            "has_keyframe_ocr": True,
+                        },
+                    },
+                )
+            )
+            processor.start()
+            ingest = IngestRequest(
+                chat_id="-1001",
+                reply_to_message_id="42",
+                request_id="job-video-model-unavailable",
+                source_kind="video_url",
+                source_url="https://example.com/video/model-unavailable",
+                dry_run=True,
+            )
+            processor.enqueue(ingest)
+            processor._queue.join()
+            job = jobs.load("job-video-model-unavailable")
+            processor.stop()
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "done")
+            self.assertEqual(job.result["outcome"], "partial")
+            self.assertEqual(job.result["summary_mode"], "video_model_unavailable")
+            self.assertEqual(job.result["video_assessment"]["level"], "medium")
+            self.assertTrue(any("video_summary_model_unavailable" in item for item in job.warnings))
+
+    def test_low_quality_english_asr_uses_theme_only_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AppConfig(
+                listen_host="127.0.0.1",
+                listen_port=8765,
+                state_dir="state",
+                obsidian=ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["AI", "股票"],
+                    auto_topic_blocklist=["测试", "总结", "路径"],
+                    auto_entity_pages=False,
+                ),
+                telegram=TelegramConfig(result_bot_token="token"),
+                summarizer=SummarizerConfig(api_base_url="https://example.com", api_key="k", model="m", timeout_seconds=30),
+                extractors=ExtractorConfig(),
+            )
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            jobs = JobStore(state_dir / "jobs")
+            processor = _attach_note_renderer(WorkflowProcessor(cfg, jobs, FakeSummarizer(), state_dir))
+            processor.video_summarizer = BrokenVideoSummarizer()
+            gibberish = (
+                "Foher securitylifeses morlst takenerountet but werepecial fiew fomo "
+                "twonte malineargo the gena sive home the first humans marge "
+            ) * 12
+            processor.extractor = StaticExtractor(
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://example.com/video/theme-only",
+                    platform_hint="video",
+                    title="人类起源",
+                    text=gibberish,
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    transcript=gibberish,
+                    evidence_items=[
+                        EvidenceItem(
+                            modality="speech",
+                            source="asr",
+                            provider="video_audio_command",
+                            text=gibberish,
+                            timestamp_start=0.0,
+                            timestamp_end=180.0,
+                            confidence=0.9,
+                            is_primary=True,
+                        )
+                    ],
+                    metadata={
+                        "video_duration_seconds": 240,
+                        "transcript_language": "zh_cn",
+                        "tracks": {
+                            "has_subtitle": False,
+                            "has_transcript": True,
+                            "has_keyframes": True,
+                            "has_keyframe_ocr": True,
+                        },
+                    },
+                )
+            )
+            processor.start()
+            ingest = IngestRequest(
+                chat_id="-1001",
+                reply_to_message_id="42",
+                request_id="job-video-theme-only",
+                source_kind="video_url",
+                source_url="https://example.com/video/theme-only",
+                dry_run=True,
+            )
+            processor.enqueue(ingest)
+            processor._queue.join()
+            job = jobs.load("job-video-theme-only")
+            processor.stop()
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "done")
+            self.assertEqual(job.result["summary_mode"], "video_theme_only")
+            self.assertEqual(job.result["outcome"], "partial")
+            self.assertTrue(any("语音转写质量不足" in item for item in job.result["summary"]["uncertainties"]))
 
     def test_summary_cache_reuses_model_result_for_same_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

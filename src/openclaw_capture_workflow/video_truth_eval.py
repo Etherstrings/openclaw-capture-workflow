@@ -144,3 +144,53 @@ def evaluate_enumeration_recall(evidence: EvidenceBundle, summary: SummaryResult
         viewer_feedback_hit=_story_block_hit(summary_corpus, viewer_feedback_block),
         bullet_quality_ok=not any(_looks_like_raw_transcript_bullet(item, evidence) for item in summary_points),
     )
+
+
+def fallback_retained_outline_count(summary: SummaryResult) -> int:
+    seen_numbers: set[int] = set()
+    unique_points: list[str] = []
+    for raw in summary.bullets:
+        text = re.sub(r"\s+", " ", str(raw).strip())
+        if not text:
+            continue
+        match = re.match(r"^(\d{1,2})\.\s+", text)
+        if match:
+            seen_numbers.add(int(match.group(1)))
+            continue
+        normalized = _normalize_point(text)
+        if normalized and normalized not in unique_points:
+            unique_points.append(normalized)
+    if seen_numbers:
+        return len(seen_numbers)
+    if summary.timeline_sections:
+        labels: list[str] = []
+        for raw in summary.timeline_sections:
+            if not isinstance(raw, dict):
+                continue
+            heading = _normalize_point(str(raw.get("heading", "")).strip())
+            body = _normalize_point(str(raw.get("summary", "")).strip())
+            label = heading or body
+            if label and label not in labels:
+                labels.append(label)
+        if labels:
+            return len(labels)
+    return len(unique_points)
+
+
+def compute_retained_outline_count(
+    evidence: EvidenceBundle,
+    summary: SummaryResult,
+    *,
+    expected_outline_count: int = 0,
+) -> int:
+    fallback_count = fallback_retained_outline_count(summary)
+    recall = evaluate_enumeration_recall(evidence, summary)
+    if recall.outline_detected:
+        count = len(recall.matched_points)
+        if count == 0 and fallback_count > 0:
+            count = fallback_count
+    else:
+        count = fallback_count
+    if expected_outline_count > 0:
+        return min(expected_outline_count, max(0, count))
+    return max(0, count)

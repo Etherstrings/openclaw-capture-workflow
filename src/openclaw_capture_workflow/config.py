@@ -101,6 +101,74 @@ class VideoSummaryConfig:
     model: str = "gemini-2.5-pro"
     fallback_model: str = "gemini-2.5-flash"
     timeout_seconds: int = 60
+    chunk_window_seconds: int = 180
+    chunk_overlap_seconds: int = 30
+
+
+@dataclass
+class VideoProviderConfig:
+    enabled: bool = True
+    transport: str = "command"
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    http_url: str = ""
+    tool_name: str = ""
+    timeout_seconds: int = 90
+
+
+def _default_bilibili_provider() -> "VideoProviderConfig":
+    return VideoProviderConfig(
+        enabled=True,
+        transport="stdio_json",
+        command="bilibili-video-mcp-server",
+        args=[],
+        tool_name="extract_bilibili_complete_content",
+        timeout_seconds=180,
+    )
+
+
+def _default_xiaohongshu_provider() -> "VideoProviderConfig":
+    return VideoProviderConfig(
+        enabled=True,
+        transport="http_mcp",
+        http_url="http://127.0.0.1:18060/mcp",
+        tool_name="get_feed_detail",
+        timeout_seconds=90,
+    )
+
+
+def _default_youtube_provider() -> "VideoProviderConfig":
+    return VideoProviderConfig(
+        enabled=True,
+        transport="stdio_json",
+        command="npx",
+        args=["-y", "@kimtaeyoon83/mcp-server-youtube-transcript"],
+        tool_name="get_transcript",
+        timeout_seconds=90,
+    )
+
+
+def _default_vidscribe_provider() -> "VideoProviderConfig":
+    return VideoProviderConfig(
+        enabled=False,
+        transport="command",
+        command="",
+        args=[],
+        tool_name="",
+        timeout_seconds=120,
+    )
+
+
+@dataclass
+class VideoProviderRoutingConfig:
+    enabled: bool = True
+    bilibili_order: list[str] = field(default_factory=lambda: ["bilibili_mcp", "vidscribe", "local"])
+    xiaohongshu_order: list[str] = field(default_factory=lambda: ["xiaohongshu_mcp", "local"])
+    youtube_order: list[str] = field(default_factory=lambda: ["youtube_transcript_mcp", "vidscribe", "local"])
+    bilibili_mcp: VideoProviderConfig = field(default_factory=_default_bilibili_provider)
+    xiaohongshu_mcp: VideoProviderConfig = field(default_factory=_default_xiaohongshu_provider)
+    youtube_transcript_mcp: VideoProviderConfig = field(default_factory=_default_youtube_provider)
+    vidscribe: VideoProviderConfig = field(default_factory=_default_vidscribe_provider)
 
 
 @dataclass
@@ -120,6 +188,9 @@ class VideoAccuracyConfig:
     min_text_chars: int = 180
     require_speech_track: bool = True
     require_visual_track: bool = False
+    min_speech_chars_refuse: int = 400
+    min_speech_chars_summarize: int = 1200
+    min_coverage_ratio_for_summary: float = 0.35
     max_evidence_chars: int = 12000
     max_evidence_lines: int = 220
     retry_on_incomplete: bool = True
@@ -151,6 +222,7 @@ class AppConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     video_summary: VideoSummaryConfig = field(default_factory=VideoSummaryConfig)
+    video_provider_routing: VideoProviderRoutingConfig = field(default_factory=VideoProviderRoutingConfig)
     summary_routing: SummaryRoutingConfig = field(default_factory=SummaryRoutingConfig)
 
     @classmethod
@@ -174,6 +246,25 @@ class AppConfig:
             video_summary.api_key = data.get("summarizer", {}).get("api_key", "")
         if not video_summary.timeout_seconds:
             video_summary.timeout_seconds = int(data.get("summarizer", {}).get("timeout_seconds", 60))
+        provider_routing_data = data.get("video_provider_routing", {})
+        bilibili_provider = _default_bilibili_provider()
+        bilibili_provider.__dict__.update(provider_routing_data.get("bilibili_mcp", {}))
+        xiaohongshu_provider = _default_xiaohongshu_provider()
+        xiaohongshu_provider.__dict__.update(provider_routing_data.get("xiaohongshu_mcp", {}))
+        youtube_provider = _default_youtube_provider()
+        youtube_provider.__dict__.update(provider_routing_data.get("youtube_transcript_mcp", {}))
+        vidscribe_provider = _default_vidscribe_provider()
+        vidscribe_provider.__dict__.update(provider_routing_data.get("vidscribe", {}))
+        provider_routing = VideoProviderRoutingConfig(
+            enabled=bool(provider_routing_data.get("enabled", True)),
+            bilibili_order=list(provider_routing_data.get("bilibili_order", ["bilibili_mcp", "vidscribe", "local"])),
+            xiaohongshu_order=list(provider_routing_data.get("xiaohongshu_order", ["xiaohongshu_mcp", "local"])),
+            youtube_order=list(provider_routing_data.get("youtube_order", ["youtube_transcript_mcp", "vidscribe", "local"])),
+            bilibili_mcp=bilibili_provider,
+            xiaohongshu_mcp=xiaohongshu_provider,
+            youtube_transcript_mcp=youtube_provider,
+            vidscribe=vidscribe_provider,
+        )
 
         return cls(
             listen_host=data.get("listen_host", "127.0.0.1"),
@@ -189,6 +280,7 @@ class AppConfig:
             execution=ExecutionConfig(**data.get("execution", {})),
             analysis=AnalysisConfig(**data.get("analysis", {})),
             video_summary=video_summary,
+            video_provider_routing=provider_routing,
             summary_routing=SummaryRoutingConfig(**data.get("summary_routing", {})),
         )
 

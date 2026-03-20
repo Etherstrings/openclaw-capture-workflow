@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
 PROFILE_DEFINITIONS: dict[str, dict[str, object]] = {
     "skill_recommendation": {
         "required_signal_keys": ["projects", "links", "skills", "skill_ids", "commands"],
-        "optional_signal_keys": ["use_cases", "validation_actions"],
+        "optional_signal_keys": ["use_cases", "validation_actions", "supported_platforms", "boundaries"],
         "require_action_checklist": True,
         "require_project_section": True,
     },
     "installation_tutorial": {
         "required_signal_keys": ["commands"],
-        "optional_signal_keys": ["prerequisites", "validation_actions", "common_errors"],
+        "optional_signal_keys": ["prerequisites", "validation_actions", "common_errors", "supported_platforms", "boundaries"],
         "require_action_checklist": True,
         "require_project_section": True,
     },
     "project_overview": {
         "required_signal_keys": ["projects", "links"],
-        "optional_signal_keys": ["purposes", "boundaries"],
+        "optional_signal_keys": ["purposes", "boundaries", "supported_platforms", "validation_actions"],
         "require_action_checklist": False,
         "require_project_section": True,
     },
@@ -32,7 +33,7 @@ PROFILE_DEFINITIONS: dict[str, dict[str, object]] = {
     },
     "general_capture": {
         "required_signal_keys": [],
-        "optional_signal_keys": [],
+        "optional_signal_keys": ["commands", "prerequisites", "validation_actions", "supported_platforms", "boundaries", "common_errors"],
         "require_action_checklist": False,
         "require_project_section": False,
     },
@@ -51,22 +52,37 @@ def infer_content_profile(
     step_items = meta.get("step_items", []) if isinstance(meta.get("step_items"), list) else []
     lowered_text = (text or "").lower()
     lowered_url = (source_url or "").lower()
+    command_lines = signals.get("commands", []) if isinstance(signals.get("commands"), list) else []
+    prerequisites = signals.get("prerequisites", []) if isinstance(signals.get("prerequisites"), list) else []
+    validations = signals.get("validation_actions", []) if isinstance(signals.get("validation_actions"), list) else []
+
+    procedural_heading_hits = len(
+        re.findall(r"(?:^|\n)\s*(?:step\s*\d+[:.)-]?|\d+\.\s+|[一二三四五六七八九十]+[、）])", lowered_text)
+    )
+    english_procedure_hits = sum(
+        1
+        for token in ["install", "setup", "configure", "pair", "start", "verify", "run", "deploy", "onboard"]
+        if token in lowered_text
+    )
+    has_install_procedure = bool(command_lines or prerequisites or validations or steps or step_items)
+    has_install_procedure = has_install_procedure or procedural_heading_hits >= 2 or english_procedure_hits >= 3
 
     has_skill = bool(signals.get("skills") or signals.get("skill_ids")) or any(
         token in lowered_text for token in ["/install-skill", ".skill", " skill", "技能id", "skill id"]
     )
-    has_install = bool(signals.get("commands") or steps or step_items) or any(
+    has_install = has_install_procedure or any(
         token in lowered_text for token in ["安装", "教程", "步骤", "配置", "setup", "install", "前置条件"]
     )
     has_project = bool(signals.get("projects")) or "github.com/" in lowered_url or any(
         token in lowered_text for token in ["项目", "仓库", "repo", "repository", "readme"]
     )
+    docs_homepage = bool(lowered_url.startswith("https://docs.") and lowered_url.rstrip("/").count("/") <= 2)
 
     if source_kind == "video_url":
         kind = "video_explainer"
     elif has_skill:
         kind = "skill_recommendation"
-    elif has_install:
+    elif has_install and has_install_procedure and not docs_homepage:
         kind = "installation_tutorial"
     elif has_project:
         kind = "project_overview"

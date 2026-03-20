@@ -9,15 +9,10 @@ from openclaw_capture_workflow.telegram import (
     TelegramNotifier,
     _brief_value_line,
     _extract_priority_project_lines,
-    _jarvis_brief_line,
-    _jarvis_intro_line,
-    _jarvis_judgment_line,
     _one_line_summary,
     _render_ranked_rant_video_reply,
     _render_video_direct_reply,
-    _what_is_it_line,
-    _why_it_matters_line,
-    _worth_it_line,
+    render_video_note_markdown,
 )
 
 
@@ -62,9 +57,9 @@ class TelegramFormatTest(unittest.TestCase):
             note_tags=[],
             follow_up_actions=[],
         )
-        self.assertIn("值不值得回看", _brief_value_line(summary))
+        self.assertIn("回看原视频", _brief_value_line(summary))
 
-    def test_docs_link_lines_are_not_treated_as_video(self) -> None:
+    def test_build_result_message_payload_for_docs_uses_neutral_sections(self) -> None:
         ingest = IngestRequest(
             chat_id="-1",
             reply_to_message_id="1",
@@ -91,36 +86,55 @@ class TelegramFormatTest(unittest.TestCase):
             follow_up_actions=[],
             recommendation_level="must_read",
         )
-        self.assertEqual(_what_is_it_line(ingest, summary), "OpenClaw 是一个跨平台 AI 代理网关，这条是它的官方安装文档。")
-        self.assertIn("官方文档最省事", _worth_it_line(ingest, summary))
-        self.assertIn("告诉你 OpenClaw 是什么", _why_it_matters_line(ingest, summary))
+        payload = TelegramNotifier("token").build_result_message_payload(
+            ingest,
+            summary,
+            "Inbox/OpenClaw/test.md",
+            "",
+            "obsidian://open",
+        )
+        self.assertIn("关键信息：", payload["text"])
+        self.assertIn("判断：", payload["text"])
+        self.assertIn("资料：", payload["text"])
+        self.assertIn("https://docs.openclaw.ai/", payload["text"])
+        self.assertNotIn("贾维斯", payload["text"])
 
-    def test_reply_lines_use_direct_style(self) -> None:
+    def test_build_result_message_payload_for_docs_overview_uses_direct_next_step_sentence(self) -> None:
         ingest = IngestRequest(
             chat_id="-1",
             reply_to_message_id="1",
-            request_id="tg-test-jarvis",
+            request_id="tg-test-docs-overview",
             source_kind="url",
             source_url="https://docs.openclaw.ai/",
             raw_text="https://docs.openclaw.ai/",
         )
         summary = SummaryResult(
-            title="OpenClaw 安装指南",
+            title="OpenClaw",
             primary_topic="OpenClaw",
             secondary_topics=[],
             entities=[],
-            conclusion="OpenClaw 提供跨多个平台的 AI 代理服务，安装过程简单明了。",
-            bullets=["关键链接: https://docs.openclaw.ai/", "支持多平台", "安装服务并配对 WhatsApp"],
+            conclusion="当前拿到的是《OpenClaw》的概览页，不是完整安装文档。",
+            bullets=[
+                "平台支持: WhatsApp | Telegram | Discord | iMessage",
+                "流程要点: Onboard and install the service | Pair WhatsApp and start the Gateway",
+                "适用边界: 当前页更像文档首页概览，没有给出完整命令、验证和失败处理",
+            ],
             evidence_quotes=[],
             coverage="full",
-            confidence="high",
+            confidence="medium",
             note_tags=[],
-            follow_up_actions=["访问官方文档开始安装"],
-            reader_judgment="如果准备第一次上手，这条文档值得直接看。",
+            follow_up_actions=["如果要真正开始安装，继续进入详细安装或配对子页查看具体命令和验证步骤。"],
+            reader_judgment="当前页只够判断支持范围和大致接入方向，不够直接拿来安装。",
         )
-        self.assertEqual(_jarvis_intro_line(), "")
-        self.assertIn("官方安装文档", _jarvis_brief_line(ingest, summary))
-        self.assertEqual(_jarvis_judgment_line(ingest, summary), "如果准备第一次上手，这条文档值得直接看。")
+        payload = TelegramNotifier("token").build_result_message_payload(
+            ingest,
+            summary,
+            "Inbox/OpenClaw/test.md",
+            "",
+            "obsidian://open",
+        )
+        self.assertIn("如果要真正开始安装，继续进入详细安装或配对子页查看具体命令和验证步骤。", payload["text"])
+        self.assertNotIn("建议先如果要真正开始安装", payload["text"])
 
     def test_build_result_message_payload_preserves_group_reply_context(self) -> None:
         ingest = IngestRequest(
@@ -269,10 +283,14 @@ class TelegramFormatTest(unittest.TestCase):
             },
         )
         text = _render_video_direct_reply(ingest, summary, evidence)
-        self.assertIn("这个视频大意是在演示：作者怎么把 OpenClaw 改造成一个", text)
-        self.assertIn("主要讲了这几件事：", text)
-        self.assertIn("一句话总结：", text)
-        self.assertIn("这视频是在秀一个 OpenClaw + 自动化工作流 的炒股辅助玩法", text)
+        self.assertIn("Milky 已完成视频总结", text)
+        self.assertIn("🧊 关键做法", text)
+        self.assertIn("💡 关键思路", text)
+        self.assertIn("🔥 边界与风险", text)
+        self.assertIn("系统会在开盘前给出逐只股票的分析和买入/持有建议", text)
+        self.assertIn("记得随时呼叫Milky哦", text)
+        self.assertNotIn("主要讲了这几件事：", text)
+        self.assertNotIn("一句话总结：", text)
         self.assertNotIn("归档：", text)
         self.assertNotIn("打开：", text)
 
@@ -314,10 +332,10 @@ class TelegramFormatTest(unittest.TestCase):
             metadata={"evidence_sources": ["video_platform_metadata", "video_audio_asr"]},
         )
         text = _render_ranked_rant_video_reply(summary, evidence)
-        self.assertIn("这个视频在吐槽“简中互联网里最反人类的 10 种交互设计”", text)
-        self.assertIn("第10名：双击图片点赞", text)
-        self.assertIn("第1名：shadowban / 幽灵屏蔽", text)
-        self.assertIn("整体风格就是高强度吐槽", text)
+        self.assertIn("这条视频在盘点简中互联网里最常见的 10 类糟糕交互设计", text)
+        self.assertIn("- 第10名：双击图片点赞", text)
+        self.assertIn("- 第1名：shadowban / 幽灵屏蔽", text)
+        self.assertIn("边界：", text)
 
     def test_generic_tool_video_reply_is_more_natural_and_richer(self) -> None:
         ingest = IngestRequest(
@@ -357,11 +375,76 @@ class TelegramFormatTest(unittest.TestCase):
             metadata={},
         )
         text = _render_video_direct_reply(ingest, summary, evidence)
-        self.assertIn("主要讲了这几件事：", text)
+        self.assertIn("Milky 已完成视频总结", text)
+        self.assertIn("🧊 关键做法", text)
+        self.assertIn("🔥 边界与风险", text)
         self.assertIn("世界地图上的信息面板", text)
         self.assertIn("自然灾害、天气预警、重点地区直播、金融资讯和宏观信息", text)
         self.assertIn("整个项目是开源免费的", text)
-        self.assertIn("情报/监控面板的演示视频", text)
+        self.assertNotIn("主要讲了这几件事：", text)
+
+    def test_render_video_note_markdown_finance_prefers_normalized_opening_and_rows(self) -> None:
+        summary = SummaryResult(
+            title="第1144日投资记录",
+            primary_topic="视频",
+            secondary_topics=[],
+            entities=[],
+            conclusion="已按时间段整理出视频主线，可先用于快速筛选；细节仍建议回看原视频复核。",
+            bullets=[
+                "市场表现与组合回顾：投资它有两种维度的第一个就是哦我的收益率有多高第二个是我的回撤有多小",
+            ],
+            evidence_quotes=[],
+            coverage="partial",
+            confidence="medium",
+            note_tags=[],
+            follow_up_actions=[],
+            reader_judgment="当前已经能看出视频主线，适合先看结构，再决定是否回看细节。",
+            timeline_sections=[
+                {
+                    "start": 0.0,
+                    "end": 300.0,
+                    "heading": "持仓逻辑",
+                    "summary": "重点对比海底捞和中国食品的估值与调仓思路。",
+                    "bullets": ["海底捞估值不便宜。", "中国食品估值更低。"],
+                    "evidence": [],
+                }
+            ],
+            finance_matrix=[
+                {
+                    "name": "海底捞",
+                    "sector": "消费/餐饮",
+                    "thesis": "海底捞估值不便宜，计划冲高卖出。",
+                    "position_change": "海底捞估值不便宜，计划冲高卖出。",
+                    "risk": "海底捞估值不便宜，计划冲高卖出。",
+                }
+            ],
+            finance_snapshot={
+                "market_view": ["啊 ，市场赚钱效应一般，但港股结构尚可。"],
+                "action_plan": ["啊 ，后续以低频调仓为主，不追高。"],
+            },
+        )
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1unw9zxEHF",
+            platform_hint="bilibili",
+            title="第1144日投资记录",
+            text="市场赚钱效应一般，海底捞估值不便宜。",
+            transcript="市场赚钱效应一般，海底捞估值不便宜。",
+            evidence_type="multimodal_video",
+            coverage="partial",
+            metadata={
+                "video_duration_seconds": 1800.0,
+                "video_direction_estimate": {"kind": "finance_market"},
+                "evidence_sources": ["video_audio_asr"],
+            },
+        )
+        text = render_video_note_markdown(summary, evidence)
+        self.assertIn("## 核心判断", text)
+        self.assertIn("## 市场判断与后续计划", text)
+        self.assertIn("## 标的矩阵", text)
+        self.assertNotIn("已按时间段整理出视频主线", text)
+        self.assertIn("后续以低频调仓为主", text)
+        self.assertIn("| 海底捞 | 消费/餐饮 | 海底捞估值不便宜 | 计划冲高卖出 |  |", text)
 
 
 if __name__ == "__main__":

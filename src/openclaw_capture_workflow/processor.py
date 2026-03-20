@@ -18,17 +18,65 @@ from urllib.parse import quote
 
 from .config import AppConfig, SummarizerConfig
 from .content_profile import build_signal_requirements, infer_content_profile, iter_required_signal_entries
+from .evidence_utils import build_evidence_digest
 from .extractor import EvidenceExtractor
 from .models import IngestRequest, JobRecord, SummaryResult
 from .obsidian import ObsidianWriter
 from .note_renderer import OpenAICompatibleNoteRenderer
+from .quality_gate import (
+    build_model_unavailable_summary,
+    build_refusal_summary,
+    build_theme_only_summary,
+    evaluate_quality_gate,
+)
 from .storage import JobStore
-from .summarizer import OpenAICompatibleSummarizer, SummaryEngine, PROMPT_VERSION, _validate_and_normalize_summary
+from .summarizer import (
+    OpenAICompatibleSummarizer,
+    SummaryEngine,
+    PROMPT_VERSION,
+    _signal_priority_bullets,
+    _validate_and_normalize_summary,
+)
 from .telegram import TelegramNotifier
+from .video_experiment_summarizer import AiHubMixGeminiSummarizer, EvidenceDrivenVideoSummarizer
+from .video_summary_score import score_video_summary
 from .video_story_blocks import get_qualified_video_story_blocks, get_viewer_feedback
+from .video_truth_eval import compute_retained_outline_count
 
 
 FALLBACK_SUMMARY_VERSION = "20260315-video-story-v1"
+_RESOURCE_BULLET_LABELS = {"GitHub地址", "视频链接", "关键链接", "仓库地址", "文档链接", "来源链接", "链接"}
+_BOUNDARY_BULLET_LABELS = {"适用边界", "常见错误", "验证边界", "风险", "边界", "限制"}
+_HARD_FACT_BULLET_LABELS = {
+    "项目名称",
+    "项目仓库",
+    "技能名",
+    "技能ID",
+    "安装方法",
+    "关键命令",
+    "前置条件",
+    "验证动作",
+    "使用方式",
+    "核心用途",
+    "流程要点",
+    "平台支持",
+    "适用边界",
+    "常见错误",
+    "主题",
+}
+_PSEUDO_SUMMARY_TOKENS = [
+    "已提取核心事实",
+    "帮助快速",
+    "内容完整",
+    "覆盖全面",
+    "适合作为参考",
+    "适合先留档",
+    "值得继续",
+    "有信息价值",
+    "值得回看",
+    "值得留档",
+    "可作为背景资料",
+]
 
 
 def _has_sufficient_evidence_text(
@@ -75,7 +123,10 @@ def _has_sufficient_evidence_text(
         evidence_sources = metadata.get("evidence_sources", [])
         if isinstance(evidence_sources, list) and "web_blocked_notice" in evidence_sources:
             return True
-    has_signal = any(bool(signals.get(key)) for key in ["skills", "skill_ids", "commands", "links"])
+    has_signal = any(
+        bool(signals.get(key))
+        for key in ["skills", "skill_ids", "commands", "links", "supported_platforms", "prerequisites", "validation_actions", "boundaries"]
+    )
     if has_signal and len(cleaned) >= min_chars_signal:
         return True
     if source_kind in {"image", "video_url", "mixed"} and len(cleaned) >= min_chars_media:
@@ -83,6 +134,46 @@ def _has_sufficient_evidence_text(
     if len(cleaned) < min_chars_general:
         return False
     return True
+
+
+def _is_web_blocked_notice_evidence(evidence) -> bool:
+    if evidence.source_kind == "video_url":
+        return False
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    evidence_sources = metadata.get("evidence_sources", [])
+    return isinstance(evidence_sources, list) and "web_blocked_notice" in evidence_sources
+
+
+def _build_web_blocked_notice_summary(evidence: EvidenceBundle) -> SummaryResult:
+    title = re.sub(r"\s+", " ", str(evidence.title or "页面不可见").strip()) or "页面不可见"
+    source_url = re.sub(r"\s+", " ", str(evidence.source_url or "").strip())
+    bullets = [
+        "当前拿不到正文，不能把这版结果当成正常内容总结。",
+        "原因更像链接失效、页面不可见或平台访问限制。",
+        "当前不建议继续基于这版结果投入时间或判断内容。",
+    ]
+    if source_url:
+        bullets.append(f"来源链接: {source_url}")
+    return SummaryResult(
+        title=title,
+        primary_topic="页面访问受限",
+        secondary_topics=[],
+        entities=[],
+        conclusion="当前页面不可见或正文未返回，这版结果不能作为内容总结使用。",
+        bullets=bullets,
+        evidence_quotes=[],
+        coverage="partial",
+        confidence="low",
+        note_tags=["web_blocked_notice"],
+        follow_up_actions=["如果后续仍需要这条内容，再补正常页面、登录态或浏览环境后重试。"],
+        timeliness="low",
+        effectiveness="low",
+        recommendation_level="skip",
+        reader_judgment="当前只能确认链接受限，不能可靠还原正文内容。",
+        outcome="partial",
+        evidence_basis=["web_blocked_notice"],
+        uncertainties=["页面或平台限制导致正文缺失。"],
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -138,6 +229,16 @@ def _evidence_fingerprint(evidence) -> str:
     text = re.sub(r"\s+", " ", (evidence.text or "").strip())
     transcript = re.sub(r"\s+", " ", (evidence.transcript or "").strip())
     tracks = evidence.metadata.get("tracks", {}) if isinstance(evidence.metadata, dict) else {}
+    evidence_items = [
+        {
+            "source": getattr(item, "source", ""),
+            "text": re.sub(r"\s+", " ", getattr(item, "text", "").strip())[:500],
+            "start": getattr(item, "timestamp_start", None),
+            "end": getattr(item, "timestamp_end", None),
+            "primary": bool(getattr(item, "is_primary", False)),
+        }
+        for item in getattr(evidence, "evidence_items", [])[:120]
+    ]
     payload = {
         "source_url": base_url,
         "evidence_type": evidence.evidence_type,
@@ -145,6 +246,8 @@ def _evidence_fingerprint(evidence) -> str:
         "text": text[:12000],
         "transcript": transcript[:12000],
         "tracks": tracks,
+        "evidence_items": evidence_items,
+        "capture_manifest": evidence.capture_manifest.to_dict() if hasattr(evidence, "capture_manifest") else {},
         "prompt_version": PROMPT_VERSION,
         "fallback_summary_version": FALLBACK_SUMMARY_VERSION,
     }
@@ -402,39 +505,118 @@ def _summary_signal_coverage(summary: SummaryResult, evidence) -> tuple[float, l
     return hits / max(1, total), missing
 
 
-def _summary_quality_score(summary: SummaryResult, evidence) -> tuple[float, list[str], float]:
-    coverage, missing = _summary_signal_coverage(summary, evidence)
-    score = coverage
-    if len(summary.bullets) >= 3:
-        score += 0.1
-    else:
-        score -= 0.15
+def _bullet_parts(value: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
+    if not text:
+        return "", ""
+    for sep in (":", "："):
+        if sep not in text:
+            continue
+        label, rest = text.split(sep, 1)
+        if len(label.strip()) <= 12:
+            return label.strip(), rest.strip()
+    return "", text
+
+
+def _is_resource_bullet(value: str) -> bool:
+    label, body = _bullet_parts(value)
+    lowered = body.lower()
+    return label in _RESOURCE_BULLET_LABELS or lowered.startswith(("http://", "https://"))
+
+
+def _is_boundary_text(value: str) -> bool:
+    label, body = _bullet_parts(value)
+    text = f"{label} {body}".lower()
+    if label in _BOUNDARY_BULLET_LABELS:
+        return True
+    return any(token in text for token in ["边界", "限制", "不支持", "仅支持", "注意事项", "风险", "报错", "错误", "失败", "证据缺口"])
+
+
+def _is_pseudo_summary_text(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
+    lowered = text.lower()
+    if not text or len(text) < 6:
+        return True
+    if any(token in lowered for token in _PSEUDO_SUMMARY_TOKENS):
+        return True
+    if text.startswith(("适合", "值得", "建议", "当前可先", "先留档", "后续再看")) and len(text) <= 28:
+        return True
+    return False
+
+
+def _summary_hard_fact_bullets(summary: SummaryResult) -> list[str]:
+    hard_facts: list[str] = []
+    for raw in summary.bullets:
+        line = re.sub(r"\s+", " ", str(raw).strip()).strip("。；;")
+        if not line or _is_resource_bullet(line):
+            continue
+        label, body = _bullet_parts(line)
+        if _is_boundary_text(line):
+            if not _is_pseudo_summary_text(body or line):
+                hard_facts.append(line)
+            continue
+        if label in _HARD_FACT_BULLET_LABELS:
+            hard_facts.append(line)
+            continue
+        if _is_pseudo_summary_text(body or line):
+            continue
+        fact_text = body or line
+        if len(fact_text) >= 6 and any(
+            token in fact_text for token in ["包含", "支持", "完成", "启动", "配对", "运行", "部署", "验证", "步骤", "命令", "网关", "语音轨道", "关键步骤", "摘要", "项目", "仓库"]
+        ):
+            hard_facts.append(line)
+            continue
+        if len(fact_text) >= 12 and (
+            re.search(r"[A-Za-z0-9_/.-]", fact_text)
+            or re.search(r"[，。；：:,]", fact_text)
+            or len(fact_text) >= 18
+        ):
+            hard_facts.append(line)
+    deduped: list[str] = []
+    for item in hard_facts:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _summary_quality_details(summary: SummaryResult, evidence) -> dict[str, object]:
+    signal_coverage, missing = _summary_signal_coverage(summary, evidence)
     conclusion = re.sub(r"\s+", " ", (summary.conclusion or "").strip())
+    hard_fact_bullets = _summary_hard_fact_bullets(summary)
+    hard_fact_count = len(hard_fact_bullets)
+    resource_count = sum(1 for item in summary.bullets if _is_resource_bullet(str(item)))
+    resource_only_ratio = resource_count / max(1, len(summary.bullets))
+    boundary_present = any(_is_boundary_text(item) for item in summary.bullets) or any(
+        _is_boundary_text(item) for item in summary.uncertainties
+    ) or _is_boundary_text(conclusion)
+    signal_coverage_v2 = min(
+        1.0,
+        0.5 * signal_coverage + 0.35 * min(1.0, hard_fact_count / 4.0) + 0.15 * (1.0 if boundary_present else 0.0),
+    )
+    score = signal_coverage_v2
+    if hard_fact_count >= 3:
+        score += 0.12
+    elif hard_fact_count == 2:
+        score -= 0.05
+    else:
+        score -= 0.22
+    if len(summary.bullets) < 3:
+        score -= 0.08
     if len(conclusion) < 12:
-        score -= 0.1
-    if any(token in conclusion for token in ["已提取核心事实", "模型不可用", "帮助你快速"]):
-        score -= 0.25
-    if any(token in conclusion for token in ["你", "你可以", "对你"]):
-        score -= 0.1
-    if summary.follow_up_actions and len(summary.follow_up_actions) >= 2:
-        score += 0.05
-    elif missing and any(item.startswith(("section:执行清单", "actions:")) for item in missing):
+        score -= 0.08
+    if _is_pseudo_summary_text(conclusion):
+        score -= 0.18
+    if resource_only_ratio > 0.5:
         score -= 0.15
+    if evidence.source_kind != "video_url" and not boundary_present:
+        score -= 0.08
+    if summary.follow_up_actions and len(summary.follow_up_actions) >= 2:
+        score += 0.03
+    elif missing and any(item.startswith(("section:执行清单", "actions:")) for item in missing):
+        score -= 0.12
     metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
     video_gate = metadata.get("video_gate_reasons") if isinstance(metadata, dict) else None
     evidence_sources = metadata.get("evidence_sources", []) if isinstance(metadata, dict) else []
-    if evidence.source_kind == "video_url":
-        if isinstance(video_gate, list) and video_gate:
-            score -= 0.35
-        if isinstance(evidence_sources, list):
-            normalized_sources = {str(item) for item in evidence_sources}
-            weak_only = {"user_raw_text", "video_page_snapshot", "video_html_fallback"}
-            if normalized_sources and normalized_sources.issubset(weak_only):
-                score -= 0.15
-        text_len = len((evidence.text or "").strip())
-        if text_len < 180:
-            score -= 0.1
-    score = max(0.0, min(1.0, score))
     reasons: list[str] = []
     if missing:
         reasons.append("missing_signals:" + ",".join(missing[:4]))
@@ -442,59 +624,196 @@ def _summary_quality_score(summary: SummaryResult, evidence) -> tuple[float, lis
         reasons.append("too_few_bullets")
     if len(conclusion) < 12:
         reasons.append("conclusion_too_short")
+    if _is_pseudo_summary_text(conclusion):
+        reasons.append("conclusion_too_generic")
+    if hard_fact_count < 3:
+        reasons.append(f"hard_facts_lt3:{hard_fact_count}")
+    if evidence.source_kind != "video_url" and not boundary_present:
+        reasons.append("boundary_missing")
+    if resource_only_ratio > 0.5:
+        reasons.append(f"resource_ratio_high:{round(resource_only_ratio, 2)}")
     if evidence.source_kind == "video_url":
+        informative_video_bullets = [
+            item
+            for item in summary.bullets
+            if re.sub(r"\s+", " ", str(item).strip())
+            and not _is_pseudo_summary_text(str(item))
+            and not _is_resource_bullet(str(item))
+        ]
+        if len(conclusion) >= 18 and not _is_pseudo_summary_text(conclusion):
+            score += 0.08
+        else:
+            score -= 0.06
+            reasons.append("video_topic_clarity_low")
+        if len(informative_video_bullets) >= 3:
+            score += 0.08
+        elif len(informative_video_bullets) <= 1:
+            score -= 0.08
+            reasons.append("video_mainline_bullets_low")
         if isinstance(video_gate, list) and video_gate:
+            score -= 0.35
             reasons.append("video_incomplete")
         if isinstance(evidence_sources, list):
             normalized_sources = {str(item) for item in evidence_sources}
             weak_only = {"user_raw_text", "video_page_snapshot", "video_html_fallback"}
             if normalized_sources and normalized_sources.issubset(weak_only):
+                score -= 0.15
                 reasons.append("video_page_snapshot_only")
         if len((evidence.text or "").strip()) < 180:
+            score -= 0.1
             reasons.append("video_evidence_short")
-    return score, reasons, coverage
+        quality_gate = metadata.get("quality_gate", {}) if isinstance(metadata.get("quality_gate"), dict) else {}
+        gate_outcome = str(quality_gate.get("outcome", "")).strip().lower()
+        gate_mode = str(quality_gate.get("mode", "")).strip().lower()
+        probe_quality = str(quality_gate.get("probe_quality", "")).strip().lower()
+        expected_outline_count = int(quality_gate.get("expected_outline_count", 0) or 0)
+        observed_outline_count = int(quality_gate.get("observed_outline_count", 0) or 0)
+        retained_outline_count = int(quality_gate.get("retained_outline_count", observed_outline_count) or observed_outline_count)
+        if summary.outcome == "refused" or gate_outcome == "refused":
+            score = min(score, 0.45)
+            if "video_refused" not in reasons:
+                reasons.append("video_refused")
+        elif summary.outcome == "partial" or gate_outcome == "partial":
+            if gate_mode == "probe":
+                max_score = 0.79 if probe_quality in {"usable", "strong"} else 0.62
+                score = min(score, max_score)
+                if "video_probe_partial" not in reasons:
+                    reasons.append("video_probe_partial")
+            else:
+                score = min(score, 0.69)
+                if "video_partial_only" not in reasons:
+                    reasons.append("video_partial_only")
+        if expected_outline_count > 0 and retained_outline_count < expected_outline_count:
+            reasons.append(f"outline_partial:{retained_outline_count}/{expected_outline_count}")
+    score = max(0.0, min(1.0, score))
+    return {
+        "quality_score": score,
+        "signal_coverage": signal_coverage,
+        "signal_coverage_v2": signal_coverage_v2,
+        "hard_fact_count": hard_fact_count,
+        "boundary_present": boundary_present,
+        "resource_only_ratio": resource_only_ratio,
+        "reasons": reasons,
+        "hard_fact_bullets": hard_fact_bullets[:5],
+    }
 
 
-def _video_assessment(evidence, config: AppConfig) -> dict[str, object] | None:
+def _summary_quality_score(summary: SummaryResult, evidence) -> tuple[float, list[str], float]:
+    details = _summary_quality_details(summary, evidence)
+    return (
+        float(details["quality_score"]),
+        list(details["reasons"]),
+        float(details["signal_coverage_v2"]),
+    )
+
+
+def _build_low_information_partial(summary: SummaryResult, evidence, quality: dict[str, object]) -> SummaryResult:
+    hard_facts = [str(item) for item in quality.get("hard_fact_bullets", []) if str(item).strip()]
+    if not hard_facts:
+        hard_facts = [item for item in _signal_priority_bullets(evidence, limit=4) if not _is_resource_bullet(item)]
+    bullets = hard_facts[:3]
+    gap_line = "证据缺口: 当前只抽到少量可核对细节，不能把这版结果当完整总结使用。"
+    if not any(_is_boundary_text(item) for item in bullets):
+        bullets.append(gap_line)
+    conclusion_core = ""
+    if bullets:
+        _, body = _bullet_parts(bullets[0])
+        conclusion_core = body or bullets[0]
+    title = _clean_fallback_title(summary.title or evidence.title)
+    conclusion = (
+        f"当前只能确认《{title}》的少量硬信息，已能核实{conclusion_core}，但还不足以可靠还原更多细节。"
+        if conclusion_core
+        else f"当前只能确认《{title}》的主题，硬信息不足，不能把这版结果当完整总结。"
+    )
+    follow_up_actions = list(summary.follow_up_actions[:1])
+    refill_action = "如果后续确实要用这条内容，再补原文、完整页面或更稳定证据后重跑。"
+    if refill_action not in follow_up_actions:
+        follow_up_actions.append(refill_action)
+    uncertainties = list(summary.uncertainties)
+    uncertainty = "当前硬信息少于 3 条，已自动降级为 partial。"
+    if uncertainty not in uncertainties:
+        uncertainties.append(uncertainty)
+    return SummaryResult(
+        title=summary.title,
+        primary_topic=summary.primary_topic,
+        secondary_topics=list(summary.secondary_topics),
+        entities=list(summary.entities),
+        conclusion=conclusion,
+        bullets=bullets[:4],
+        evidence_quotes=list(summary.evidence_quotes[:3]),
+        coverage="partial",
+        confidence="low" if int(quality.get("hard_fact_count", 0) or 0) < 2 else "medium",
+        note_tags=list(dict.fromkeys([*summary.note_tags, "low_information_partial"])),
+        follow_up_actions=follow_up_actions[:2],
+        timeliness=summary.timeliness,
+        effectiveness="low" if summary.effectiveness == "high" else summary.effectiveness,
+        recommendation_level="optional" if summary.recommendation_level != "skip" else "skip",
+        reader_judgment="当前只适合先留档，真正要用时还需要补原文或更多证据。",
+        outcome="partial",
+        evidence_basis=list(summary.evidence_basis),
+        timeline_sections=list(summary.timeline_sections),
+        uncertainties=uncertainties[:6],
+        refusal_reason=summary.refusal_reason,
+        finance_matrix=list(summary.finance_matrix),
+        finance_snapshot=dict(summary.finance_snapshot),
+    )
+
+
+def _theme_only_has_specific_evidence(evidence) -> bool:
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
+    if isinstance(signals, dict) and any(
+        signals.get(key) for key in ["projects", "skills", "skill_ids", "commands", "purposes", "use_cases", "boundaries", "common_errors"]
+    ):
+        return True
+    description = re.sub(r"\s+", " ", str(metadata.get("bilibili_description") or "").strip())
+    if description and len(description) >= 12:
+        return True
+    title = re.sub(r"\s+", " ", str(evidence.title or "").strip())
+    for line in [re.sub(r"\s+", " ", item.strip()) for item in (evidence.text or "").splitlines() if item.strip()]:
+        if line == title or line == (evidence.source_url or "").strip():
+            continue
+        if line.startswith(("http://", "https://")):
+            continue
+        if len(line) >= 14:
+            return True
+    return False
+
+
+def _video_assessment(evidence, config: AppConfig, gate: dict[str, object] | None = None) -> dict[str, object] | None:
     if evidence.source_kind != "video_url":
         return None
     metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
-    tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
-    reasons = _video_gate_reasons(evidence, config)
-    text_chars = len((evidence.text or "").strip())
     sources = metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []
-    score = 0
-    if tracks.get("has_subtitle"):
-        score += 3
-    if tracks.get("has_transcript"):
-        score += 4
-    if tracks.get("has_keyframes"):
-        score += 1
-    if tracks.get("has_keyframe_ocr"):
-        score += 1
-    if text_chars >= 400:
-        score += 2
-    elif text_chars >= 180:
-        score += 1
-    missing_speech = any("missing speech track" in item for item in reasons)
-    if missing_speech and config.video_accuracy.require_speech_track:
-        level = "weak"
-    elif not reasons and (tracks.get("has_subtitle") or tracks.get("has_transcript")):
+    gate_payload = gate if isinstance(gate, dict) else (metadata.get("quality_gate", {}) if isinstance(metadata.get("quality_gate"), dict) else {})
+    outcome = str(gate_payload.get("outcome", "")).strip().lower()
+    mode = str(gate_payload.get("mode", "")).strip().lower()
+    probe_quality = str(gate_payload.get("probe_quality", "")).strip().lower()
+    reasons = [str(item) for item in gate_payload.get("reasons", [])] if isinstance(gate_payload.get("reasons"), list) else []
+    speech_chars = int(gate_payload.get("speech_chars", 0) or 0)
+    if outcome == "summarized":
         level = "strong"
-    elif score >= 3 and text_chars >= 180:
-        level = "medium"
+        score = 9
+        next_step = "当前证据与总结状态一致，可直接人工复核。"
+    elif outcome == "partial":
+        if mode == "probe":
+            level = "medium" if probe_quality in {"usable", "strong"} else "weak"
+            score = 6 if probe_quality == "strong" else 5 if probe_quality == "usable" else 3
+            next_step = "当前已拿到部分可靠内容，可先判断主题和部分要点；如需完整结论请拉长抽取。"
+        else:
+            level = "medium"
+            score = 5
+            next_step = "当前只适合做部分理解，优先补充证据或确认结构覆盖范围。"
     else:
         level = "weak"
-    next_step = "当前证据可直接人工复核。"
-    if any("missing speech track" in item for item in reasons):
-        next_step = "优先补抓字幕或语音轨，再判断视频结论是否可信。"
-    elif text_chars < 180:
-        next_step = "优先补充更多页面文本、关键帧 OCR 或字幕内容。"
+        score = 2
+        next_step = "优先补抓字幕或稳定语音轨，再判断视频结论是否可信。"
     return {
         "level": level,
         "score": score,
         "reasons": reasons,
-        "text_chars": text_chars,
+        "text_chars": len((evidence.text or "").strip()),
+        "speech_chars": speech_chars,
         "evidence_sources": sources,
         "next_step": next_step,
     }
@@ -601,7 +920,7 @@ def _build_fallback_summary(evidence) -> SummaryResult:
                 recommendation_level="recommended" if ordered_bullets else "optional",
                 timeliness="medium",
                 effectiveness="high" if block_map.get("workflow") else "medium",
-                reader_judgment="从大厂程序员视角看，这条视频更像可复用工作流展示，值得按流程回看。",  # ensures WYSIWYG even without model
+                reader_judgment="当前能看出流程主线，但具体参数和细节仍建议回原视频核对。",
             )
             return _validate_and_normalize_summary(summary, evidence)
 
@@ -609,32 +928,8 @@ def _build_fallback_summary(evidence) -> SummaryResult:
     primary_topic = "未分类"
     secondary_topics: list[str] = []
     entities: list[str] = []
-    conclusion_parts: list[str] = []
-    bullets: list[str] = []
+    bullets: list[str] = _signal_priority_bullets(evidence, limit=5)
     signals = evidence.metadata.get("signals", {}) if isinstance(evidence.metadata, dict) else {}
-    if isinstance(signals, dict):
-        if signals.get("skills"):
-            bullets.append("技能: " + " | ".join([str(item) for item in signals["skills"][:3]]))
-        if signals.get("skill_ids"):
-            bullets.append("技能ID: " + " | ".join([str(item) for item in signals["skill_ids"][:4]]))
-        if signals.get("commands"):
-            bullets.append("命令: " + " | ".join([str(item) for item in signals["commands"][:3]]))
-        if signals.get("links"):
-            source_url = (evidence.source_url or "").strip()
-            link_items = [
-                str(item)
-                for item in signals["links"]
-                if str(item).strip() and str(item).strip() != source_url
-            ]
-            if link_items:
-                bullets.append("链接: " + " | ".join(link_items[:2]))
-        if signals.get("projects"):
-            bullets.append("项目: " + " | ".join([str(item) for item in signals["projects"][:3]]))
-            conclusion_parts.append(f"识别到项目 {str(signals['projects'][0])}")
-        if signals.get("skill_ids"):
-            conclusion_parts.append(f"技能ID {str(signals['skill_ids'][0])}")
-        if signals.get("commands"):
-            conclusion_parts.append("包含可执行命令")
 
     step_items = None
     steps = None
@@ -648,10 +943,13 @@ def _build_fallback_summary(evidence) -> SummaryResult:
             line = title_part
             if detail:
                 line = f"{line}：{detail}" if line else detail
-            if line:
+            if line and line not in bullets:
                 bullets.append(line)
     elif steps:
-        bullets.extend([str(step) for step in steps[:7]])
+        for step in steps[:7]:
+            text = str(step).strip()
+            if text and text not in bullets:
+                bullets.append(text)
     else:
         for line in [line.strip() for line in evidence.text.splitlines() if line.strip()]:
             if len(line) < 8 or len(line) > 120:
@@ -672,29 +970,34 @@ def _build_fallback_summary(evidence) -> SummaryResult:
                 continue
             if line.startswith("链接: ") or line.startswith("技能名: ") or line.startswith("命令: "):
                 continue
-            if "Skill" in line or "skill" in line:
+            if line not in bullets:
                 bullets.append(line)
-                if len(bullets) >= 5:
-                    break
-                continue
-            bullets.append(line)
             if len(bullets) >= 5:
                 break
     if not bullets:
-        bullets = ["未能从证据中抽取到可用要点。"]
-    if not conclusion_parts:
-        lead_bullet = re.sub(r"\s+", " ", str(bullets[0]).strip()).strip("。；;")
-        if ":" in lead_bullet:
-            lead_bullet = lead_bullet.split(":", 1)[1].strip()
-        if "：" in lead_bullet:
-            lead_bullet = lead_bullet.split("：", 1)[1].strip()
-        if lead_bullet:
-            conclusion_parts = [f"核心信息是：{lead_bullet}"]
-        else:
-            conclusion_parts = ["已从证据中提取核心事实（规则摘要）"]
-    if evidence.coverage == "partial":
-        conclusion_parts.append("证据不完整")
-    conclusion = "，".join(conclusion_parts) + "。"
+        bullets = ["证据缺口: 当前没有抽到足够的正文细节，不能把这版结果当成完整总结。"]
+    hard_facts = [item for item in bullets if not _is_resource_bullet(item) and not _is_pseudo_summary_text(item)]
+    boundary_line = next((item for item in bullets if _is_boundary_text(item)), "")
+    if not boundary_line:
+        boundary_line = "证据缺口: 当前只抽到少量可核对细节，更多内容需要回原文确认。"
+        bullets.append(boundary_line)
+    lead_bullet = hard_facts[0] if hard_facts else bullets[0]
+    _, lead_body = _bullet_parts(lead_bullet)
+    _, boundary_body = _bullet_parts(boundary_line)
+    lead_text = lead_body or lead_bullet
+    boundary_text = boundary_body or boundary_line
+    conclusion = f"当前可确认的核心信息是{lead_text}；{boundary_text}"
+    if not conclusion.endswith("。"):
+        conclusion += "。"
+    coverage = evidence.coverage or "partial"
+    confidence = "medium"
+    outcome = "summarized"
+    reader_judgment = ""
+    if len(hard_facts) < 3 or evidence.coverage == "partial":
+        coverage = "partial"
+        confidence = "low" if len(hard_facts) < 2 else "medium"
+        outcome = "partial"
+        reader_judgment = "当前只适合先留档，真正要用时还需要补原文或更多证据。"
 
     evidence_quotes: list[str] = []
     for line in [line.strip() for line in evidence.text.splitlines() if line.strip()]:
@@ -721,12 +1024,15 @@ def _build_fallback_summary(evidence) -> SummaryResult:
         secondary_topics=secondary_topics,
         entities=entities,
         conclusion=conclusion,
-        bullets=bullets,
+        bullets=bullets[:5],
         evidence_quotes=evidence_quotes,
-        coverage=evidence.coverage or "partial",
-        confidence="medium",
+        coverage=coverage,
+        confidence=confidence,
         note_tags=[],
         follow_up_actions=[],
+        reader_judgment=reader_judgment,
+        outcome=outcome,
+        uncertainties=[boundary_text] if outcome == "partial" else [],
     )
     return _validate_and_normalize_summary(summary, evidence)
 
@@ -736,6 +1042,10 @@ class WorkflowProcessor:
         self.config = config
         self.jobs = jobs
         self.summarizer = summarizer
+        self.video_summarizer = EvidenceDrivenVideoSummarizer(
+            config.video_summary,
+            client=AiHubMixGeminiSummarizer(config.video_summary),
+        )
         self._upgrade_summarizer: OpenAICompatibleSummarizer | None = None
         if (
             config.summary_routing.enabled
@@ -776,16 +1086,25 @@ class WorkflowProcessor:
             return False
         return True
 
-    def _should_upgrade_for_quality(self, summary: SummaryResult, evidence) -> tuple[bool, float, list[str], float]:
-        score, reasons, coverage = _summary_quality_score(summary, evidence)
+    def _should_upgrade_for_quality(self, summary: SummaryResult, evidence) -> tuple[bool, dict[str, object]]:
+        details = _summary_quality_details(summary, evidence)
+        score = float(details["quality_score"])
+        reasons = list(details["reasons"])
+        coverage = float(details["signal_coverage_v2"])
         threshold = float(self.config.summary_routing.low_quality_threshold)
         min_signal_coverage = float(self.config.summary_routing.min_signal_coverage)
+        hard_fact_count = int(details.get("hard_fact_count", 0) or 0)
         need_upgrade = score < threshold or coverage < min_signal_coverage
+        if evidence.source_kind != "video_url" and hard_fact_count < 3:
+            need_upgrade = True
         if need_upgrade and score < threshold:
             reasons.append(f"quality_score={round(score,3)}<threshold={round(threshold,3)}")
         if need_upgrade and coverage < min_signal_coverage:
             reasons.append(f"signal_coverage={round(coverage,3)}<min={round(min_signal_coverage,3)}")
-        return need_upgrade, score, reasons, coverage
+        if need_upgrade and evidence.source_kind != "video_url" and hard_fact_count < 3:
+            reasons.append(f"hard_fact_count={hard_fact_count}<3")
+        details["reasons"] = reasons
+        return need_upgrade, details
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -810,8 +1129,10 @@ class WorkflowProcessor:
             return False
         if not evidence.source_url:
             return False
-        if evidence.source_kind == "video_url" and _video_gate_reasons(evidence, self.config):
-            return False
+        if evidence.source_kind == "video_url":
+            gate = evaluate_quality_gate(evidence, self.config)
+            if gate.outcome == "refused":
+                return False
         if ingest.dry_run and not self.config.execution.cache_for_dry_run:
             return False
         if not ingest.dry_run and not self.config.execution.cache_for_non_dry_run:
@@ -977,7 +1298,8 @@ class WorkflowProcessor:
                 current_phase = "summarize"
                 job.set_phase("summarize", "processing")
                 self.jobs.save(job)
-                if not _has_sufficient_evidence_text(
+                quality_gate = evaluate_quality_gate(evidence, self.config)
+                if evidence.source_kind != "video_url" and not _has_sufficient_evidence_text(
                     evidence.source_kind,
                     evidence.text,
                     evidence.source_url,
@@ -985,16 +1307,23 @@ class WorkflowProcessor:
                     self.config.evidence_gate,
                 ):
                     raise RuntimeError("insufficient evidence extracted from source; refusing to summarize")
-                video_gate = _video_gate_reasons(evidence, self.config)
-                if video_gate:
-                    evidence.metadata["video_gate_reasons"] = video_gate
-                    job.add_warning("video_evidence_incomplete: " + "; ".join(video_gate))
-                    if self.config.routing.enable_network_search_fallback:
-                        calls = max(1, int(self.config.routing.max_search_calls))
-                        mode = (self.config.routing.search_mode or "surfing").strip()
-                        job.add_warning(
-                            f"network_search_recommended: mode={mode}, max_calls={calls}, reasons={'; '.join(video_gate)}"
+                if isinstance(evidence.metadata, dict):
+                    evidence.metadata["quality_gate"] = quality_gate.to_dict()
+                if quality_gate.reasons:
+                    job.add_warning("quality_gate: " + "; ".join(quality_gate.reasons[:4]))
+                    if evidence.source_kind == "video_url":
+                        gate_reasons = list(quality_gate.reasons)
+                        should_flag_incomplete = (
+                            quality_gate.mode == "full"
+                            or quality_gate.outcome == "refused"
+                            or quality_gate.theme_only
+                            or quality_gate.probe_quality == "weak"
                         )
+                        evidence.metadata["video_gate_reasons"] = gate_reasons if should_flag_incomplete else []
+                        if quality_gate.mode == "probe" and not should_flag_incomplete:
+                            job.add_warning("video_probe_partial: " + "; ".join(quality_gate.reasons[:4]))
+                        else:
+                            job.add_warning("video_evidence_incomplete: " + "; ".join(quality_gate.reasons[:4]))
                 video_cost_estimate = None
                 if evidence.source_kind == "video_url":
                     video_cost_estimate = _estimate_video_cost_rmb(evidence, self.config)
@@ -1047,12 +1376,53 @@ class WorkflowProcessor:
                         job.add_warning("summary_cache_hit")
 
                 if summary is None:
-                    if ingest.dry_run and self.config.execution.dry_run_skip_model_call:
-                        summary_mode = "fallback_dry_run"
-                        summary = _build_fallback_summary(evidence)
-                        summary_model_used = "fallback"
-                        summary_model_chain = ["fallback"]
-                        job.add_warning("dry_run_skip_model_call")
+                    if _is_web_blocked_notice_evidence(evidence):
+                        summary = _build_web_blocked_notice_summary(evidence)
+                        summary_mode = "web_blocked_notice"
+                        summary_model_used = "web_blocked_notice"
+                        summary_model_chain = ["web_blocked_notice"]
+                    elif quality_gate.outcome == "refused":
+                        summary = build_refusal_summary(evidence, quality_gate)
+                        summary_mode = "quality_gate_refusal"
+                        summary_model_used = "quality_gate"
+                        summary_model_chain = ["quality_gate"]
+                    elif evidence.source_kind == "video_url":
+                        summary_attempts += 1
+                        if quality_gate.theme_only:
+                            if _theme_only_has_specific_evidence(evidence):
+                                summary = build_theme_only_summary(evidence, quality_gate)
+                                summary_mode = "video_theme_only"
+                                summary_model_used = "quality_gate_theme_only"
+                                summary_model_chain = ["quality_gate_theme_only"]
+                            else:
+                                summary = build_refusal_summary(evidence, quality_gate)
+                                summary_mode = "quality_gate_refusal"
+                                summary_model_used = "quality_gate"
+                                summary_model_chain = ["quality_gate"]
+                                job.add_warning("video_theme_only_refused_due_to_missing_specific_evidence")
+                        else:
+                            try:
+                                summary = self.video_summarizer.summarize(evidence)
+                                summary_mode = "video_evidence_driven"
+                                summary_model_used = self.config.video_summary.model
+                                summary_model_chain = [self.config.video_summary.model, self.config.video_summary.fallback_model]
+                            except Exception as exc:
+                                summary_error = str(exc)
+                                summary = build_model_unavailable_summary(evidence, quality_gate, summary_error)
+                                summary_mode = "video_model_unavailable"
+                                summary_model_used = "video_model_unavailable"
+                                summary_model_chain = [self.config.video_summary.model, self.config.video_summary.fallback_model]
+                                job.add_warning(f"video_summary_model_unavailable: {summary_error}")
+                        if quality_gate.outcome == "partial" and summary.outcome != "refused":
+                            summary.outcome = "partial"
+                            partial_note = (
+                                "当前是快速抽取结果，已拿到部分可靠内容，但不是整条视频完整理解。"
+                                if quality_gate.mode == "probe"
+                                else "当前视频证据仍然只有部分覆盖。"
+                            )
+                            if partial_note not in summary.uncertainties:
+                                summary.uncertainties = [*summary.uncertainties, partial_note]
+                            summary.coverage = "partial"
                     else:
                         primary_model = self.config.summarizer.model
                         for attempt in range(2):
@@ -1067,56 +1437,34 @@ class WorkflowProcessor:
                             except Exception as exc:
                                 summary_error = str(exc)
                                 if attempt == 1:
-                                    summary_mode = "fallback"
-                                    summary = _build_fallback_summary(evidence)
-                                    summary_model_used = "fallback"
-                                    if "fallback" not in summary_model_chain:
-                                        summary_model_chain.append("fallback")
-                                    job.add_warning(f"summarizer_fallback: {summary_error}")
+                                    raise
                         if (
                             summary is not None
-                            and summary_mode == "fallback"
-                            and self._can_upgrade_summary(ingest)
-                            and self.config.summary_routing.trigger_on_error
-                        ):
-                            upgrade_model = self.config.summary_routing.upgrade_model
-                            try:
-                                summary_attempts += 1
-                                upgraded = self._upgrade_summarizer.summarize(evidence)  # type: ignore[union-attr]
-                                summary = upgraded
-                                summary_mode = "recovered_by_upgrade_model"
-                                summary_model_used = upgrade_model
-                                if upgrade_model not in summary_model_chain:
-                                    summary_model_chain.append(upgrade_model)
-                                job.add_warning(
-                                    f"summary_model_upgrade_on_error: primary={primary_model} -> upgrade={upgrade_model}"
-                                )
-                                summary_error = ""
-                            except Exception as upgrade_exc:
-                                job.add_warning(f"summary_model_upgrade_failed: {upgrade_exc}")
-                        if (
-                            summary is not None
-                            and summary_mode in {"normal", "recovered_by_upgrade_model"}
+                            and summary_mode in {"normal"}
                             and self._can_upgrade_summary(ingest)
                             and self.config.summary_routing.trigger_on_low_quality
                             and summary_model_used != self.config.summary_routing.upgrade_model
                         ):
-                            need_upgrade, quality_score, quality_reasons, signal_coverage = self._should_upgrade_for_quality(
+                            need_upgrade, quality_details = self._should_upgrade_for_quality(
                                 summary, evidence
                             )
+                            quality_score = float(quality_details["quality_score"])
                             summary_quality = {
                                 "quality_score": round(quality_score, 4),
-                                "signal_coverage": round(signal_coverage, 4),
-                                "reasons": quality_reasons,
+                                "signal_coverage": round(float(quality_details["signal_coverage"]), 4),
+                                "signal_coverage_v2": round(float(quality_details["signal_coverage_v2"]), 4),
+                                "hard_fact_count": int(quality_details["hard_fact_count"]),
+                                "boundary_present": bool(quality_details["boundary_present"]),
+                                "resource_only_ratio": round(float(quality_details["resource_only_ratio"]), 4),
+                                "reasons": list(quality_details["reasons"]),
                             }
                             if need_upgrade:
                                 upgrade_model = self.config.summary_routing.upgrade_model
                                 try:
                                     summary_attempts += 1
                                     upgraded = self._upgrade_summarizer.summarize(evidence)  # type: ignore[union-attr]
-                                    upgraded_score, upgraded_reasons, upgraded_coverage = _summary_quality_score(
-                                        upgraded, evidence
-                                    )
+                                    upgraded_details = _summary_quality_details(upgraded, evidence)
+                                    upgraded_score = float(upgraded_details["quality_score"])
                                     if upgraded_score >= quality_score:
                                         summary = upgraded
                                         summary_mode = "upgraded_model"
@@ -1125,8 +1473,12 @@ class WorkflowProcessor:
                                             summary_model_chain.append(upgrade_model)
                                         summary_quality = {
                                             "quality_score": round(upgraded_score, 4),
-                                            "signal_coverage": round(upgraded_coverage, 4),
-                                            "reasons": upgraded_reasons,
+                                            "signal_coverage": round(float(upgraded_details["signal_coverage"]), 4),
+                                            "signal_coverage_v2": round(float(upgraded_details["signal_coverage_v2"]), 4),
+                                            "hard_fact_count": int(upgraded_details["hard_fact_count"]),
+                                            "boundary_present": bool(upgraded_details["boundary_present"]),
+                                            "resource_only_ratio": round(float(upgraded_details["resource_only_ratio"]), 4),
+                                            "reasons": list(upgraded_details["reasons"]),
                                             "primary_quality_score": round(quality_score, 4),
                                             "upgraded": True,
                                         }
@@ -1139,18 +1491,40 @@ class WorkflowProcessor:
                                         )
                                 except Exception as upgrade_exc:
                                     job.add_warning(f"summary_model_upgrade_failed: {upgrade_exc}")
+                        if summary is not None and evidence.source_kind != "video_url":
+                            low_info_details = _summary_quality_details(summary, evidence)
+                            if int(low_info_details.get("hard_fact_count", 0) or 0) < 3:
+                                summary = _build_low_information_partial(summary, evidence, low_info_details)
+                                job.add_warning("summary_low_information_degraded")
                         if (
                             summary is not None
-                            and summary_mode in {"normal", "upgraded_model", "recovered_by_upgrade_model"}
+                            and summary_mode in {"normal", "upgraded_model"}
                             and self._should_use_summary_cache(ingest, evidence)
                         ):
                             cache_key = self._save_summary_cache(evidence, summary)
                 assert summary is not None
+                if isinstance(evidence.metadata, dict):
+                    gate_payload = evidence.metadata.get("quality_gate", {})
+                    if isinstance(gate_payload, dict):
+                        gate_payload["retained_outline_count"] = compute_retained_outline_count(
+                            evidence,
+                            summary,
+                            expected_outline_count=int(gate_payload.get("expected_outline_count", 0) or 0),
+                        )
+                        evidence.metadata["quality_gate"] = gate_payload
+                        quality_gate.retained_outline_count = int(gate_payload["retained_outline_count"] or 0)
                 summary_elapsed_seconds = round(max(0.0, time.perf_counter() - summary_started_at), 3)
-                quality_score, quality_reasons, signal_coverage = _summary_quality_score(summary, evidence)
+                quality_details = _summary_quality_details(summary, evidence)
+                quality_score = float(quality_details["quality_score"])
+                quality_reasons = list(quality_details["reasons"])
+                signal_coverage = float(quality_details["signal_coverage_v2"])
                 final_quality = {
                     "quality_score": round(quality_score, 4),
-                    "signal_coverage": round(signal_coverage, 4),
+                    "signal_coverage": round(float(quality_details["signal_coverage"]), 4),
+                    "signal_coverage_v2": round(signal_coverage, 4),
+                    "hard_fact_count": int(quality_details["hard_fact_count"]),
+                    "boundary_present": bool(quality_details["boundary_present"]),
+                    "resource_only_ratio": round(float(quality_details["resource_only_ratio"]), 4),
                     "reasons": quality_reasons,
                 }
                 if summary_quality:
@@ -1158,7 +1532,7 @@ class WorkflowProcessor:
                         if key not in {"quality_score", "signal_coverage", "reasons"}:
                             final_quality[key] = value
                 summary_quality = final_quality
-                if quality_reasons and summary_mode in {"normal", "cache", "fallback", "fallback_dry_run"}:
+                if quality_reasons and summary_mode in {"normal", "cache", "video_evidence_driven"}:
                     job.add_warning("summary_quality_flags: " + "; ".join(quality_reasons[:3]))
                 job.set_phase("summarize", "done")
 
@@ -1166,93 +1540,139 @@ class WorkflowProcessor:
                 note_preview = None
                 open_url = None
                 notification_error = ""
+                refusal_only_video = summary.outcome == "refused" and evidence.source_kind == "video_url"
 
                 if ingest.dry_run:
                     job.set_phase("write_note", "skipped")
-                    note_preview = self.writer.preview(
-                        summary,
-                        evidence,
-                        use_model_render=True,
-                    )
-                    if "content" in note_preview:
-                        preview_file = self._save_note_preview_file(ingest.request_id, note_preview)
-                        if preview_file:
-                            note_preview["preview_file"] = preview_file
+                    if not refusal_only_video:
+                        note_preview = self.writer.preview(
+                            summary,
+                            evidence,
+                            use_model_render=True,
+                        )
+                        if "content" in note_preview:
+                            preview_file = self._save_note_preview_file(ingest.request_id, note_preview)
+                            if preview_file:
+                                note_preview["preview_file"] = preview_file
                     job.set_phase("notify", "skipped")
                 else:
-                    current_phase = "write_note"
-                    job.mark("processing", message="writing note")
-                    job.set_phase("write_note", "processing")
-                    self.jobs.save(job)
-                    note_meta = self.writer.write(summary, evidence, use_model_render=True)
-                    if note_meta.get("note_render_error"):
-                        job.set_phase("write_note", "failed")
-                        partial_result: Dict[str, object] = {
-                            "summary": summary.to_dict(),
-                            "evidence": evidence.to_dict(),
-                            "dry_run": ingest.dry_run,
-                            "summary_mode": summary_mode,
-                            "summary_attempts": summary_attempts,
-                            "summary_model": summary_model_used,
-                            "summary_model_chain": summary_model_chain,
-                            "entry_context": _infer_entry_context(ingest),
-                            "content_profile": evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {},
-                            "signal_requirements": evidence.metadata.get("signal_requirements", {}) if isinstance(evidence.metadata, dict) else {},
-                            "evidence_sources": evidence.metadata.get("evidence_sources", []) if isinstance(evidence.metadata, dict) else [],
-                            "note_render_error": note_meta.get("note_render_error"),
-                            "materials_file": note_meta.get("materials_file"),
-                        }
-                        if summary_quality:
-                            partial_result["summary_quality"] = summary_quality
-                        job.mark("failed", message="note_render_failed", result=partial_result, error=str(note_meta.get("note_render_error")))
-                        self.jobs.save(job)
-                        continue
-                    job.set_phase("write_note", "done")
-                    open_url = f"{self.config.local_base_url}/open?path={quote(str(note_meta['note_path']), safe='')}"
-
                     current_phase = "notify"
-                    job.mark("processing", message="sending notification")
-                    job.set_phase("notify", "processing")
-                    self.jobs.save(job)
-                    job.notification = {"attempted": True, "ok": None, "error": None}
-                    try:
+                    if refusal_only_video:
+                        job.set_phase("write_note", "skipped")
+                        job.mark("processing", message="sending refusal notification")
+                        job.set_phase("notify", "processing")
+                        self.jobs.save(job)
+                        job.notification = {"attempted": True, "ok": None, "error": None}
                         try:
-                            self.notifier.send_result(
-                                ingest,
-                                summary,
-                                str(note_meta["note_path"]),
-                                str(note_meta["structure_map"]),
-                                open_url,
-                                evidence,
-                                summary_model_used,
-                                summary_elapsed_seconds,
+                            refusal_text = (
+                                self.notifier.build_refusal_message(summary, evidence)
+                                if hasattr(self.notifier, "build_refusal_message")
+                                else summary.refusal_reason or summary.conclusion
                             )
-                        except TypeError as exc:
-                            if "positional arguments" not in str(exc) and "keyword" not in str(exc):
-                                raise
-                            self.notifier.send_result(
-                                ingest,
-                                summary,
-                                str(note_meta["note_path"]),
-                                str(note_meta["structure_map"]),
-                                open_url,
-                            )
-                        job.notification = {"attempted": True, "ok": True, "error": None}
-                        job.set_phase("notify", "done")
-                    except Exception as exc:
-                        notification_error = str(exc)
-                        job.notification = {
-                            "attempted": True,
-                            "ok": False,
-                            "error": notification_error,
-                        }
-                        job.set_phase("notify", "failed")
-                        job.add_warning(f"notification_error: {notification_error}")
+                            reply_to_message_id = None
+                            if ingest.reply_to_message_id:
+                                try:
+                                    reply_to_message_id = int(ingest.reply_to_message_id)
+                                except (TypeError, ValueError):
+                                    reply_to_message_id = None
+                            if hasattr(self.notifier, "send_text"):
+                                self.notifier.send_text(
+                                    chat_id=ingest.chat_id,
+                                    text=refusal_text,
+                                    reply_to_message_id=reply_to_message_id,
+                                )
+                            elif hasattr(self.notifier, "send_result"):
+                                self.notifier.send_result(ingest, summary, "", "", "")
+                            job.notification = {"attempted": True, "ok": True, "error": None}
+                            job.set_phase("notify", "done")
+                        except Exception as exc:
+                            notification_error = str(exc)
+                            job.notification = {
+                                "attempted": True,
+                                "ok": False,
+                                "error": notification_error,
+                            }
+                            job.set_phase("notify", "failed")
+                            job.add_warning(f"notification_error: {notification_error}")
+                    else:
+                        current_phase = "write_note"
+                        job.mark("processing", message="writing note")
+                        job.set_phase("write_note", "processing")
+                        self.jobs.save(job)
+                        note_meta = self.writer.write(summary, evidence, use_model_render=True)
+                        if note_meta.get("note_render_error"):
+                            job.set_phase("write_note", "failed")
+                            partial_result: Dict[str, object] = {
+                                "summary": summary.to_dict(),
+                                "evidence": evidence.to_dict(),
+                                "dry_run": ingest.dry_run,
+                                "summary_mode": summary_mode,
+                                "summary_attempts": summary_attempts,
+                                "summary_model": summary_model_used,
+                                "summary_model_chain": summary_model_chain,
+                                "entry_context": _infer_entry_context(ingest),
+                                "content_profile": evidence.metadata.get("content_profile", {}) if isinstance(evidence.metadata, dict) else {},
+                                "signal_requirements": evidence.metadata.get("signal_requirements", {}) if isinstance(evidence.metadata, dict) else {},
+                                "evidence_sources": evidence.metadata.get("evidence_sources", []) if isinstance(evidence.metadata, dict) else [],
+                                "note_render_error": note_meta.get("note_render_error"),
+                                "materials_file": note_meta.get("materials_file"),
+                            }
+                            if summary_quality:
+                                partial_result["summary_quality"] = summary_quality
+                            job.mark("failed", message="note_render_failed", result=partial_result, error=str(note_meta.get("note_render_error")))
+                            self.jobs.save(job)
+                            continue
+                        job.set_phase("write_note", "done")
+                        open_url = f"{self.config.local_base_url}/open?path={quote(str(note_meta['note_path']), safe='')}"
+
+                        current_phase = "notify"
+                        job.mark("processing", message="sending notification")
+                        job.set_phase("notify", "processing")
+                        self.jobs.save(job)
+                        job.notification = {"attempted": True, "ok": None, "error": None}
+                        try:
+                            try:
+                                self.notifier.send_result(
+                                    ingest,
+                                    summary,
+                                    str(note_meta["note_path"]),
+                                    str(note_meta["structure_map"]),
+                                    open_url,
+                                    evidence,
+                                    summary_model_used,
+                                    summary_elapsed_seconds,
+                                )
+                            except TypeError as exc:
+                                if "positional arguments" not in str(exc) and "keyword" not in str(exc):
+                                    raise
+                                self.notifier.send_result(
+                                    ingest,
+                                    summary,
+                                    str(note_meta["note_path"]),
+                                    str(note_meta["structure_map"]),
+                                    open_url,
+                                )
+                            job.notification = {"attempted": True, "ok": True, "error": None}
+                            job.set_phase("notify", "done")
+                        except Exception as exc:
+                            notification_error = str(exc)
+                            job.notification = {
+                                "attempted": True,
+                                "ok": False,
+                                "error": notification_error,
+                            }
+                            job.set_phase("notify", "failed")
+                            job.add_warning(f"notification_error: {notification_error}")
 
                 result: Dict[str, object] = {
                     "summary": summary.to_dict(),
                     "evidence": evidence.to_dict(),
                     "dry_run": ingest.dry_run,
+                    "outcome": summary.outcome,
+                    "capture_manifest": evidence.capture_manifest.to_dict(),
+                    "evidence_digest": build_evidence_digest(evidence),
+                    "refusal_reason": summary.refusal_reason,
+                    "quality_gate": quality_gate.to_dict(),
                     "summary_mode": summary_mode,
                     "summary_attempts": summary_attempts,
                     "summary_model": summary_model_used,
@@ -1263,6 +1683,11 @@ class WorkflowProcessor:
                     "signal_requirements": evidence.metadata.get("signal_requirements", {}) if isinstance(evidence.metadata, dict) else {},
                     "evidence_sources": evidence.metadata.get("evidence_sources", []) if isinstance(evidence.metadata, dict) else [],
                 }
+                if evidence.source_kind == "video_url" and isinstance(evidence.metadata, dict):
+                    result["video_provider"] = str(evidence.metadata.get("video_provider") or "")
+                    result["video_provider_attempts"] = evidence.metadata.get("video_provider_attempts", [])
+                    result["coverage_basis"] = evidence.metadata.get("coverage_basis", {})
+                    result["video_provider_capabilities"] = evidence.metadata.get("video_provider_capabilities", {})
                 if cache_key:
                     result["summary_cache"] = {
                         "enabled": True,
@@ -1275,9 +1700,32 @@ class WorkflowProcessor:
                     result["summary_error"] = summary_error
                 if video_cost_estimate is not None:
                     result["video_cost_estimate"] = video_cost_estimate
-                video_assessment = _video_assessment(evidence, self.config)
+                assessment_gate = quality_gate.to_dict()
+                if summary.outcome == "partial" and str(assessment_gate.get("outcome", "")).strip().lower() == "summarized":
+                    assessment_gate["outcome"] = "partial"
+                    assessment_reasons = [str(item) for item in assessment_gate.get("reasons", [])] if isinstance(assessment_gate.get("reasons"), list) else []
+                    if summary_mode == "video_model_unavailable":
+                        assessment_reasons.append("video summary model unavailable")
+                    assessment_gate["reasons"] = assessment_reasons
+                elif summary.outcome == "refused":
+                    assessment_gate["outcome"] = "refused"
+                    assessment_reasons = [str(item) for item in assessment_gate.get("reasons", [])] if isinstance(assessment_gate.get("reasons"), list) else []
+                    if summary.refusal_reason:
+                        assessment_reasons.append(summary.refusal_reason)
+                    assessment_gate["reasons"] = assessment_reasons
+                video_assessment = _video_assessment(evidence, self.config, assessment_gate)
                 if video_assessment is not None:
                     result["video_assessment"] = video_assessment
+                if evidence.source_kind == "video_url":
+                    clarity_score = score_video_summary(
+                        summary.to_dict(),
+                        outcome=summary.outcome,
+                        quality_gate=assessment_gate,
+                        status="done",
+                    )
+                    result["video_clarity_score"] = clarity_score.to_dict()
+                    if clarity_score.total < 6:
+                        job.add_warning(f"video_clarity_low: {clarity_score.total}/10")
                 if video_recovery is not None:
                     result["video_recovery"] = video_recovery
                 if note_meta is not None:

@@ -81,7 +81,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Progressive multi-type validation")
     parser.add_argument("--config", default=str(root / "config.json"))
-    parser.add_argument("--cases", default=str(root / "scripts" / "accuracy_eval_cases.multitype.json"))
+    parser.add_argument("--cases", default=str(root / "scripts" / "accuracy_eval_cases.fixed_real_samples.json"))
     parser.add_argument("--mini-model", default="gpt-4o-mini")
     parser.add_argument("--strong-model", default="gpt-4.1")
     parser.add_argument("--output-dir", default=str(root / "state" / "reports"))
@@ -142,4 +142,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

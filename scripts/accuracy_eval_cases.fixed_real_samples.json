@@ -1,0 +1,122 @@
+[
+  {
+    "id": "bilibili_long_finance",
+    "source_kind": "video_url",
+    "source_url": "https://www.bilibili.com/video/BV1bFPMzFEnd",
+    "video_probe_seconds": 180,
+    "expect": {
+      "required_keywords": [
+        "OpenClaw",
+        "自选股",
+        "买入"
+      ],
+      "required_links": [
+        "https://www.bilibili.com/video/BV1bFPMzFEnd"
+      ],
+      "forbidden_phrases": [
+        "一句话总结",
+        "如果我是你",
+        "贾维斯"
+      ],
+      "min_evidence_chars": 120
+    }
+  },
+  {
+    "id": "bilibili_long_tutorial_or_career",
+    "source_kind": "video_url",
+    "source_url": "https://www.bilibili.com/video/BV1ggpcevEgk",
+    "video_probe_seconds": 180,
+    "expect": {
+      "required_keywords": [
+        "面试",
+        "自我介绍",
+        "职业发展"
+      ],
+      "required_links": [
+        "https://www.bilibili.com/video/BV1ggpcevEgk"
+      ],
+      "forbidden_phrases": [
+        "时间段速览",
+        "一句话总结",
+        "如果我是你"
+      ],
+      "min_evidence_chars": 120
+    }
+  },
+  {
+    "id": "youtube_subtitle_only",
+    "source_kind": "video_url",
+    "source_url": "https://www.youtube.com/watch?v=c7qJzG_swUE",
+    "video_probe_seconds": 150,
+    "expect": {
+      "required_links": [
+        "https://www.youtube.com/watch?v=c7qJzG_swUE"
+      ],
+      "forbidden_phrases": [
+        "一句话总结",
+        "如果我是你",
+        "贾维斯"
+      ],
+      "min_evidence_chars": 60
+    }
+  },
+  {
+    "id": "xhs_blocked_note",
+    "source_kind": "url",
+    "source_url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb",
+    "expect": {
+      "required_keywords": [
+        "页面不可见",
+        "不能作为内容总结使用"
+      ],
+      "forbidden_phrases": [
+        "值得看",
+        "值得存",
+        "帮助快速理解"
+      ],
+      "min_evidence_chars": 20
+    }
+  },
+  {
+    "id": "openclaw_docs_install",
+    "source_kind": "url",
+    "source_url": "https://docs.openclaw.ai/",
+    "expect": {
+      "required_keywords": [
+        "WhatsApp",
+        "Telegram",
+        "配对",
+        "网关"
+      ],
+      "required_links": [
+        "https://docs.openclaw.ai/"
+      ],
+      "forbidden_phrases": [
+        "一句话总结",
+        "适合作为参考",
+        "帮助快速理解"
+      ],
+      "min_evidence_chars": 80
+    }
+  },
+  {
+    "id": "github_project_page",
+    "source_kind": "url",
+    "source_url": "https://github.com/VoltAgent/awesome-openclaw-skills",
+    "platform_hint": "github",
+    "expect": {
+      "required_projects": [
+        "VoltAgent/awesome-openclaw-skills"
+      ],
+      "required_links": [
+        "https://github.com/VoltAgent/awesome-openclaw-skills"
+      ],
+      "forbidden_phrases": [
+        "一句话总结",
+        "帮助快速理解",
+        "如果我是你"
+      ],
+      "min_evidence_chars": 60
+    }
+  }
+]

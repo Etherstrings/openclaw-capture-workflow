@@ -9,22 +9,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from openclaw_capture_workflow.config import AppConfig, ExtractorConfig, ObsidianConfig, SummarizerConfig, TelegramConfig
 from openclaw_capture_workflow.extractor import (
-    _cleanup_browser_tab,
+    _apply_directional_repairs,
+    _adaptive_video_probe_seconds,
     _canonicalize_video_source_url,
+    _estimate_video_direction,
     _extract_high_value_ocr_lines,
     _extract_article_blocks,
     _fetch_bilibili_video_metadata,
     _extract_meta_description,
     _extract_bilibili_viewer_feedback_from_snapshot,
     _extract_skill_signals,
+    _extract_step_items_from_text,
     _extract_text_from_browser_snapshot,
     _extract_steps_from_tencent_snapshot,
     _extract_text_from_tencent_snapshot,
     _normalize_structured_ocr_output,
     _parse_video_text_output,
+    _repair_video_speech_track,
     _extract_wechat_article,
-    _find_browser_tab_for_url,
-    _find_or_open_browser_tab_with_state,
     _looks_like_legal_footer,
     _looks_like_command_line,
     _should_try_browser_ocr,
@@ -57,6 +59,84 @@ def _config(tmp: str) -> AppConfig:
 
 
 class ExtractorTest(unittest.TestCase):
+    def test_video_direction_estimate_detects_finance_market_theme(self) -> None:
+        direction = _estimate_video_direction(
+            title="第1143日投资记录：跟随恒指恒科小赚回血",
+            transcript_text="赚钱效应只有50%，恒生指数和恒生科技指数表现较强。宁德时代H股比A股溢价44个点。",
+            subtitle_text="",
+            metadata={"bilibili_tags": ["股票", "港股", "投资"]},
+            keyframe_ocr_lines=["恒生科技指数", "溢价44个点"],
+        )
+        self.assertEqual(direction.get("kind"), "finance_market")
+        self.assertIn(direction.get("confidence"), {"medium", "high"})
+
+    def test_directional_repairs_fix_obvious_finance_asr_errors(self) -> None:
+        repaired, applied = _apply_directional_repairs(
+            "内德时代甚至比A股的价格一价44个点，华人医药4.5卖的，服生员跟指数逆向。",
+            direction_kind="finance_market",
+        )
+        self.assertIn("宁德时代", repaired)
+        self.assertIn("溢价44个点", repaired)
+        self.assertIn("华润医药", repaired)
+        self.assertIn("福寿园", repaired)
+        self.assertTrue(applied)
+
+    def test_repair_video_speech_track_updates_timeline_lines_and_segments(self) -> None:
+        repaired_text, updated_meta, applied = _repair_video_speech_track(
+            "内德时代甚至比A股的价格一价44个点。",
+            {
+                "timeline_lines": ["[01:24] 内德时代甚至比A股的价格一价44个点"],
+                "segments": [{"start": 84.0, "end": 90.0, "text": "内德时代甚至比A股的价格一价44个点"}],
+            },
+            direction_kind="finance_market",
+        )
+        self.assertIn("宁德时代", repaired_text)
+        self.assertTrue(any("宁德时代" in item for item in updated_meta["timeline_lines"]))
+        self.assertEqual(updated_meta["segments"][0]["text"], "宁德时代甚至比A股的价格溢价44个点")
+        self.assertTrue(applied)
+
+    def test_adaptive_video_probe_seconds_skips_probe_for_enumerated_long_video(self) -> None:
+        cfg = _config("/tmp")
+        request = IngestRequest(
+            chat_id="-1",
+            reply_to_message_id="1",
+            request_id="probe-adaptive-1",
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1ggpcevEgk/",
+            raw_text="https://www.bilibili.com/video/BV1ggpcevEgk/",
+            dry_run=True,
+        )
+        probe_seconds = _adaptive_video_probe_seconds(
+            request=request,
+            video_url=request.source_url,
+            metadata={"bilibili_duration_seconds": 453},
+            default_probe_seconds=cfg.execution.dry_run_video_probe_seconds,
+            title_context="求职面试中，最常见的12个问题，务必收藏",
+            description_context="今天为你总结分享12个常见的面试问题",
+        )
+        self.assertEqual(probe_seconds, 0)
+
+    def test_adaptive_video_probe_seconds_skips_probe_for_long_duration(self) -> None:
+        cfg = _config("/tmp")
+        request = IngestRequest(
+            chat_id="-1",
+            reply_to_message_id="1",
+            request_id="probe-adaptive-2",
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1unw9zxEHF/",
+            raw_text="重点看投资逻辑",
+            dry_run=True,
+        )
+        probe_seconds = _adaptive_video_probe_seconds(
+            request=request,
+            video_url=request.source_url,
+            metadata={"bilibili_duration_seconds": 1760},
+            default_probe_seconds=cfg.execution.dry_run_video_probe_seconds,
+            title_context="第1143日投资记录：跟随恒指恒科小赚回血",
+            description_context="今天主要复盘持仓和后续计划",
+        )
+        self.assertEqual(probe_seconds, 0)
+
     def test_url_request_prefers_analyzer_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
@@ -388,6 +468,59 @@ class ExtractorTest(unittest.TestCase):
         signals = _extract_skill_signals(text, "https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7")
         self.assertIn("https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7", signals.get("links", []))
 
+    def test_extract_skill_signals_captures_supported_platforms(self) -> None:
+        text = """
+        OpenClaw 支持 WhatsApp、Telegram、Discord、iMessage 等平台。
+        安装服务并完成 WhatsApp 配对后，才能启动网关。
+        """
+        signals = _extract_skill_signals(text, "https://docs.openclaw.ai/")
+        self.assertEqual(
+            signals.get("supported_platforms", []),
+            ["WhatsApp", "Telegram", "Discord", "iMessage"],
+        )
+
+    def test_extract_step_items_from_text_supports_english_docs_headings(self) -> None:
+        text = """
+        Onboard and install the service
+        Pair WhatsApp and start the Gateway
+        Verify the Gateway is running
+        """
+        steps = _extract_step_items_from_text(text)
+        self.assertEqual(
+            [item["title"] for item in steps],
+            [
+                "Onboard and install the service",
+                "Pair WhatsApp and start the Gateway",
+                "Verify the Gateway is running",
+            ],
+        )
+
+    def test_web_extractor_backfills_step_items_from_visible_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(tmp)
+            cfg.extractors.webpage_text_command = (
+                "python3 -c 'import json; print(json.dumps({"
+                "\\\"title\\\":\\\"OpenClaw - OpenClaw\\\","
+                "\\\"text\\\":\\\"Any OS gateway for AI agents across WhatsApp, Telegram, Discord, iMessage, and more.\\\\n\\\\n"
+                "Onboard and install the service\\\\n\\\\nPair WhatsApp and start the Gateway\\\""
+                "}, ensure_ascii=False))'"
+            )
+            extractor = EvidenceExtractor(cfg, Path(tmp) / "artifacts")
+            evidence = extractor.extract(
+                IngestRequest(
+                    chat_id="-1",
+                    reply_to_message_id="1",
+                    request_id="docs-home-steps",
+                    source_kind="url",
+                    source_url="https://docs.openclaw.ai/",
+                    raw_text="https://docs.openclaw.ai/",
+                )
+            )
+            step_items = evidence.metadata.get("step_items", [])
+            self.assertTrue(step_items)
+            self.assertEqual(step_items[0]["title"], "Onboard and install the service")
+            self.assertEqual(step_items[1]["title"], "Pair WhatsApp and start the Gateway")
+
     def test_github_blob_markdown_uses_raw_file_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
@@ -515,46 +648,6 @@ class ExtractorTest(unittest.TestCase):
         self.assertNotIn("00:02 / 00:47", cleaned)
         self.assertNotIn("我怎么觉得十几年前就用个这个 psv", cleaned)
         self.assertNotIn("相关推荐", cleaned)
-
-    def test_find_browser_tab_for_url_matches_xiaohongshu_share_variants(self) -> None:
-        tabs = [
-            {
-                "targetId": "1",
-                "url": "https://www.xiaohongshu.com/explore/69a3032400000000150305bb?app_platform=ios&apptime=111&share_id=aaa",
-                "title": "推荐一个「美股财报深度分析」Skill - 小红书",
-            }
-        ]
-        matched = _find_browser_tab_for_url(
-            "https://www.xiaohongshu.com/explore/69a3032400000000150305bb?app_platform=ios&apptime=222&share_id=bbb",
-            tabs,
-        )
-        self.assertIsNotNone(matched)
-        self.assertEqual(matched["targetId"], "1")
-
-    def test_find_or_open_browser_tab_with_state_marks_new_tab(self) -> None:
-        with patch(
-            "openclaw_capture_workflow.extractor._run_openclaw_browser_json",
-            side_effect=[
-                {"tabs": []},
-                {"ok": True},
-                {"tabs": [{"targetId": "t1", "url": "https://example.com/video", "title": "video"}]},
-            ],
-        ):
-            tab, opened = _find_or_open_browser_tab_with_state("https://example.com/video", retries=1, delay_seconds=0)
-        self.assertTrue(opened)
-        self.assertEqual(tab["targetId"], "t1")
-
-    def test_cleanup_browser_tab_pauses_and_closes_new_tab(self) -> None:
-        calls: list[tuple] = []
-
-        def _fake_browser_json(*args):
-            calls.append(args)
-            return {"ok": True}
-
-        with patch("openclaw_capture_workflow.extractor._run_openclaw_browser_json", side_effect=_fake_browser_json):
-            _cleanup_browser_tab({"targetId": "t-video-1"}, opened_for_capture=True)
-        self.assertEqual(calls[0][0], "evaluate")
-        self.assertEqual(calls[1], ("close", "t-video-1"))
 
     def test_extract_text_from_tencent_snapshot_keeps_steps(self) -> None:
         snapshot = """
@@ -905,7 +998,7 @@ class ExtractorTest(unittest.TestCase):
             self.assertIn("小红书图文当前在本地环境下已经返回", evidence.text)
             self.assertIn("web_blocked_notice", evidence.metadata.get("evidence_sources", []))
 
-    def test_video_extract_adds_viewer_feedback_and_story_blocks(self) -> None:
+    def test_video_extract_adds_viewer_feedback_without_story_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             extractor = EvidenceExtractor(_config(tmp), Path(tmp) / "artifacts")
             extractor.config.extractors.video_subtitle_command = (
@@ -959,10 +1052,7 @@ class ExtractorTest(unittest.TestCase):
             )
             self.assertEqual(evidence.metadata.get("viewer_feedback_capture", {}).get("count"), 2)
             story_blocks = evidence.metadata.get("video_story_blocks", [])
-            labels = [item.get("label") for item in story_blocks]
-            self.assertIn("core_topic", labels)
-            self.assertIn("workflow", labels)
-            self.assertIn("risk", labels)
+            self.assertEqual(story_blocks, [])
 
     def test_video_viewer_feedback_failure_does_not_break_extract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

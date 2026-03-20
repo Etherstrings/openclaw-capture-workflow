@@ -24,7 +24,7 @@ from .video_story_blocks import (
 PROMPT = """Role: Direct Analyst
 
 Profile:
-Your job is to help a busy software engineer quickly understand fragmented web information.
+Your job is to summarize fragmented evidence into a clear, factual brief.
 You are not a decorative narrator and not a persona. You reconstruct noisy evidence into a direct, useful answer.
 
 Core mission:
@@ -35,8 +35,7 @@ Core mission:
 
 Capabilities:
 - Semantic reconstruction: the evidence may be sliced, partially OCR'd, noisy, or structurally broken. Rebuild the likely logic chain.
-- Multi-mode summarization: produce an executive brief, technical note, or action-oriented read depending on the source.
-- Tactical judgment: estimate timeliness, practical usefulness, and recommendation level for a busy engineer.
+- Multi-mode summarization: produce concise factual output depending on source type.
 
 Important:
 - Only use facts present in the evidence. Do not invent unstated facts.
@@ -75,7 +74,7 @@ Rules:
 - timeliness must be one of: high, medium, low
 - effectiveness must be one of: high, medium, low
 - recommendation_level must be one of: must_read, recommended, optional, skip
-- reader_judgment must be one sentence stating the practical judgment for a large-tech software engineer.
+- reader_judgment must be one sentence stating the practical judgment based on available evidence.
 - title must be short and semantic (no site UI prefix like "GitHub -" / "小红书 -").
 - conclusion must be one sentence and directly state the main finding.
 - bullets should be 3 to 6 concise points, each point only one fact.
@@ -96,10 +95,10 @@ Rules:
 - Avoid boilerplate/meta statements like "已提取核心事实" or "帮助你快速理解".
 - Avoid vague phrases like "内容完整/覆盖全面/适用于开发者和爱好者" unless the evidence explicitly states them.
 - Do not repeat the same fact in different bullets with slight wording changes.
-- If the evidence clearly enumerates multiple points using explicit numbering, preserve all detected points in order instead of compressing them into 3-5 generic bullets.
-- If `video_outline.outline_detected=true`, keep the outline structure in order and rewrite each point clearly instead of collapsing it into vague themes.
-- If `video_story_blocks` is present, treat it as the main structure for narrative videos and rewrite each block into clear human language.
-- If `video_story_blocks` contains `workflow`, `risk`, or `viewer_feedback`, prioritize those blocks in bullets when the evidence supports them.
+- If the evidence clearly enumerates multiple points, preserve the main sequence when it is reliable; if the details are noisy, prefer a few clean paragraph-like bullets over a forced full list.
+- If `video_outline.outline_detected=true`, use it as a hint, not a hard requirement.
+- If `video_story_blocks` is present, use it only when it clearly improves readability; otherwise prefer simple timeline paragraphs.
+- If `video_story_blocks` contains `workflow`, `risk`, or `viewer_feedback`, only use those blocks when the evidence is explicit.
 - Do not copy long raw ASR fragments into bullets; rewrite them as concise topic blocks.
 - If `viewer_feedback` is empty, do not invent audience reaction.
 """
@@ -522,6 +521,18 @@ def _normalize_bullet_text(value: str) -> str:
     return text
 
 
+def _normalize_finance_cell_text(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
+    if not text:
+        return ""
+    parts = [item.strip("，,：:；;。 ") for item in re.split(r"[。；;\n]+", text) if item.strip("，,：:；;。 ")]
+    if parts:
+        text = parts[0]
+    if len(text) > 96:
+        text = text[:96].rstrip("，,：:；; ") + "..."
+    return text
+
+
 def _is_generic_bullet(value: str) -> bool:
     lowered = value.lower()
     generic_tokens = [
@@ -537,12 +548,94 @@ def _is_generic_bullet(value: str) -> bool:
     return any(token in lowered for token in generic_tokens)
 
 
+def _content_profile_kind(evidence: EvidenceBundle) -> str:
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    profile = metadata.get("content_profile", {}) if isinstance(metadata.get("content_profile"), dict) else {}
+    if not profile:
+        profile = infer_content_profile(evidence.source_kind, evidence.source_url, evidence.text, metadata)
+    kind = str(profile.get("kind", "")).strip()
+    return kind or "general_capture"
+
+
+def _is_docs_overview_page(evidence: EvidenceBundle) -> bool:
+    source_url = (evidence.source_url or "").strip().lower().rstrip("/")
+    if not source_url.startswith("https://docs."):
+        return False
+    if source_url.count("/") > 2:
+        return False
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
+    commands = signals.get("commands", []) if isinstance(signals.get("commands"), list) else []
+    prerequisites = signals.get("prerequisites", []) if isinstance(signals.get("prerequisites"), list) else []
+    validations = signals.get("validation_actions", []) if isinstance(signals.get("validation_actions"), list) else []
+    step_items = metadata.get("step_items", []) if isinstance(metadata.get("step_items"), list) else []
+    return not bool(commands or prerequisites or validations) and bool(step_items or signals.get("supported_platforms"))
+
+
+def _labeled_bullet_parts(value: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
+    if not text:
+        return "", ""
+    for sep in (":", "："):
+        if sep not in text:
+            continue
+        label, rest = text.split(sep, 1)
+        if len(label.strip()) <= 12:
+            return label.strip(), rest.strip()
+    return "", text
+
+
+def _looks_like_resource_bullet(value: str) -> bool:
+    label, body = _labeled_bullet_parts(value)
+    lowered = body.lower()
+    return label in {"GitHub地址", "视频链接", "关键链接", "仓库地址", "文档链接", "来源链接"} or lowered.startswith(
+        ("http://", "https://")
+    )
+
+
+def _looks_like_boundary_bullet(value: str) -> bool:
+    label, body = _labeled_bullet_parts(value)
+    text = f"{label} {body}".lower()
+    if label in {"适用边界", "常见错误", "验证边界", "风险", "边界", "限制"}:
+        return True
+    return any(token in text for token in ["边界", "限制", "不支持", "仅支持", "注意事项", "风险", "报错", "错误", "失败", "缺口"])
+
+
+def _normalize_signal_values(
+    values: list[str],
+    *,
+    limit: int = 2,
+    sanitize_url: bool = False,
+    label: str = "",
+) -> list[str]:
+    normalized: list[str] = []
+    for raw in values:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if sanitize_url:
+            text = _sanitize_display_url(text)
+        if label:
+            for prefix in (f"{label}:", f"{label}："):
+                if text.startswith(prefix):
+                    text = text[len(prefix) :].strip()
+                    break
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or text in normalized:
+            continue
+        normalized.append(text)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
 def _signal_priority_bullets(evidence: EvidenceBundle, limit: int = 4) -> list[str]:
     metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
     signals = metadata.get("signals", {})
     if not isinstance(signals, dict):
         return []
     bullets: list[str] = []
+    profile_kind = _content_profile_kind(evidence)
     projects = [str(item) for item in signals.get("projects", []) if str(item).strip()]
     links = [_sanitize_display_url(str(item)) for item in signals.get("links", []) if str(item).strip()]
     skills = [str(item) for item in signals.get("skills", []) if str(item).strip()]
@@ -552,6 +645,15 @@ def _signal_priority_bullets(evidence: EvidenceBundle, limit: int = 4) -> list[s
     validations = [str(item) for item in signals.get("validation_actions", []) if str(item).strip()]
     use_cases = [str(item) for item in signals.get("use_cases", []) if str(item).strip()]
     purposes = [str(item) for item in signals.get("purposes", []) if str(item).strip()]
+    boundaries = [str(item) for item in signals.get("boundaries", []) if str(item).strip()]
+    common_errors = [str(item) for item in signals.get("common_errors", []) if str(item).strip()]
+    supported_platforms = [str(item) for item in signals.get("supported_platforms", []) if str(item).strip()]
+    step_items = metadata.get("step_items", []) if isinstance(metadata.get("step_items"), list) else []
+    step_titles = [
+        re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+        for item in step_items
+        if isinstance(item, dict) and str(item.get("title", "")).strip()
+    ]
 
     # Prefer canonical repo/doc links before raw install artifacts.
     candidate_links = [
@@ -587,33 +689,102 @@ def _signal_priority_bullets(evidence: EvidenceBundle, limit: int = 4) -> list[s
             ranked_projects.append((score, project))
         projects = [item[1] for item in sorted(ranked_projects, key=lambda pair: pair[0], reverse=True)]
 
-    if projects:
-        bullets.append("项目名称: " + " | ".join(projects[:1]))
-    if github_links:
-        bullets.append("GitHub地址: " + " | ".join(github_links[:2]))
-    if video_links:
-        bullets.append("视频链接: " + " | ".join(video_links[:2]))
-    if other_links:
-        bullets.append("关键链接: " + " | ".join(other_links[:2]))
-    if skills:
-        bullets.append("技能名: " + " | ".join(skills[:2]))
-    if skill_ids:
-        bullets.append("技能ID: " + " | ".join(skill_ids[:3]))
-    if commands:
-        has_install_command = any(token in cmd.lower() for cmd in commands for token in ["install", "/install-skill"])
-        if has_install_command:
-            bullets.append("安装方法: " + " | ".join(commands[:2]))
-        else:
-            bullets.append("关键命令: " + " | ".join(commands[:2]))
-    if prerequisites:
-        bullets.append("前置条件: " + " | ".join(prerequisites[:2]))
-    if validations:
-        bullets.append("验证动作: " + " | ".join(validations[:2]))
-    if use_cases and evidence.source_kind != "video_url":
-        bullets.append("使用方式: " + " | ".join(use_cases[:2]))
-    elif purposes and evidence.source_kind != "video_url":
-        bullets.append("核心用途: " + " | ".join(purposes[:2]))
-    return _normalize_list([_normalize_bullet_text(item) for item in bullets], limit=limit)
+    def append_line(label: str, values: list[str], *, cap: int = 2, sanitize_url: bool = False) -> None:
+        normalized_values = _normalize_signal_values(values, limit=cap, sanitize_url=sanitize_url, label=label)
+        if not normalized_values:
+            return
+        bullet = _normalize_bullet_text(f"{label}: " + " | ".join(normalized_values))
+        if bullet and bullet not in bullets:
+            bullets.append(bullet)
+
+    if profile_kind == "installation_tutorial":
+        append_line("前置条件", prerequisites)
+        if commands:
+            has_install_command = any(token in cmd.lower() for cmd in commands for token in ["install", "/install-skill"])
+            append_line("安装方法" if has_install_command else "关键命令", commands)
+        append_line("验证动作", validations)
+        append_line("平台支持", supported_platforms, cap=4)
+        append_line("适用边界", boundaries)
+        append_line("常见错误", common_errors)
+        append_line("项目名称", projects, cap=1)
+        append_line("GitHub地址", github_links, sanitize_url=True)
+        append_line("关键链接", other_links, sanitize_url=True)
+    elif profile_kind == "skill_recommendation":
+        append_line("技能名", skills)
+        append_line("技能ID", skill_ids, cap=3)
+        if commands:
+            has_install_command = any(token in cmd.lower() for cmd in commands for token in ["install", "/install-skill"])
+            append_line("安装方法" if has_install_command else "关键命令", commands)
+        append_line("使用方式", use_cases or purposes)
+        append_line("项目名称", projects, cap=1)
+        append_line("GitHub地址", github_links, sanitize_url=True)
+        append_line("平台支持", supported_platforms, cap=4)
+        append_line("适用边界", boundaries)
+        append_line("验证动作", validations)
+        append_line("常见错误", common_errors)
+        append_line("关键链接", other_links, sanitize_url=True)
+    elif profile_kind == "project_overview":
+        append_line("项目名称", projects, cap=1)
+        append_line("GitHub地址", github_links, sanitize_url=True)
+        append_line("核心用途", purposes or use_cases)
+        if commands:
+            has_install_command = any(token in cmd.lower() for cmd in commands for token in ["install", "/install-skill"])
+            append_line("安装方法" if has_install_command else "关键命令", commands)
+        append_line("平台支持", supported_platforms, cap=4)
+        append_line("适用边界", boundaries)
+        append_line("验证动作", validations)
+        append_line("关键链接", other_links, sanitize_url=True)
+    else:
+        append_line("项目名称", projects, cap=1)
+        append_line("技能名", skills)
+        append_line("技能ID", skill_ids, cap=3)
+        append_line("前置条件", prerequisites)
+        if commands:
+            has_install_command = any(token in cmd.lower() for cmd in commands for token in ["install", "/install-skill"])
+            append_line("安装方法" if has_install_command else "关键命令", commands)
+        append_line("验证动作", validations)
+        append_line("使用方式", use_cases)
+        append_line("核心用途", purposes)
+        append_line("平台支持", supported_platforms, cap=4)
+        append_line("适用边界", boundaries)
+        append_line("常见错误", common_errors)
+        if step_titles:
+            append_line("流程要点", step_titles, cap=3)
+        append_line("GitHub地址", github_links, sanitize_url=True)
+        if video_links and evidence.source_kind == "video_url":
+            append_line("视频链接", video_links, sanitize_url=True)
+        append_line("关键链接", other_links, sanitize_url=True)
+    if _is_docs_overview_page(evidence) and step_titles:
+        append_line("流程要点", step_titles, cap=3)
+        if not boundaries:
+            append_line("适用边界", ["当前页更像文档首页概览，没有给出完整命令、验证和失败处理。"])
+
+    normalized = _normalize_list([_normalize_bullet_text(item) for item in bullets], limit=max(limit + 2, 6))
+    if any(item.startswith("平台支持:") for item in normalized):
+        normalized = [
+            item
+            for item in normalized
+            if item not in {"支持多平台", "支持多个平台", "支持多平台服务"} and not item.startswith("支持多平台")
+        ]
+    if boundaries or common_errors:
+        has_boundary = any(_looks_like_boundary_bullet(item) for item in normalized)
+        if not has_boundary:
+            boundary_values = boundaries or common_errors
+            boundary_label = "适用边界" if boundaries else "常见错误"
+            boundary_line = _normalize_bullet_text(
+                f"{boundary_label}: " + " | ".join(_normalize_signal_values(boundary_values, limit=2, label=boundary_label))
+            )
+            if boundary_line:
+                if len(normalized) >= max(limit, 1):
+                    replace_idx = next((idx for idx in range(len(normalized) - 1, -1, -1) if _looks_like_resource_bullet(normalized[idx])), len(normalized) - 1)
+                    normalized[replace_idx] = boundary_line
+                else:
+                    normalized.append(boundary_line)
+    if profile_kind == "general_capture":
+        fact_count = sum(1 for item in normalized if not _looks_like_resource_bullet(item))
+        if fact_count < 3 and other_links and not any(item.startswith("关键链接:") for item in normalized):
+            normalized.append("关键链接: " + " | ".join(_normalize_signal_values(other_links, limit=2, sanitize_url=True)))
+    return _normalize_list(_dedupe_fact_categories(normalized), limit=limit)
 
 
 def _dedupe_fact_categories(items: list[str]) -> list[str]:
@@ -622,6 +793,8 @@ def _dedupe_fact_categories(items: list[str]) -> list[str]:
         "GitHub地址",
         "视频链接",
         "关键链接",
+        "文档链接",
+        "来源链接",
         "技能名",
         "技能ID",
         "关键命令",
@@ -630,6 +803,10 @@ def _dedupe_fact_categories(items: list[str]) -> list[str]:
         "验证动作",
         "使用方式",
         "核心用途",
+        "流程要点",
+        "平台支持",
+        "适用边界",
+        "常见错误",
         "命令",
         "链接",
         "项目",
@@ -819,12 +996,77 @@ def _refine_incomplete_video_bullets(bullets: list[str], evidence: EvidenceBundl
     return refined[:5]
 
 
+def _looks_like_raw_video_bullet(value: str, evidence: EvidenceBundle) -> bool:
+    text = _normalize_bullet_text(value)
+    if not text:
+        return False
+    if re.fullmatch(r"要点\d+", text):
+        return True
+    if len(text) >= 90:
+        return True
+    compact = re.sub(r"\s+", "", text.lower())
+    transcript_corpus = re.sub(r"\s+", "", (evidence.transcript or evidence.text or "").lower())
+    if compact and len(compact) >= 32 and compact in transcript_corpus and not re.search(r"[，。；：:,]", text):
+        return True
+    return False
+
+
 def _refine_bullets(summary_bullets: list[str], evidence: EvidenceBundle) -> list[str]:
     if evidence.source_kind == "video_url":
+        evidence_corpus = "\n".join(
+            [
+                _sanitize_display_url(evidence.source_url or ""),
+                _refine_title(evidence.title, evidence),
+                evidence.text or "",
+                evidence.transcript or "",
+            ]
+        ).lower()
+        story_bullets = get_story_block_bullets(evidence, include_feedback=True, limit=6)
+        blocked_video_templates = [
+            "视频把关键流程拆成了输入、配置和运行几个环节，重点在把方案真正跑起来。",
+            "系统会结合行情、业绩和多种数据源来做判断，而不只是给一句结论。",
+            "视频明确提醒这更像技术展示和参考，不建议盲目跟单或直接照搬投资决策。",
+            "评论区主要围绕实盘体验、可靠性和使用边界展开讨论。",
+        ]
+        video_candidates: list[str] = []
+        weak_video_candidate_count = 0
+        for raw in summary_bullets:
+            bullet = _normalize_bullet_text(raw)
+            if not bullet or _is_generic_bullet(bullet):
+                continue
+            if _looks_like_raw_video_bullet(bullet, evidence):
+                weak_video_candidate_count += 1
+                continue
+            if any(token in bullet for token in ["素材未包含", "素材不包含", "当前素材未包含"]):
+                weak_video_candidate_count += 1
+                continue
+            if any(template in bullet for template in blocked_video_templates):
+                normalized = bullet.lower()
+                if normalized not in evidence_corpus:
+                    weak_video_candidate_count += 1
+                    continue
+            cleaned_bullet = _clean_video_fact_text(bullet, evidence)
+            if not cleaned_bullet and not bullet.startswith(("视频链接:", "关键链接:", "GitHub地址:", "项目名称:", "技能名:", "技能ID:")):
+                weak_video_candidate_count += 1
+                continue
+            if len(cleaned_bullet or bullet) < 10 and not bullet.startswith(("视频链接:", "关键链接:", "GitHub地址:", "项目名称:", "技能名:", "技能ID:")):
+                weak_video_candidate_count += 1
+            video_candidates.append(bullet if bullet.startswith(("视频链接:", "关键链接:", "GitHub地址:", "项目名称:", "技能名:", "技能ID:")) else cleaned_bullet)
+        video_candidates = _normalize_list(_dedupe_fact_categories(video_candidates), limit=6)
+        if story_bullets:
+            candidate_corpus = "\n".join(video_candidates).lower()
+            story_hits = sum(1 for item in story_bullets if _normalize_bullet_text(item).lower() in candidate_corpus)
+            if story_hits == 0:
+                return [f"{idx + 1}. {point}" for idx, point in enumerate(story_bullets)]
+        if story_bullets and (len(video_candidates) < 3 or weak_video_candidate_count > 0):
+            return [f"{idx + 1}. {point}" for idx, point in enumerate(story_bullets)]
         explicit_outline = _extract_explicit_video_outline(evidence, summary_bullets)
+        if explicit_outline and len(explicit_outline) > len(video_candidates):
+            return [f"{idx + 1}. {point}" for idx, point in enumerate(explicit_outline)]
+        if len(video_candidates) >= 3:
+            return video_candidates[:6]
         if explicit_outline:
             return [f"{idx + 1}. {point}" for idx, point in enumerate(explicit_outline)]
-        story_bullets = get_story_block_bullets(evidence, include_feedback=True, limit=6)
         if story_bullets:
             return [f"{idx + 1}. {point}" for idx, point in enumerate(story_bullets)]
         outline_points = _extract_video_outline(evidence, summary_bullets)
@@ -861,6 +1103,12 @@ def _refine_bullets(summary_bullets: list[str], evidence: EvidenceBundle) -> lis
     if len(merged) < 3:
         fallback = [_normalize_bullet_text(item) for item in _fallback_bullets(evidence, limit=7)]
         merged = _normalize_list(_dedupe_fact_categories(merged + fallback), limit=6)
+    if _is_docs_overview_page(evidence):
+        flow_bullet = next((item for item in merged if item.startswith("流程要点:")), "")
+        if flow_bullet:
+            _, flow_text = _labeled_bullet_parts(flow_bullet)
+            flow_parts = {part.strip() for part in flow_text.split("|") if part.strip()}
+            merged = [item for item in merged if item == flow_bullet or item not in flow_parts]
     if prioritized and len(merged) > 6:
         base = merged[:6]
         if appended_focus:
@@ -980,6 +1228,10 @@ def _extract_install_actions_from_evidence(evidence: EvidenceBundle, limit: int 
 def _refine_follow_up_actions(actions: list[str], evidence: EvidenceBundle, bullets: list[str]) -> list[str]:
     normalized = _normalize_list([_normalize_bullet_text(item) for item in actions if _normalize_bullet_text(item)], limit=8)
     if evidence.source_kind == "video_url":
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        profile = metadata.get("content_profile", {}) if isinstance(metadata.get("content_profile"), dict) else {}
+        profile_kind = str(profile.get("kind", "")).strip()
+        signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
         if _is_incomplete_video(evidence):
             guided = [
                 "补抓字幕或语音轨后再复核结论",
@@ -1005,9 +1257,21 @@ def _refine_follow_up_actions(actions: list[str], evidence: EvidenceBundle, bull
             filtered.append(item)
         if len(filtered) >= 2:
             return filtered[:4]
+        supports_tutorial_actions = profile_kind in {"installation_tutorial", "skill_recommendation", "project_overview"}
+        supports_tutorial_actions = supports_tutorial_actions or bool(
+            isinstance(signals, dict)
+            and (
+                signals.get("commands")
+                or signals.get("projects")
+                or signals.get("skill_ids")
+                or signals.get("validation_actions")
+            )
+        )
+        if not supports_tutorial_actions:
+            return filtered[:4]
         video_facts = _extract_video_fact_points(bullets, evidence, limit=3)
         derived: list[str] = []
-        joined = "\n".join(video_facts + [str(evidence.metadata.get("user_guidance", ""))]).lower() if isinstance(evidence.metadata, dict) else "\n".join(video_facts).lower()
+        joined = "\n".join(video_facts + [str(metadata.get("user_guidance", ""))]).lower()
         if any(token in joined for token in ["项目", "技术点", "学项目", "有没有帮助"]):
             derived.append("先确认项目是干什么的、关键技术点是什么，再决定是否继续投入")
         if any(token in joined for token in ["下载", "运行", "跑起来", "部署"]):
@@ -1018,8 +1282,6 @@ def _refine_follow_up_actions(actions: list[str], evidence: EvidenceBundle, bull
             derived.append("用TRAE或chain把项目先部署到本地试跑")
         if any(token in joined for token in ["全英文", "英文"]):
             derived.append("先确认自己能否接受全英文界面和英文信息源")
-        if any(token in joined for token in ["仪表盘", "数据源"]):
-            derived.append("按自己的关注主题调整仪表盘和数据源")
         merged = _normalize_list(filtered + derived, limit=4)
         return merged[:4]
     if _is_incomplete_video(evidence):
@@ -1029,6 +1291,8 @@ def _refine_follow_up_actions(actions: list[str], evidence: EvidenceBundle, bull
         ]
         merged = _normalize_list(guided + normalized, limit=4)
         return merged[:4]
+    if _is_docs_overview_page(evidence):
+        return ["如果要真正开始安装，继续进入详细安装或配对子页查看具体命令和验证步骤。"]
     tutorial_like = _is_tutorial_like(evidence)
     if tutorial_like:
         install_actions = _extract_install_actions_from_evidence(evidence, limit=8)
@@ -1058,31 +1322,168 @@ def _refine_conclusion(conclusion: str, evidence: EvidenceBundle, bullets: list[
             title = _refine_title(evidence.title, evidence)
             if title and title != "未命名内容":
                 return f"视频主要围绕《{title}》展开。"
+    if _is_docs_overview_page(evidence):
+        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+        step_items = metadata.get("step_items", []) if isinstance(metadata.get("step_items"), list) else []
+        step_titles = [
+            re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+            for item in step_items
+            if isinstance(item, dict) and str(item.get("title", "")).strip()
+        ]
+        signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
+        supported_platforms = signals.get("supported_platforms", []) if isinstance(signals.get("supported_platforms"), list) else []
+        platform_text = "、".join([str(item) for item in supported_platforms[:4] if str(item).strip()])
+        title = _refine_title(evidence.title or "", evidence)
+        if len(step_titles) >= 2:
+            return (
+                f"当前拿到的是《{title}》的概览页，不是完整安装文档；"
+                f"能确认的大致流程是先{step_titles[0]}，再{step_titles[1]}，但具体命令、验证和失败处理还没给出。"
+            )
+        if platform_text:
+            return (
+                f"当前拿到的是《{title}》的概览页，不是完整安装文档；"
+                f"目前只能确认它支持{platform_text}，以及大致安装/配对方向。"
+            )
     signals = {}
     if isinstance(evidence.metadata, dict) and isinstance(evidence.metadata.get("signals"), dict):
         signals = evidence.metadata["signals"]
     projects = signals.get("projects", []) if isinstance(signals, dict) else []
     skills = signals.get("skills", []) if isinstance(signals, dict) else []
     skill_ids = signals.get("skill_ids", []) if isinstance(signals, dict) else []
-    if _is_generic_bullet(clean) or clean in {"已提取核心事实。", "已提取核心事实"}:
-        parts: list[str] = []
+    if evidence.source_kind != "video_url" and (_is_generic_bullet(clean) or clean in {"已提取核心事实。", "已提取核心事实"} or len(clean) < 18):
+        profile_kind = _content_profile_kind(evidence)
+        if _is_docs_overview_page(evidence):
+            metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+            step_items = metadata.get("step_items", []) if isinstance(metadata.get("step_items"), list) else []
+            step_titles = [
+                re.sub(r"\s+", " ", str(item.get("title", "")).strip())
+                for item in step_items
+                if isinstance(item, dict) and str(item.get("title", "")).strip()
+            ]
+            signals = metadata.get("signals", {}) if isinstance(metadata.get("signals"), dict) else {}
+            supported_platforms = signals.get("supported_platforms", []) if isinstance(signals.get("supported_platforms"), list) else []
+            platform_text = "、".join([str(item) for item in supported_platforms[:4] if str(item).strip()])
+            if len(step_titles) >= 2:
+                return (
+                    f"当前拿到的是《{_refine_title(evidence.title or '', evidence)}》的概览页，不是完整安装文档；"
+                    f"能确认的大致流程是先{step_titles[0]}，再{step_titles[1]}，但具体命令、验证和失败处理还没给出。"
+                )
+            if platform_text:
+                return (
+                    f"当前拿到的是《{_refine_title(evidence.title or '', evidence)}》的概览页，不是完整安装文档；"
+                    f"目前只能确认它支持{platform_text}，以及大致安装/配对方向。"
+                )
+        subject = ""
         if projects:
-            parts.append(f"识别到项目 {projects[0]}")
-        if skills:
-            parts.append(f"技能为 {skills[0]}")
-        if skill_ids:
-            parts.append(f"技能ID {skill_ids[0]}")
-        if evidence.coverage == "partial":
-            parts.append("证据不完整")
-        elif not parts:
-            parts.append("已提取核心事实")
-        return "，".join(parts) + "。"
+            subject = f"项目 {projects[0]}"
+        elif skills:
+            subject = f"技能 {skills[0]}"
+        elif skill_ids:
+            subject = f"技能ID {skill_ids[0]}"
+        else:
+            title = _refine_title(evidence.title or "", evidence)
+            if title and title != "未命名内容":
+                subject = f"《{title}》"
+        fact_values: list[str] = []
+        boundary_value = ""
+        for item in bullets:
+            if _looks_like_resource_bullet(item):
+                continue
+            label, body = _labeled_bullet_parts(item)
+            if not body:
+                continue
+            if _looks_like_boundary_bullet(item):
+                if not boundary_value:
+                    boundary_value = body
+                continue
+            if body not in fact_values:
+                fact_values.append(body)
+            if len(fact_values) >= 2 and boundary_value:
+                break
+        if profile_kind == "installation_tutorial":
+            lead = fact_values[0] if fact_values else "安装顺序和验证动作"
+            tail = boundary_value or ("当前证据不完整" if evidence.coverage == "partial" else "更适合作为安装参考")
+            return f"这条内容主要在说明{subject or '安装流程'}，当前可确认的关键动作是{lead}；{tail}。"
+        if profile_kind == "skill_recommendation":
+            lead = fact_values[0] if fact_values else "安装入口和使用方式"
+            tail = boundary_value or ("当前证据不完整" if evidence.coverage == "partial" else "更适合作为技能筛选与安装参考")
+            return f"这条内容围绕{subject or '一个技能/工具'}，当前能确认的是{lead}；{tail}。"
+        lead = fact_values[0] if fact_values else "当前只抽到少量可核对信息"
+        if len(fact_values) >= 2:
+            lead = f"{fact_values[0]}，并补充了{fact_values[1]}"
+        tail = boundary_value or ("当前证据不完整" if evidence.coverage == "partial" else "更适合作为初筛参考")
+        if subject:
+            return f"这条内容主要在讲{subject}，当前能确认的是{lead}；{tail}。"
+        return f"当前能确认的是{lead}；{tail}。"
     return clean
 
 
 def _normalize_requirement_token(value: str) -> str:
     text = _sanitize_display_url(str(value).strip()).lower()
     return re.sub(r"\s+", " ", text)
+
+
+def _looks_like_fragmented_video_bullet(value: str, evidence: EvidenceBundle) -> bool:
+    text = _normalize_bullet_text(value)
+    if not text:
+        return True
+    body = re.sub(r"^\d{1,2}\.\s*", "", text).strip()
+    if not body:
+        return True
+    lowered = body.lower()
+    if any(token in lowered for token in ["spm_id_from", "search-card", "vd_source"]):
+        return True
+    if re.match(r"^[¥$€£]?\d", body):
+        return True
+    if re.fullmatch(r"[0-9a-z._?&=:/+-]{12,}", lowered):
+        return True
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", body))
+    digit_chars = len(re.findall(r"\d", body))
+    punctuation = len(re.findall(r"[，。；：,.!?！？]", body))
+    transcript_corpus = re.sub(r"\s+", "", ((evidence.transcript or "") + "\n" + (evidence.text or "")).lower())
+    compact = re.sub(r"\s+", "", lowered)
+    if compact and len(compact) >= 20 and compact in transcript_corpus and punctuation == 0:
+        return True
+    if digit_chars >= max(4, cjk_chars) and punctuation <= 1:
+        return True
+    if cjk_chars < 8:
+        return True
+    return False
+
+
+def _timeline_section_bullets(timeline_sections: list[dict[str, object]], limit: int = 6) -> list[str]:
+    bullets: list[str] = []
+    for raw in timeline_sections:
+        if not isinstance(raw, dict):
+            continue
+        heading = re.sub(r"\s+", " ", str(raw.get("heading", "")).strip())
+        section_summary = re.sub(r"\s+", " ", str(raw.get("summary", "")).strip())
+        if not section_summary:
+            continue
+        if heading and heading not in section_summary:
+            text = f"{heading}：{section_summary}"
+        else:
+            text = section_summary
+        text = _normalize_bullet_text(text)
+        if text and text not in bullets:
+            bullets.append(text)
+        if len(bullets) >= limit:
+            break
+    return bullets[:limit]
+
+
+def _should_replace_video_bullets_from_timeline(
+    bullets: list[str],
+    timeline_sections: list[dict[str, object]],
+    evidence: EvidenceBundle,
+) -> bool:
+    if evidence.source_kind != "video_url" or not timeline_sections:
+        return False
+    meaningful = [item for item in bullets if _normalize_bullet_text(item)]
+    if len(meaningful) < 3:
+        return True
+    bad_count = sum(1 for item in meaningful if _looks_like_fragmented_video_bullet(item, evidence))
+    return bad_count >= max(2, len(meaningful) // 2)
 
 
 def _missing_required_fields(
@@ -1122,9 +1523,6 @@ def _missing_required_fields(
         )
         if not has_project_link:
             missing.append("section:项目与链接")
-    outline_points = _extract_video_outline(evidence, bullets)
-    if evidence.source_kind == "video_url" and outline_points and len(bullets) < len(outline_points):
-        missing.append(f"video_outline:{len(bullets)}/{len(outline_points)}")
     return missing
 
 
@@ -1153,11 +1551,15 @@ def _validate_and_normalize_summary(summary: SummaryResult, evidence: EvidenceBu
     reader_judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
     metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
     video_gate = metadata.get("video_gate_reasons") if isinstance(metadata, dict) else None
+    quality_gate = metadata.get("quality_gate", {}) if isinstance(metadata.get("quality_gate"), dict) else {}
+    gate_mode = str(quality_gate.get("mode", "")).strip().lower()
+    gate_outcome = str(quality_gate.get("outcome", "")).strip().lower()
     if isinstance(video_gate, list) and video_gate:
         coverage = "partial"
         confidence = "medium" if confidence == "high" else confidence
     refined_conclusion = _refine_conclusion(conclusion, evidence, bullets)
-    if isinstance(video_gate, list) and video_gate and "证据不完整" not in refined_conclusion:
+    should_append_incomplete = not (gate_mode == "probe" and gate_outcome == "partial")
+    if isinstance(video_gate, list) and video_gate and should_append_incomplete and "证据不完整" not in refined_conclusion:
         refined_conclusion = refined_conclusion.rstrip("。") + "，当前证据不完整。"
     if not reader_judgment:
         profile_kind = ""
@@ -1166,16 +1568,128 @@ def _validate_and_normalize_summary(summary: SummaryResult, evidence: EvidenceBu
             if isinstance(profile, dict):
                 profile_kind = str(profile.get("kind", "")).strip()
         if evidence.source_kind == "video_url":
-            reader_judgment = "从大厂程序员视角看，这条内容更适合用来快速筛选是否值得后续回看。"
+            reader_judgment = "更适合先看提炼结果，再决定是否需要回看原视频。"
+        elif _is_docs_overview_page(evidence):
+            reader_judgment = "当前页只够判断支持范围和大致接入方向，不够直接拿来安装。"
         elif profile_kind == "installation_tutorial":
-            reader_judgment = "从大厂程序员视角看，这条内容偏实用，适合直接留作后续操作参考。"
+            reader_judgment = "适合直接当安装参考，但环境与验证步骤仍建议回原文核对。"
+        elif profile_kind == "project_overview":
+            reader_judgment = "适合作为项目初筛，真正落地前还要回仓库或文档确认细节。"
         else:
-            reader_judgment = "从大厂程序员视角看，这条内容有信息价值，但是否深入跟进取决于当前任务相关性。"
+            reader_judgment = "当前可先用于初筛，后续是否继续投入取决于证据密度和实际需求。"
     if isinstance(video_gate, list) and video_gate:
         recommendation_level = "optional" if recommendation_level == "must_read" else recommendation_level
         effectiveness = "medium" if effectiveness == "high" else effectiveness
     note_tags = _normalize_list(list(summary.note_tags), limit=8)
     follow_up_actions = _refine_follow_up_actions(list(summary.follow_up_actions), evidence, bullets)
+    outcome = (summary.outcome or "").strip().lower()
+    if outcome not in {"summarized", "partial", "refused"}:
+        outcome = "partial" if coverage == "partial" else "summarized"
+    evidence_basis = _normalize_list(list(summary.evidence_basis), limit=10)
+    uncertainties = _normalize_list(list(summary.uncertainties), limit=8)
+    if evidence.source_kind == "video_url" and outcome == "partial":
+        quality_gate = metadata.get("quality_gate", {}) if isinstance(metadata.get("quality_gate"), dict) else {}
+        expected_outline_count = int(quality_gate.get("expected_outline_count", 0) or 0)
+        if expected_outline_count > 0:
+            numbered_count = len(
+                [
+                    item
+                    for item in bullets
+                    if re.match(r"^\d{1,2}\.\s+", str(item).strip())
+                ]
+            )
+            retained_outline_count = min(
+                expected_outline_count,
+                numbered_count if numbered_count > 0 else len(bullets),
+            )
+            if re.search(r"当前已覆盖\s+\d+/\d+\s*项", refined_conclusion):
+                refined_conclusion = re.sub(
+                    r"当前已覆盖\s+\d+/\d+\s*项",
+                    f"当前已覆盖 {retained_outline_count}/{expected_outline_count} 项",
+                    refined_conclusion,
+                )
+            updated_uncertainties: list[str] = []
+            for item in uncertainties:
+                text = str(item)
+                if re.search(r"^仅覆盖\s+\d+/\d+\s*项", text):
+                    text = re.sub(
+                        r"^仅覆盖\s+\d+/\d+\s*项",
+                        f"仅覆盖 {retained_outline_count}/{expected_outline_count} 项",
+                        text,
+                    )
+                updated_uncertainties.append(text)
+            uncertainties = _normalize_list(updated_uncertainties, limit=8)
+    timeline_sections: list[dict[str, object]] = []
+    for raw in list(summary.timeline_sections or [])[:12]:
+        if not isinstance(raw, dict):
+            continue
+        heading = re.sub(r"\s+", " ", str(raw.get("heading", "")).strip())
+        section_summary = re.sub(r"\s+", " ", str(raw.get("summary", "")).strip())
+        section_bullets = raw.get("bullets", [])
+        if not isinstance(section_bullets, list):
+            section_bullets = raw.get("key_points", [])
+        if not isinstance(section_bullets, list):
+            section_bullets = []
+        evidence_lines = raw.get("evidence", [])
+        if not isinstance(evidence_lines, list):
+            evidence_lines = []
+        timeline_sections.append(
+            {
+                "start": raw.get("start"),
+                "end": raw.get("end"),
+                "heading": heading,
+                "summary": section_summary,
+                "bullets": _normalize_list([_normalize_bullet_text(str(item)) for item in section_bullets], limit=4),
+                "evidence": _normalize_list([str(item) for item in evidence_lines], limit=3),
+            }
+        )
+    if _should_replace_video_bullets_from_timeline(bullets, timeline_sections, evidence):
+        rebuilt_bullets = _timeline_section_bullets(timeline_sections, limit=6)
+        if rebuilt_bullets:
+            bullets = rebuilt_bullets
+            if not evidence_quotes:
+                evidence_quotes = bullets[:2]
+    refusal_reason = re.sub(r"\s+", " ", str(summary.refusal_reason or "").strip())
+    finance_matrix: list[dict[str, str]] = []
+    if isinstance(summary.finance_matrix, list):
+        seen_finance_rows: set[str] = set()
+        for raw in summary.finance_matrix[:12]:
+            if not isinstance(raw, dict):
+                continue
+            name = re.sub(r"\s+", " ", str(raw.get("name", "")).strip())
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen_finance_rows:
+                continue
+            seen_finance_rows.add(key)
+            row = {
+                "name": name,
+                "sector": _normalize_finance_cell_text(str(raw.get("sector", ""))),
+                "thesis": _normalize_finance_cell_text(str(raw.get("thesis", ""))),
+                "position_change": _normalize_finance_cell_text(str(raw.get("position_change", ""))),
+                "risk": _normalize_finance_cell_text(str(raw.get("risk", ""))),
+            }
+            if any(row[field] for field in ["thesis", "position_change", "risk"]):
+                finance_matrix.append(row)
+    finance_snapshot: dict[str, list[str]] = {}
+    if isinstance(summary.finance_snapshot, dict):
+        for key in ["market_view", "performance_review", "action_plan"]:
+            value = summary.finance_snapshot.get(key, [])
+            if isinstance(value, str):
+                values = re.split(r"[。\n；;]+", value)
+            elif isinstance(value, list):
+                values = [str(item) for item in value]
+            else:
+                values = []
+            lines = _normalize_list([re.sub(r"\s+", " ", str(item).strip()).strip("。；;") for item in values], limit=4)
+            if lines:
+                finance_snapshot[key] = lines
+    uncertainties = [
+        item
+        for item in uncertainties
+        if str(item).strip().lower() not in {"无", "none", "n/a", "na"}
+    ]
     missing_required = _missing_required_fields(
         title=title,
         conclusion=refined_conclusion,
@@ -1203,4 +1717,11 @@ def _validate_and_normalize_summary(summary: SummaryResult, evidence: EvidenceBu
         effectiveness=effectiveness,
         recommendation_level=recommendation_level,
         reader_judgment=reader_judgment,
+        outcome=outcome,
+        evidence_basis=evidence_basis,
+        timeline_sections=timeline_sections,
+        uncertainties=uncertainties,
+        refusal_reason=refusal_reason,
+        finance_matrix=finance_matrix,
+        finance_snapshot=finance_snapshot,
     )

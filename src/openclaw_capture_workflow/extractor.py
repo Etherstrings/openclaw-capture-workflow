@@ -9,7 +9,9 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import tempfile
 import time
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 from urllib import request as urlrequest
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -17,13 +19,23 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from .config import AppConfig
 from .analyzer import analyze_url
 from .content_profile import build_signal_requirements, infer_content_profile
+from .evidence_utils import add_evidence_item, build_capture_manifest, mark_capture, merged_text_from_items
 from .models import EvidenceBundle, IngestRequest
-from .video_story_blocks import build_video_story_blocks, story_blocks_are_qualified
+from .video_provider_router import VideoProviderBundle, VideoProviderRouter
+from .web_capture import WebCaptureEngine
 
 
 def _run_template(command: str, **kwargs: str) -> str:
-    rendered = command.format(**kwargs)
+    # Only substitute known placeholders so JSON braces in inline commands
+    # do not need to be escaped with ``{{ ... }}``.
+    rendered = command.replace("{{", "{").replace("}}", "}")
+    for key, value in kwargs.items():
+        rendered = rendered.replace("{" + key + "}", value)
     args = shlex.split(rendered)
+    if len(args) >= 3 and args[1] == "-c":
+        script = args[2]
+        if "json.dumps({\\\"" in script or "json.dumps({\\'" in script:
+            args[2] = script.replace('\\"', '"').replace("\\'", "'")
     try:
         result = subprocess.run(
             args,
@@ -72,6 +84,181 @@ def _normalize_text(value: str) -> str:
     return value.strip()
 
 
+def _normalize_command_text_block(value: object) -> str:
+    text = str(value or "")
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return _normalize_text(text)
+
+
+_VIDEO_DIRECTION_KEYWORDS: dict[str, list[str]] = {
+    "finance_market": [
+        "股票",
+        "港股",
+        "a股",
+        "h股",
+        "指数",
+        "恒生",
+        "科技指数",
+        "赚钱效应",
+        "估值",
+        "持仓",
+        "买点",
+        "卖掉",
+        "外资",
+        "地产",
+        "业绩",
+        "风险",
+        "波动",
+    ],
+    "career_interview": [
+        "面试",
+        "offer",
+        "hr",
+        "录取",
+        "求职",
+        "职业规划",
+        "薪资",
+        "背调",
+        "岗位",
+        "加班",
+    ],
+    "tutorial_project": [
+        "安装",
+        "部署",
+        "配置",
+        "命令",
+        "项目",
+        "github",
+        "教程",
+        "工作流",
+        "运行",
+        "步骤",
+    ],
+    "product_review": [
+        "横评",
+        "测评",
+        "评测",
+        "跑分",
+        "续航",
+        "参数",
+        "配置",
+        "体验",
+        "性能",
+        "对比",
+    ],
+    "narrative_story": [
+        "故事",
+        "经历",
+        "移民",
+        "人生",
+        "回忆",
+        "小时候",
+        "后来",
+        "当时",
+        "家庭",
+        "朋友",
+    ],
+}
+
+
+_VIDEO_DIRECTION_REPAIR_RULES: dict[str, list[tuple[re.Pattern[str], str, str]]] = {
+    "finance_market": [
+        (re.compile(r"中东的磁尖"), "中东的资金", "finance_token"),
+        (re.compile(r"(?:内德时代|应得时[带代]|宁的时代)"), "宁德时代", "entity_fix"),
+        (re.compile(r"华人医药"), "华润医药", "entity_fix"),
+        (re.compile(r"服生员"), "福寿园", "entity_fix"),
+        (re.compile(r"(?:港五通|性感悟通|健康活通)"), "港股通", "term_fix"),
+        (re.compile(r"(?:特股份公司|泰股份公司)"), "太古股份公司", "entity_fix"),
+        (re.compile(r"(?:太股份|泰股份)(?!公司)"), "太古股份", "entity_fix"),
+        (re.compile(r"太古地坛"), "太古地产", "entity_fix"),
+        (re.compile(r"价格一价\s*44个点"), "价格溢价44个点", "finance_term"),
+        (re.compile(r"一价\s*44个点"), "溢价44个点", "finance_term"),
+    ],
+    "career_interview": [
+        (re.compile(r"(?<![A-Za-z])HI(?=在犹豫|可能|想给你发)"), "HR", "entity_fix"),
+        (re.compile(r"建议建议录取"), "建议录取", "phrase_fix"),
+        (re.compile(r"建议淘汰或待定"), "建议淘汰或待定", "phrase_fix"),
+    ],
+}
+
+
+def _estimate_video_direction(
+    *,
+    title: str,
+    transcript_text: str,
+    subtitle_text: str,
+    metadata: dict[str, object],
+    keyframe_ocr_lines: list[str],
+) -> dict[str, object]:
+    corpus_parts = [
+        title,
+        str(metadata.get("bilibili_description") or ""),
+        " ".join(str(item) for item in metadata.get("bilibili_tags", [])[:12]) if isinstance(metadata.get("bilibili_tags"), list) else "",
+        transcript_text[:2500],
+        subtitle_text[:1500],
+        "\n".join(keyframe_ocr_lines[:20]),
+    ]
+    corpus = "\n".join(part for part in corpus_parts if part).lower()
+    score_map: dict[str, int] = {}
+    reasons_map: dict[str, list[str]] = {}
+    for kind, keywords in _VIDEO_DIRECTION_KEYWORDS.items():
+        hits = []
+        for token in keywords:
+            if token.lower() in corpus:
+                hits.append(token)
+        score_map[kind] = len(hits)
+        reasons_map[kind] = hits[:6]
+    kind = max(score_map, key=score_map.get) if score_map else "general"
+    score = score_map.get(kind, 0)
+    if score < 2:
+        return {"kind": "general", "confidence": "low", "reasons": []}
+    confidence = "high" if score >= 5 else "medium"
+    return {"kind": kind, "confidence": confidence, "reasons": reasons_map.get(kind, [])}
+
+
+def _apply_directional_repairs(text: str, *, direction_kind: str) -> tuple[str, list[str]]:
+    repaired = str(text or "")
+    applied: list[str] = []
+    for pattern, replacement, label in _VIDEO_DIRECTION_REPAIR_RULES.get(direction_kind, []):
+        updated, count = pattern.subn(replacement, repaired)
+        if count > 0:
+            repaired = updated
+            applied.append(f"{label}:{replacement}x{count}")
+    return repaired, applied
+
+
+def _repair_video_speech_track(
+    text: str,
+    track_meta: dict[str, object],
+    *,
+    direction_kind: str,
+) -> tuple[str, dict[str, object], list[str]]:
+    if not text.strip():
+        return text, track_meta, []
+    repaired_text, applied = _apply_directional_repairs(text, direction_kind=direction_kind)
+    if not applied:
+        return text, track_meta, []
+    updated_meta = dict(track_meta)
+    timeline_lines = updated_meta.get("timeline_lines")
+    if isinstance(timeline_lines, list):
+        new_lines: list[str] = []
+        for raw in timeline_lines:
+            line, _ = _apply_directional_repairs(str(raw), direction_kind=direction_kind)
+            new_lines.append(line)
+        updated_meta["timeline_lines"] = new_lines
+    segments = updated_meta.get("segments")
+    if isinstance(segments, list):
+        new_segments: list[dict[str, object]] = []
+        for raw in segments:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            item["text"], _ = _apply_directional_repairs(str(item.get("text", "")), direction_kind=direction_kind)
+            new_segments.append(item)
+        updated_meta["segments"] = new_segments
+    return repaired_text, updated_meta, applied
+
+
 def _looks_like_url_only(text: str, source_url: str | None = None) -> bool:
     value = text.strip()
     if not value:
@@ -79,6 +266,27 @@ def _looks_like_url_only(text: str, source_url: str | None = None) -> bool:
     if source_url and value == source_url.strip():
         return True
     return bool(re.fullmatch(r"https?://\S+", value))
+
+
+def _host_from_url(url: str | None) -> str:
+    value = (url or "").strip()
+    if not value:
+        return ""
+    try:
+        return urlparse(value).netloc.lower()
+    except ValueError:
+        return ""
+
+
+def _looks_like_direct_video_source(url: str | None) -> bool:
+    value = (url or "").strip()
+    if not value:
+        return False
+    try:
+        suffix = Path(urlparse(value).path).suffix.lower()
+    except ValueError:
+        return False
+    return suffix in {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 
 
 def _normalize_signal_url(url: str) -> str:
@@ -637,77 +845,52 @@ def _tighten_github_signals(signals: Dict[str, list[str]], source_url: str | Non
     return {key: values for key, values in filtered.items() if values}
 
 
-def _run_openclaw_browser_json(*args: str) -> dict:
-    result = subprocess.run(
-        ["openclaw", "browser", *args, "--json"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(result.stdout)
-
-
-def _find_browser_tab_for_url(url: str, tabs: list[dict]) -> dict | None:
-    normalized = _normalize_url_for_match(url)
-    for tab in tabs:
-        tab_url = tab.get("url", "")
-        if tab_url == url or _normalize_url_for_match(tab_url) == normalized:
-            return tab
-    for tab in tabs:
-        tab_url = tab.get("url", "")
-        if parsed_url_path_key(tab_url) == parsed_url_path_key(url):
-            return tab
-    return None
-
-
-def parsed_url_path_key(url: str) -> tuple[str, str]:
-    parsed = urlparse(url)
-    path = parsed.path.rstrip("/") or "/"
-    return parsed.netloc, path
-
-
-def _find_or_open_browser_tab_with_state(url: str, retries: int = 8, delay_seconds: float = 0.6) -> tuple[dict | None, bool]:
-    tabs_payload = _run_openclaw_browser_json("tabs")
-    tabs = tabs_payload.get("tabs", [])
-    tab = _find_browser_tab_for_url(url, tabs)
-    if tab:
-        return tab, False
-    _run_openclaw_browser_json("open", url)
-    for _ in range(retries):
-        time.sleep(delay_seconds)
-        tabs_payload = _run_openclaw_browser_json("tabs")
-        tabs = tabs_payload.get("tabs", [])
-        tab = _find_browser_tab_for_url(url, tabs)
-        if tab:
-            return tab, True
-    return None, False
-
-
-def _find_or_open_browser_tab(url: str, retries: int = 8, delay_seconds: float = 0.6) -> dict | None:
-    tab, _ = _find_or_open_browser_tab_with_state(url, retries=retries, delay_seconds=delay_seconds)
-    return tab
-
-
-def _cleanup_browser_tab(tab: dict | None, *, opened_for_capture: bool) -> None:
-    if not opened_for_capture or not isinstance(tab, dict):
-        return
-    target_id = str(tab.get("targetId", "")).strip()
-    if not target_id:
-        return
+@contextmanager
+def _browser_capture_page(url: str, *, timeout_seconds: int = 30):
     try:
-        _run_openclaw_browser_json(
-            "evaluate",
-            "--target-id",
-            target_id,
-            "--fn",
-            '() => { const videos = Array.from(document.querySelectorAll("video")); for (const video of videos) { try { video.pause(); } catch (e) {} } return { videoCount: videos.length, pausedCount: videos.filter((video) => video.paused).length }; }',
-        )
-    except Exception:
-        pass
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("playwright is not installed") from exc
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=max(5, int(timeout_seconds)) * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(max(5, int(timeout_seconds)), 10) * 1000)
+            except PlaywrightTimeoutError:
+                pass
+            yield page
+        finally:
+            try:
+                page.evaluate(
+                    '() => { const videos = Array.from(document.querySelectorAll("video")); for (const video of videos) { try { video.pause(); } catch (e) {} } return videos.length; }'
+                )
+            except Exception:
+                pass
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            browser.close()
+
+
+def _page_body_inner_text(page) -> str:
     try:
-        _run_openclaw_browser_json("close", target_id)
+        return (page.locator("body").inner_text(timeout=3000) or "").strip()
     except Exception:
-        pass
+        try:
+            content = page.content()
+        except Exception:
+            return ""
+        return _extract_paragraph_fallback(content)
 
 
 def _looks_like_ui_noise(text: str) -> bool:
@@ -1036,8 +1219,20 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
         "purposes": [],
         "boundaries": [],
         "common_errors": [],
+        "supported_platforms": [],
     }
     normalized = text or ""
+    platform_aliases = [
+        ("WhatsApp", [r"\bwhatsapp\b"]),
+        ("Telegram", [r"\btelegram\b"]),
+        ("Discord", [r"\bdiscord\b"]),
+        ("iMessage", [r"\bimessage\b"]),
+        ("Slack", [r"\bslack\b"]),
+        ("WeChat", [r"\bwechat\b", "微信"]),
+        ("WeCom", [r"\bwecom\b", "企业微信", "wechat work"]),
+        ("Email", [r"\bemail\b", "邮件"]),
+        ("SMS", [r"\bsms\b", "短信"]),
+    ]
     url_pattern = r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
     for match in re.findall(url_pattern, normalized):
         url = _normalize_signal_url(match.rstrip(")]}>,.;，。；："))
@@ -1193,6 +1388,14 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
             continue
         lowered = line.lower()
         compact = lowered.replace(" ", "")
+        for platform_name, patterns in platform_aliases:
+            if platform_name in signals["supported_platforms"]:
+                continue
+            if any(
+                (pattern in line if re.search(r"[\u4e00-\u9fff]", pattern) else re.search(pattern, lowered))
+                for pattern in patterns
+            ):
+                signals["supported_platforms"].append(platform_name)
         if any(token in lowered for token in ["前置", "依赖", "需要安装", "requirement", "prerequisite"]) or line.startswith(
             ("前置条件", "环境要求", "准备工作")
         ):
@@ -1212,7 +1415,7 @@ def _extract_skill_signals(text: str, source_url: str | None = None) -> Dict[str
         if any(token in compact for token in ["报错", "错误", "失败", "403", "quota", "insufficient", "forbidden"]) and line not in signals["common_errors"]:
             signals["common_errors"].append(line)
 
-    for key in ["prerequisites", "validation_actions", "use_cases", "purposes", "boundaries", "common_errors"]:
+    for key in ["prerequisites", "validation_actions", "use_cases", "purposes", "boundaries", "common_errors", "supported_platforms"]:
         signals[key] = _dedupe_strings(signals[key], limit=6)
 
     return {key: values for key, values in signals.items() if values}
@@ -1257,6 +1460,16 @@ def _append_signal_hint(text: str, signals: Dict[str, list[str]]) -> str:
         lines.append("链接: " + " | ".join(signals["links"][:4]))
     if signals.get("projects"):
         lines.append("项目: " + " | ".join(signals["projects"][:4]))
+    if signals.get("supported_platforms"):
+        lines.append("平台支持: " + " | ".join(signals["supported_platforms"][:6]))
+    if signals.get("prerequisites"):
+        lines.append("前置条件: " + " | ".join(signals["prerequisites"][:3]))
+    if signals.get("validation_actions"):
+        lines.append("验证动作: " + " | ".join(signals["validation_actions"][:3]))
+    if signals.get("boundaries"):
+        lines.append("适用边界: " + " | ".join(signals["boundaries"][:2]))
+    if signals.get("common_errors"):
+        lines.append("常见错误: " + " | ".join(signals["common_errors"][:2]))
     if signals.get("hashtags"):
         lines.append("标签: " + " ".join(signals["hashtags"][:6]))
     if not lines:
@@ -1265,6 +1478,46 @@ def _append_signal_hint(text: str, signals: Dict[str, list[str]]) -> str:
     if not text.strip():
         return hint_block
     return text.rstrip() + "\n\n" + hint_block
+
+
+def _build_structured_evidence_bundle(
+    *,
+    source_kind: str,
+    source_url: str | None,
+    platform_hint: str | None,
+    title: str | None,
+    evidence_type: str,
+    coverage: str,
+    metadata: Dict[str, object],
+    evidence_items,
+    capture_manifest,
+    transcript: str | None = None,
+    keyframes: List[str] | None = None,
+    fallback_blocks: List[str] | None = None,
+) -> EvidenceBundle:
+    merged_text = merged_text_from_items(list(evidence_items), fallback_blocks=fallback_blocks or [])
+    finalized_metadata = _finalize_evidence_metadata(
+        metadata,
+        source_kind=source_kind,
+        source_url=source_url,
+        text=merged_text,
+    )
+    finalized_metadata["capture_manifest"] = capture_manifest.to_dict()
+    return EvidenceBundle(
+        source_kind=source_kind,
+        source_url=source_url,
+        platform_hint=platform_hint,
+        title=title,
+        text=merged_text,
+        evidence_type=evidence_type,
+        coverage=coverage,
+        transcript=transcript,
+        keyframes=list(keyframes or []),
+        metadata=finalized_metadata,
+        merged_text=merged_text,
+        evidence_items=list(evidence_items),
+        capture_manifest=capture_manifest,
+    )
 
 
 def _structured_document_to_text(document: dict) -> str:
@@ -1449,7 +1702,38 @@ def _extract_step_items_from_text(text: str) -> list[dict]:
         commands = []
 
     def is_heading(value: str) -> bool:
-        return bool(re.match(r"^[一二三四五六七八九十]+、", value) or re.match(r"^[一二三四五六七八九十]+）", value))
+        candidate = _normalize_text(value)
+        lowered = candidate.lower()
+        if re.match(r"^[一二三四五六七八九十]+、", candidate) or re.match(r"^[一二三四五六七八九十]+）", candidate):
+            return True
+        if re.match(r"^(step\s*\d+[:.)-]?\s+.+)$", lowered):
+            return True
+        if re.match(r"^\d+\.\s+.+$", candidate):
+            return True
+        if len(candidate) > 88 or candidate.endswith(("。", ".", "！", "!", "？", "?", "：", ":")):
+            return False
+        action_tokens = [
+            "install",
+            "setup",
+            "configure",
+            "pair",
+            "start",
+            "verify",
+            "deploy",
+            "run",
+            "connect",
+            "enable",
+            "create",
+            "onboard",
+            "安装",
+            "配置",
+            "配对",
+            "启动",
+            "验证",
+            "部署",
+            "运行",
+        ]
+        return len(candidate) >= 8 and any(token in lowered or token in candidate for token in action_tokens)
 
     def is_command(value: str) -> bool:
         candidate = value.strip()
@@ -1576,75 +1860,41 @@ def _extract_steps_from_tencent_snapshot(snapshot: str) -> list[dict]:
 
 
 def _fetch_openclaw_browser_snapshot(url: str, limit: int = 500) -> tuple[str | None, str]:
-    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
-    if not tab:
-        raise RuntimeError("browser tab not found for url")
-    try:
-        snapshot_payload = _run_openclaw_browser_json(
-            "snapshot",
-            "--target-id",
-            tab["targetId"],
-            "--limit",
-            str(limit),
-        )
-        title = tab.get("title")
-        raw_snapshot = snapshot_payload.get("snapshot", "")
-        if "cloud.tencent.com" in url:
-            text = _extract_text_from_tencent_snapshot(raw_snapshot)
-        else:
-            text = _extract_text_from_browser_snapshot(raw_snapshot)
-        return title, text
-    finally:
-        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
+    with _browser_capture_page(url) as page:
+        title = page.title()
+        text = _page_body_inner_text(page)
+        limit_chars = max(500, int(limit) * 6)
+        return title, text[:limit_chars].strip()
 
 
 def _fetch_openclaw_browser_snapshot_with_steps(url: str, limit: int = 500) -> tuple[str | None, str, list[dict]]:
-    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
-    if not tab:
-        raise RuntimeError("browser tab not found for url")
-    try:
-        snapshot_payload = _run_openclaw_browser_json(
-            "snapshot",
-            "--target-id",
-            tab["targetId"],
-            "--limit",
-            str(limit),
-        )
-        raw_snapshot = snapshot_payload.get("snapshot", "")
-        title = tab.get("title")
-        text = _extract_text_from_tencent_snapshot(raw_snapshot)
-        steps = _extract_steps_from_tencent_snapshot(raw_snapshot)
+    with _browser_capture_page(url) as page:
+        title = page.title()
+        text = _page_body_inner_text(page)[: max(500, int(limit) * 6)].strip()
+        steps = _extract_step_items_from_text(text)
         return title, text, steps
-    finally:
-        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
 
-def _scroll_bilibili_page_for_comments(target_id: str) -> None:
-    scroll_fn = (
-        "() => {"
-        " const nodes = Array.from(document.querySelectorAll('h2,div,span'));"
-        " let target = null;"
-        " for (const node of nodes) {"
-        "   const text = (node.textContent || '').trim();"
-        "   if (text === '评论' || /^评论\\s*\\d+/.test(text)) {"
-        "     const rect = node.getBoundingClientRect();"
-        "     target = rect.top + window.scrollY;"
-        "     break;"
-        "   }"
-        " }"
-        " const fallback = Math.max((document.body && document.body.scrollHeight ? document.body.scrollHeight * 0.45 : 0), 1400);"
-        " const finalTarget = Math.max(0, (target === null ? fallback : target - 220));"
-        " window.scrollTo(0, finalTarget);"
-        " return { targetY: finalTarget, currentY: window.scrollY, bodyHeight: document.body ? document.body.scrollHeight : 0 };"
-        " }"
-    )
-    _run_openclaw_browser_json(
-        "evaluate",
-        "--target-id",
-        target_id,
-        "--fn",
-        scroll_fn,
-    )
+def _scroll_bilibili_page_for_comments(page) -> None:
+    scroll_fn = """
+() => {
+  const nodes = Array.from(document.querySelectorAll('h2,div,span'));
+  let target = null;
+  for (const node of nodes) {
+    const text = (node.textContent || '').trim();
+    if (text === '评论' || /^评论\\s*\\d+/.test(text)) {
+      const rect = node.getBoundingClientRect();
+      target = rect.top + window.scrollY;
+      break;
+    }
+  }
+  const fallback = Math.max((document.body && document.body.scrollHeight ? document.body.scrollHeight * 0.45 : 0), 1400);
+  const finalTarget = Math.max(0, (target === null ? fallback : target - 220));
+  window.scrollTo(0, finalTarget);
+  return { targetY: finalTarget, currentY: window.scrollY, bodyHeight: document.body ? document.body.scrollHeight : 0 };
+}
+"""
+    page.evaluate(scroll_fn)
     time.sleep(1.0)
 
 
@@ -1752,39 +2002,24 @@ def _fetch_bilibili_viewer_feedback(
 ) -> tuple[list[str], dict[str, object]]:
     capture = {"attempted": True, "count": 0, "warning": None}
     try:
-        tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
+        with _browser_capture_page(url) as page:
+            _scroll_bilibili_page_for_comments(page)
+            body_text = _page_body_inner_text(page)
+            feedback: list[str] = []
+            for raw_line in body_text.splitlines():
+                line = _normalize_text(raw_line)
+                if not line:
+                    continue
+                if _looks_like_bilibili_viewer_feedback(line, author_name=None, owner_name=owner_name):
+                    if line not in feedback:
+                        feedback.append(line)
+                if len(feedback) >= limit:
+                    break
+            capture["count"] = len(feedback)
+            return feedback[:limit], capture
     except Exception as exc:
         capture["warning"] = str(exc)
         return [], capture
-    if not tab:
-        capture["warning"] = "browser tab not found for bilibili viewer feedback"
-        return [], capture
-    try:
-        target_id = str(tab.get("targetId", "")).strip()
-        if not target_id:
-            capture["warning"] = "bilibili viewer feedback target id missing"
-            return [], capture
-        _scroll_bilibili_page_for_comments(target_id)
-        snapshot_payload = _run_openclaw_browser_json(
-            "snapshot",
-            "--target-id",
-            target_id,
-            "--limit",
-            str(snapshot_limit),
-        )
-        raw_snapshot = snapshot_payload.get("snapshot", "")
-        feedback = _extract_bilibili_viewer_feedback_from_snapshot(
-            raw_snapshot,
-            owner_name=owner_name,
-            limit=limit,
-        )
-        capture["count"] = len(feedback)
-        return feedback, capture
-    except Exception as exc:
-        capture["warning"] = str(exc)
-        return [], capture
-    finally:
-        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
 
 
 def _resolve_default_ocr_command() -> str:
@@ -2183,6 +2418,96 @@ def _format_duration_cn(value: float) -> str:
     return "".join(parts)
 
 
+def _counted_video_outline_target(*texts: str) -> int:
+    corpus = "\n".join([str(item or "") for item in texts if str(item or "").strip()])
+    patterns = [
+        re.compile(r"\btop\s*(\d{1,2})\b", re.IGNORECASE),
+        re.compile(r"(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:个|种|类|条|问|点|步|章|招|名|大)"),
+        re.compile(r"(十大|十个|十二个|十条|十二条|十问|十二问)"),
+    ]
+    mapping = {
+        "一": 1,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+        "十一": 11,
+        "十二": 12,
+        "两": 2,
+    }
+    counts: list[int] = []
+    for pattern in patterns:
+        for match in pattern.findall(corpus):
+            token = match if isinstance(match, str) else match[0]
+            token = str(token).strip()
+            if token == "十大":
+                counts.append(10)
+                continue
+            if token in {"十个", "十条", "十问"}:
+                counts.append(10)
+                continue
+            if token in {"十二个", "十二条", "十二问"}:
+                counts.append(12)
+                continue
+            if token.isdigit():
+                counts.append(int(token))
+                continue
+            if token in mapping:
+                counts.append(mapping[token])
+    return max([value for value in counts if 2 <= value <= 30], default=0)
+
+
+def _adaptive_video_probe_seconds(
+    *,
+    request: IngestRequest,
+    video_url: str | None,
+    metadata: dict[str, object],
+    default_probe_seconds: int,
+    title_context: str,
+    description_context: str,
+) -> int:
+    if request.video_probe_seconds and request.video_probe_seconds > 0:
+        return int(request.video_probe_seconds)
+    if not request.dry_run or request.force_full_video:
+        return 0
+
+    baseline = max(0, int(default_probe_seconds))
+    lowered = (video_url or "").lower()
+    if not any(host in lowered for host in ["bilibili.com", "xiaohongshu.com"]):
+        return baseline
+
+    probe = max(baseline, 180)
+    duration_seconds = _parse_duration_seconds(metadata.get("bilibili_duration_seconds")) or _parse_duration_seconds(metadata.get("video_duration_seconds"))
+    expected_count = _counted_video_outline_target(title_context, description_context, request.raw_text or "")
+    if (duration_seconds and duration_seconds >= 600) or expected_count >= 6:
+        return 0
+    if duration_seconds:
+        if duration_seconds <= 180:
+            probe = max(probe, int(duration_seconds))
+        elif duration_seconds <= 600:
+            probe = max(probe, 180)
+        elif duration_seconds <= 1500:
+            probe = max(probe, 240)
+        else:
+            probe = max(probe, 360)
+    elif "xiaohongshu.com" in lowered:
+        probe = max(probe, 180)
+
+    if expected_count >= 10:
+        probe = max(probe, 360 if duration_seconds and duration_seconds > 900 else 240)
+    elif expected_count >= 5:
+        probe = max(probe, 240)
+
+    if duration_seconds:
+        probe = int(min(duration_seconds, float(probe)))
+    return probe
+
+
 def _parse_duration_seconds(value) -> float | None:
     if isinstance(value, (int, float)):
         duration = float(value)
@@ -2488,6 +2813,7 @@ def _parse_video_text_output(raw: str) -> tuple[str, dict[str, object]]:
             break
 
     segment_lines: list[str] = []
+    normalized_segments: list[dict[str, object]] = []
     segments = payload.get("segments")
     if isinstance(segments, list):
         for item in segments[:1200]:
@@ -2505,6 +2831,15 @@ def _parse_video_text_output(raw: str) -> tuple[str, dict[str, object]]:
                 segment_lines.append(segment_text)
             else:
                 segment_lines.append(f"[{_format_seconds_label(start)}] {segment_text}")
+            normalized_segments.append(
+                {
+                    "start": start,
+                    "end": _parse_duration_seconds(item.get("end"))
+                    if _parse_duration_seconds(item.get("end")) is not None
+                    else _parse_duration_seconds(item.get("end_seconds")),
+                    "text": segment_text,
+                }
+            )
         if not output_text and segment_lines:
             output_text = "\n".join(segment_lines)
 
@@ -2525,6 +2860,8 @@ def _parse_video_text_output(raw: str) -> tuple[str, dict[str, object]]:
 
     if segment_lines:
         metadata["timeline_lines"] = segment_lines[:300]
+    if normalized_segments:
+        metadata["segments"] = normalized_segments[:800]
     if isinstance(payload.get("language"), str):
         metadata["language"] = payload["language"]
     if output_text:
@@ -2615,30 +2952,32 @@ def _select_salient_lines(lines: list[str], limit: int = 18) -> list[str]:
 def _fetch_openclaw_browser_screenshot_ocr(url: str, command_template: str) -> tuple[str, str | None]:
     if not command_template:
         return "", None
-    tab, opened_for_capture = _find_or_open_browser_tab_with_state(url)
-    if not tab:
-        raise RuntimeError("browser tab not found for screenshot OCR")
+    temp_dir = Path(tempfile.mkdtemp(prefix="oc-browser-shot-"))
+    image_path = temp_dir / "page.png"
     try:
-        screenshot_payload = _run_openclaw_browser_json(
-            "screenshot",
-            tab["targetId"],
-            "--full-page",
-        )
-        image_path = screenshot_payload.get("path")
-        if not image_path:
-            raise RuntimeError("screenshot path missing from browser response")
-        ocr_text = _run_template(command_template, input_path=image_path)
+        with _browser_capture_page(url) as page:
+            page.screenshot(path=str(image_path), full_page=True)
+        if not image_path.exists():
+            raise RuntimeError("screenshot path missing from browser capture")
+        ocr_text = _run_template(command_template, input_path=str(image_path))
         lines = _extract_high_value_ocr_lines(ocr_text)
         lines = _select_salient_lines(lines, limit=16)
-        return "\n".join(lines).strip(), image_path
-    finally:
-        _cleanup_browser_tab(tab, opened_for_capture=opened_for_capture)
+        return "\n".join(lines).strip(), str(image_path)
+    except Exception:
+        try:
+            if image_path.exists():
+                image_path.unlink()
+            temp_dir.rmdir()
+        except OSError:
+            pass
+        raise
 
 
 class EvidenceExtractor:
     def __init__(self, config: AppConfig, artifacts_dir: Path) -> None:
         self.config = config
         self.artifacts_dir = artifacts_dir
+        self.video_provider_router = VideoProviderRouter(config)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     def _enrich_video_story_context(self, evidence: EvidenceBundle) -> EvidenceBundle:
@@ -2666,13 +3005,45 @@ class EvidenceExtractor:
         capture["count"] = len(viewer_feedback)
         metadata["viewer_feedback"] = viewer_feedback
         metadata["viewer_feedback_capture"] = capture
-        story_blocks = build_video_story_blocks(evidence)
-        metadata["video_story_blocks"] = story_blocks if story_blocks_are_qualified(story_blocks) else []
+        metadata["video_story_blocks"] = []
         evidence.metadata = metadata
         return evidence
 
-    def _analyzer_to_evidence(self, request: IngestRequest) -> EvidenceBundle | None:
+    def _should_use_analyzer_path(self, request: IngestRequest) -> bool:
         if not request.source_url or request.dry_run:
+            return False
+        source_kind = str(request.source_kind or "").strip().lower()
+        lowered_url = (request.source_url or "").strip().lower()
+        host = _host_from_url(request.source_url)
+
+        if source_kind == "mixed":
+            return False
+
+        if source_kind == "video_url":
+            if any(domain in lowered_url for domain in ("bilibili.com", "youtube.com", "youtu.be", "xiaohongshu.com")):
+                return False
+            if any(
+                command.strip()
+                for command in [
+                    self.config.extractors.video_subtitle_command,
+                    self.config.extractors.video_audio_command,
+                    self.config.extractors.video_keyframes_command,
+                ]
+            ):
+                return False
+            return _looks_like_direct_video_source(request.source_url)
+
+        if source_kind == "url":
+            if "xiaohongshu.com" in host:
+                return False
+            if self.config.extractors.webpage_text_command.strip():
+                return False
+            return True
+
+        return False
+
+    def _analyzer_to_evidence(self, request: IngestRequest) -> EvidenceBundle | None:
+        if not self._should_use_analyzer_path(request):
             return None
         try:
             outcome = analyze_url(
@@ -2693,33 +3064,55 @@ class EvidenceExtractor:
         if not analyzer_text:
             return None
 
+        capture_manifest = build_capture_manifest()
         metadata: Dict[str, object] = {
             "structured_document": document,
             "analyzer_warnings": list(outcome.warnings),
         }
+        evidence_items = []
         _add_evidence_source(metadata, "url_understanding_analyzer")
+        mark_capture(
+            capture_manifest,
+            "browser_render",
+            status="ok",
+            provider="url_understanding_analyzer",
+            details={"warning_count": len(outcome.warnings)},
+        )
+        add_evidence_item(
+            evidence_items,
+            modality="document",
+            source="browser_render",
+            provider="url_understanding_analyzer",
+            text=analyzer_text,
+            confidence=0.85,
+            is_primary=True,
+        )
         if request.raw_text and not _looks_like_url_only((request.raw_text or "").strip(), request.source_url):
             _add_evidence_source(metadata, "user_raw_text")
-            analyzer_text = _merge_text_blocks((request.raw_text or "").strip(), analyzer_text)
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_guidance",
+                provider="user_input",
+                text=(request.raw_text or "").strip(),
+                confidence=1.0,
+                is_primary=False,
+            )
         signals = _extract_skill_signals(analyzer_text, request.source_url)
         if signals:
             metadata["signals"] = signals
-        metadata = _finalize_evidence_metadata(
-            metadata,
-            source_kind=request.source_kind,
-            source_url=request.source_url,
-            text=analyzer_text,
-        )
         return self._enrich_video_story_context(
-            EvidenceBundle(
+            _build_structured_evidence_bundle(
                 source_kind=request.source_kind,
                 source_url=request.source_url,
                 platform_hint=request.platform_hint,
                 title=str(document.get("title", "")).strip() or None,
-                text=analyzer_text,
                 evidence_type="structured_document",
                 coverage="full",
                 metadata=metadata,
+                evidence_items=evidence_items,
+                capture_manifest=capture_manifest,
+                fallback_blocks=[],
             )
         )
 
@@ -2738,27 +3131,35 @@ class EvidenceExtractor:
 
     def _from_text(self, request: IngestRequest) -> EvidenceBundle:
         text = (request.raw_text or "").strip()
+        capture_manifest = build_capture_manifest()
         metadata: Dict[str, object] = {}
+        evidence_items = []
         if text:
             _add_evidence_source(metadata, "user_raw_text")
+            add_evidence_item(
+                evidence_items,
+                modality="text",
+                source="user_raw_text",
+                provider="user_input",
+                text=text,
+                confidence=1.0,
+                is_primary=True,
+            )
+            mark_capture(capture_manifest, "browser_render", status="skipped", provider="text_only")
         signals = _extract_skill_signals(text, request.source_url)
         if signals:
             metadata["signals"] = signals
-        metadata = _finalize_evidence_metadata(
-            metadata,
-            source_kind=request.source_kind,
-            source_url=request.source_url,
-            text=text,
-        )
-        return EvidenceBundle(
+        return _build_structured_evidence_bundle(
             source_kind=request.source_kind,
             source_url=request.source_url,
             platform_hint=request.platform_hint,
             title=None,
-            text=text,
             evidence_type="raw_text",
             coverage="full" if text else "partial",
             metadata=metadata,
+            evidence_items=evidence_items,
+            capture_manifest=capture_manifest,
+            fallback_blocks=[] if text else [],
         )
 
     def _from_web(self, request: IngestRequest) -> EvidenceBundle:
@@ -2766,86 +3167,156 @@ class EvidenceExtractor:
         if analyzer_evidence is not None:
             return analyzer_evidence
         raw_text = (request.raw_text or "").strip()
-        text = "" if _looks_like_url_only(raw_text, request.source_url) else raw_text
-        title = None
+        user_guidance = "" if _looks_like_url_only(raw_text, request.source_url) else raw_text
+        capture_manifest = build_capture_manifest()
         request_metadata: Dict[str, object] = {}
-        if text:
-            _add_evidence_source(request_metadata, "user_raw_text")
+        evidence_items = []
         fetch_warnings: list[str] = []
-        image_refs: list[str] = list(request.image_refs)
         temp_image_refs: list[str] = []
-        fetched_text = ""
+        title = None
+
+        if user_guidance:
+            request_metadata["user_guidance"] = user_guidance
+            _add_evidence_source(request_metadata, "user_raw_text")
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_guidance",
+                provider="user_input",
+                text=user_guidance,
+                confidence=1.0,
+                is_primary=False,
+            )
+
         if request.source_url:
             if self.config.extractors.webpage_text_command:
                 try:
                     raw = _run_template(self.config.extractors.webpage_text_command, url=request.source_url)
                     parsed = json.loads(raw) if raw.startswith("{") else {"text": raw}
                     title = parsed.get("title") or title
-                    fetched_text = str(parsed.get("text", "")).strip()
-                    if fetched_text:
+                    fetched_text = _normalize_command_text_block(parsed.get("text", ""))
+                    if fetched_text and not _looks_like_legal_footer(fetched_text):
                         _add_evidence_source(request_metadata, "webpage_text_command")
+                        add_evidence_item(
+                            evidence_items,
+                            modality="web_text",
+                            source="web_html",
+                            provider="webpage_text_command",
+                            text=fetched_text,
+                            confidence=0.9,
+                            is_primary=True,
+                        )
+                        mark_capture(capture_manifest, "web_html", status="ok", provider="webpage_text_command")
                 except Exception as exc:
                     fetch_warnings.append(f"webpage_text_command_failed: {exc}")
-            if not fetched_text:
+                    mark_capture(capture_manifest, "web_html", status="failed", provider="webpage_text_command", reason=str(exc))
+
+            if not any(item.is_primary for item in evidence_items):
                 try:
-                    if "cloud.tencent.com/developer/article" in request.source_url:
-                        html_title, html_text = _fetch_html_document(request.source_url)
-                        title, fetched_text = html_title or title, html_text
-                        if fetched_text:
-                            _add_evidence_source(request_metadata, "web_html_document")
-                        step_items = _extract_step_items_from_text(fetched_text or "")
-                        if not fetched_text or len(fetched_text) < 900 or not step_items:
-                            try:
-                                browser_title, browser_text, browser_step_items = _fetch_openclaw_browser_snapshot_with_steps(
-                                    request.source_url,
-                                    limit=3000,
-                                )
-                                if browser_text:
-                                    title, fetched_text = browser_title or title, browser_text
-                                    _add_evidence_source(request_metadata, "browser_snapshot")
-                                if browser_step_items:
-                                    step_items = browser_step_items
-                            except Exception as browser_exc:
-                                fetch_warnings.append(f"browser_snapshot_failed: {browser_exc}")
-                        if step_items:
-                            step_lines: list[str] = []
-                            for item in step_items:
-                                title_part = item.get("title") or ""
-                                detail = item.get("detail") or ""
-                                command = item.get("command") or ""
-                                line = title_part
-                                if detail:
-                                    line = f"{line}：{detail}"
-                                if command:
-                                    line = f"{line}（命令：{command}）" if line else f"命令：{command}"
-                                if line:
-                                    step_lines.append(line)
-                            request_metadata.update({"steps": step_lines, "step_items": step_items})
-                    elif "xiaohongshu.com" in request.source_url:
-                        try:
-                            title, fetched_text = _fetch_openclaw_browser_snapshot(request.source_url, limit=2400)
-                            if fetched_text:
-                                _add_evidence_source(request_metadata, "browser_snapshot")
-                        except Exception as browser_exc:
-                            fetch_warnings.append(f"browser_snapshot_failed: {browser_exc}")
+                    if "xiaohongshu.com" in request.source_url:
+                        browser_title, browser_text = _fetch_openclaw_browser_snapshot(request.source_url, limit=2400)
+                        browser_text = browser_text.strip()
+                        if browser_text and not _looks_like_legal_footer(browser_text):
+                            title = browser_title or title
+                            _add_evidence_source(request_metadata, "browser_snapshot")
+                            add_evidence_item(
+                                evidence_items,
+                                modality="web_text",
+                                source="browser_render",
+                                provider="browser_snapshot",
+                                text=browser_text,
+                                confidence=0.82,
+                                is_primary=True,
+                            )
+                            mark_capture(capture_manifest, "browser_render", status="ok", provider="browser_snapshot")
+                        else:
                             html_title, html_text = _fetch_html_document(request.source_url)
-                            title, fetched_text = html_title or title, html_text
-                            if fetched_text:
+                            title = html_title or title
+                            if html_text and not _looks_like_legal_footer(html_text):
                                 _add_evidence_source(request_metadata, "web_html_document")
+                                add_evidence_item(
+                                    evidence_items,
+                                    modality="web_text",
+                                    source="web_html",
+                                    provider="fetch_html_document",
+                                    text=html_text,
+                                    confidence=0.65,
+                                    is_primary=True,
+                                )
+                                mark_capture(capture_manifest, "web_html", status="ok", provider="fetch_html_document")
                     else:
                         html_title, html_text = _fetch_html_document(request.source_url)
-                        title, fetched_text = html_title or title, html_text
-                        if fetched_text:
+                        if html_text and not _looks_like_legal_footer(html_text):
+                            title = html_title or title
                             _add_evidence_source(request_metadata, "web_html_document")
+                            add_evidence_item(
+                                evidence_items,
+                                modality="web_text",
+                                source="web_html",
+                                provider="fetch_html_document",
+                                text=html_text,
+                                confidence=0.78,
+                                is_primary=True,
+                            )
+                            mark_capture(capture_manifest, "web_html", status="ok", provider="fetch_html_document")
                 except Exception as exc:
                     fetch_warnings.append(f"fetch_failed: {exc}")
+                    if "xiaohongshu.com" in request.source_url:
+                        try:
+                            html_title, html_text = _fetch_html_document(request.source_url)
+                            title = html_title or title
+                            if html_text and not _looks_like_legal_footer(html_text):
+                                _add_evidence_source(request_metadata, "web_html_document")
+                                add_evidence_item(
+                                    evidence_items,
+                                    modality="web_text",
+                                    source="web_html",
+                                    provider="fetch_html_document",
+                                    text=html_text,
+                                    confidence=0.65,
+                                    is_primary=True,
+                                )
+                                mark_capture(capture_manifest, "web_html", status="ok", provider="fetch_html_document")
+                        except Exception as html_exc:
+                            fetch_warnings.append(f"web_html_document_failed: {html_exc}")
+
+            if not any(item.is_primary for item in evidence_items) and "xiaohongshu.com" not in request.source_url:
+                engine = WebCaptureEngine()
+                capture_result = engine.capture(
+                    request.source_url,
+                    rendered_fetch=lambda url: _fetch_openclaw_browser_snapshot(url, limit=2400),
+                )
+                title = capture_result.title or title
+                for layer in capture_result.layers:
+                    mark_capture(
+                        capture_manifest,
+                        layer.name,
+                        status=layer.status,
+                        provider=layer.provider,
+                        reason=layer.reason,
+                    )
+                    if layer.status != "ok" or not layer.text.strip():
+                        if layer.reason:
+                            fetch_warnings.append(f"{layer.name}_failed: {layer.reason}")
+                        continue
+                    source_name = "web_html_document" if layer.name == "web_html" else "browser_snapshot"
+                    _add_evidence_source(request_metadata, source_name)
+                    add_evidence_item(
+                        evidence_items,
+                        modality="web_text",
+                        source=layer.name,
+                        provider=layer.provider,
+                        text=layer.text,
+                        confidence=0.82 if layer.name == "browser_render" else 0.74,
+                        is_primary=layer.name == "browser_render" or not any(item.is_primary for item in evidence_items),
+                    )
 
         ocr_cmd = _ocr_command(self.config)
-        merged_text = _merge_text_blocks(text, fetched_text)
+        merged_pre_ocr = merged_text_from_items(evidence_items)
         if request.source_url and ocr_cmd and _should_try_browser_ocr(
             request.source_kind,
             request.source_url,
-            merged_text,
+            merged_pre_ocr,
             self.config,
         ):
             try:
@@ -2854,7 +3325,23 @@ class EvidenceExtractor:
                     temp_image_refs.append(screenshot_path)
                 if ocr_text:
                     _add_evidence_source(request_metadata, "browser_screenshot_ocr")
-                    merged_text = _merge_text_blocks(merged_text, "[OCR补充]\n" + ocr_text)
+                    add_evidence_item(
+                        evidence_items,
+                        modality="ocr",
+                        source="browser_screenshot_ocr",
+                        provider=ocr_cmd,
+                        text=ocr_text,
+                        confidence=0.72,
+                        artifact_ref=screenshot_path,
+                        is_primary=False,
+                    )
+                    mark_capture(
+                        capture_manifest,
+                        "browser_render",
+                        status="ok",
+                        provider="browser_render+ocr",
+                        artifact_refs=[screenshot_path] if screenshot_path else [],
+                    )
             except Exception as exc:
                 fetch_warnings.append(f"screenshot_ocr_failed: {exc}")
 
@@ -2863,152 +3350,265 @@ class EvidenceExtractor:
             fetch_warnings.extend(upload_ocr_warnings)
             if uploaded_ocr_lines:
                 _add_evidence_source(request_metadata, "uploaded_image_ocr")
-                merged_text = _merge_text_blocks(
-                    merged_text,
-                    "[上传图片OCR]\n" + "\n".join(_select_salient_lines(uploaded_ocr_lines, limit=16)),
+                add_evidence_item(
+                    evidence_items,
+                    modality="ocr",
+                    source="uploaded_image_ocr",
+                    provider=ocr_cmd,
+                    text="\n".join(_select_salient_lines(uploaded_ocr_lines, limit=16)),
+                    confidence=0.7,
+                    is_primary=False,
                 )
-        text = merged_text
-        if fetch_warnings:
-            request_metadata["fetch_warnings"] = _dedupe_strings(fetch_warnings, limit=20)
-        if image_refs:
-            request_metadata["image_refs"] = _dedupe_strings(image_refs, limit=40)
-        if temp_image_refs:
-            request_metadata["temp_image_refs"] = _dedupe_strings(temp_image_refs, limit=40)
-        if not text and fetch_warnings:
-            text = f"[fetch error] {' | '.join(fetch_warnings[:2])}"
-        signals = _extract_skill_signals(text, request.source_url)
-        if signals:
-            request_metadata["signals"] = signals
-        if _looks_like_legal_footer(text):
-            text = ""
-        if not text:
+
+        merged_text = merged_text_from_items(evidence_items)
+        if _looks_like_legal_footer(merged_text):
+            merged_text = ""
+        if not merged_text:
             blocked_text = _build_blocked_web_text(
                 source_url=request.source_url,
                 title=title,
                 warnings=fetch_warnings,
             )
             if blocked_text:
-                text = blocked_text
                 _add_evidence_source(request_metadata, "web_blocked_notice")
-        request_metadata = _finalize_evidence_metadata(
-            request_metadata,
-            source_kind=request.source_kind,
-            source_url=request.source_url,
-            text=text,
-        )
-        return EvidenceBundle(
+                add_evidence_item(
+                    evidence_items,
+                    modality="notice",
+                    source="browser_render",
+                    provider="blocked_notice",
+                    text=blocked_text,
+                    confidence=1.0,
+                    is_primary=True,
+                )
+                mark_capture(
+                    capture_manifest,
+                    "browser_render",
+                    status="failed",
+                    provider="blocked_notice",
+                    reason="page blocked or empty",
+                )
+
+        if fetch_warnings:
+            request_metadata["fetch_warnings"] = _dedupe_strings(fetch_warnings, limit=20)
+        if request.image_refs:
+            request_metadata["image_refs"] = _dedupe_strings(list(request.image_refs), limit=40)
+        if temp_image_refs:
+            request_metadata["temp_image_refs"] = _dedupe_strings(temp_image_refs, limit=40)
+
+        effective_text = merged_text_from_items(evidence_items)
+        if effective_text and "step_items" not in request_metadata:
+            inferred_step_items = _extract_step_items_from_text(effective_text)
+            if inferred_step_items:
+                request_metadata["step_items"] = inferred_step_items
+                request_metadata["steps"] = _dedupe_strings(
+                    [str(item.get("title", "")).strip() for item in inferred_step_items if str(item.get("title", "")).strip()],
+                    limit=30,
+                )
+        signals = _extract_skill_signals(effective_text, request.source_url)
+        if signals:
+            request_metadata["signals"] = signals
+        coverage = "partial" if "web_blocked_notice" in request_metadata.get("evidence_sources", []) else "full" if effective_text else "partial"
+        return _build_structured_evidence_bundle(
             source_kind=request.source_kind,
             source_url=request.source_url,
             platform_hint=request.platform_hint,
             title=title,
-            text=text,
             evidence_type="visible_page_text",
-            coverage="partial" if request_metadata.get("evidence_sources") == ["web_blocked_notice"] or "web_blocked_notice" in request_metadata.get("evidence_sources", []) else "full" if text else "partial",
+            coverage=coverage,
             metadata=request_metadata,
+            evidence_items=evidence_items,
+            capture_manifest=capture_manifest,
+            fallback_blocks=[],
         )
 
     def _from_github(self, request: IngestRequest) -> EvidenceBundle:
         user_text = (request.raw_text or "").strip()
-        text = "" if _looks_like_url_only(user_text, request.source_url) else user_text
+        user_guidance = "" if _looks_like_url_only(user_text, request.source_url) else user_text
         title = None
+        capture_manifest = build_capture_manifest()
         metadata: Dict[str, object] = {}
-        if text:
+        evidence_items = []
+        fetch_warnings: list[str] = []
+        if user_guidance:
             _add_evidence_source(metadata, "user_raw_text")
-        fetched_text = ""
+            metadata["user_guidance"] = user_guidance
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_guidance",
+                provider="user_input",
+                text=user_guidance,
+                confidence=1.0,
+                is_primary=False,
+            )
         if request.source_url and self.config.extractors.github_text_command:
             try:
                 raw = _run_template(self.config.extractors.github_text_command, url=request.source_url)
                 parsed = json.loads(raw) if raw.startswith("{") else {"text": raw}
                 title = parsed.get("title")
-                fetched_text = str(parsed.get("text", "")).strip()
+                fetched_text = _normalize_command_text_block(parsed.get("text", ""))
                 parsed_metadata = parsed.get("metadata", {}) if isinstance(parsed.get("metadata", {}), dict) else {}
                 metadata = dict(parsed_metadata)
-                if text:
+                if user_guidance:
                     _add_evidence_source(metadata, "user_raw_text")
                 if fetched_text:
                     _add_evidence_source(metadata, "github_text_command")
+                    add_evidence_item(
+                        evidence_items,
+                        modality="repo_text",
+                        source="github_repo",
+                        provider="github_text_command",
+                        text=fetched_text,
+                        confidence=0.88,
+                        is_primary=True,
+                    )
+                    mark_capture(
+                        capture_manifest,
+                        "github_repo",
+                        status="ok",
+                        provider="github_text_command",
+                    )
             except Exception as exc:
-                if not text:
-                    text = f"[github extractor error] {exc}"
+                fetch_warnings.append(f"github_text_command_failed: {exc}")
         elif request.source_url:
             try:
                 blob_title, blob_text, blob_meta = _fetch_github_blob_summary(request.source_url)
                 if blob_text:
                     title, fetched_text, metadata = blob_title, blob_text, dict(blob_meta)
-                    if text:
+                    if user_guidance:
                         _add_evidence_source(metadata, "user_raw_text")
                     _add_evidence_source(metadata, "github_blob")
+                    add_evidence_item(
+                        evidence_items,
+                        modality="repo_text",
+                        source="github_repo",
+                        provider="github_blob",
+                        text=blob_text,
+                        confidence=0.93,
+                        is_primary=True,
+                    )
+                    mark_capture(capture_manifest, "github_repo", status="ok", provider="github_blob")
                 else:
                     api_title, api_text, api_meta = _fetch_github_repo_summary(request.source_url)
                     if api_text:
                         title, fetched_text, metadata = api_title, api_text, dict(api_meta)
-                        if text:
+                        if user_guidance:
                             _add_evidence_source(metadata, "user_raw_text")
                         _add_evidence_source(metadata, "github_api")
+                        add_evidence_item(
+                            evidence_items,
+                            modality="repo_text",
+                            source="github_repo",
+                            provider="github_api",
+                            text=api_text,
+                            confidence=0.92,
+                            is_primary=True,
+                        )
+                        mark_capture(capture_manifest, "github_repo", status="ok", provider="github_api")
                     else:
                         title, fetched_text = _fetch_html_document(request.source_url)
                         if fetched_text:
                             _add_evidence_source(metadata, "web_html_document")
+                            add_evidence_item(
+                                evidence_items,
+                                modality="repo_text",
+                                source="web_html",
+                                provider="github_html_fallback",
+                                text=fetched_text,
+                                confidence=0.6,
+                                is_primary=True,
+                            )
+                            mark_capture(capture_manifest, "web_html", status="ok", provider="github_html_fallback")
             except Exception as exc:
-                if not text:
-                    text = f"[github fetch error] {exc}"
-        text = _merge_text_blocks(fetched_text, text)
+                fetch_warnings.append(f"github_fetch_failed: {exc}")
+        text = merged_text_from_items(evidence_items)
+        if not text and fetch_warnings:
+            mark_capture(
+                capture_manifest,
+                "github_repo",
+                status="failed",
+                provider="github",
+                reason=fetch_warnings[0],
+            )
         signals = _extract_skill_signals(text, request.source_url)
         if signals:
             metadata["signals"] = _tighten_github_signals(signals, request.source_url)
-        metadata = _finalize_evidence_metadata(
-            metadata,
-            source_kind=request.source_kind,
-            source_url=request.source_url,
-            text=text,
-        )
-        return EvidenceBundle(
+        if fetch_warnings:
+            metadata["fetch_warnings"] = _dedupe_strings(fetch_warnings, limit=12)
+        return _build_structured_evidence_bundle(
             source_kind=request.source_kind,
             source_url=request.source_url,
             platform_hint="github",
             title=title,
-            text=text,
             evidence_type="structured_github_text",
             coverage="full" if text else "partial",
             metadata=metadata,
+            evidence_items=evidence_items,
+            capture_manifest=capture_manifest,
+            fallback_blocks=[],
         )
 
     def _from_image(self, request: IngestRequest) -> EvidenceBundle:
         ocr_cmd = _ocr_command(self.config)
         outputs: List[str] = []
+        capture_manifest = build_capture_manifest()
         metadata: Dict[str, object] = {"image_refs": request.image_refs}
+        evidence_items = []
         if request.image_refs:
             _add_evidence_source(metadata, "uploaded_image")
+            mark_capture(
+                capture_manifest,
+                "browser_render",
+                status="ok",
+                provider="uploaded_image",
+                artifact_refs=request.image_refs,
+                details={"image_count": len(request.image_refs)},
+            )
         warnings: list[str] = []
         if ocr_cmd and request.image_refs:
             ocr_lines, warnings = _ocr_images(request.image_refs, ocr_cmd, strict=False)
             if ocr_lines:
                 _add_evidence_source(metadata, "uploaded_image_ocr")
-                outputs.append("\n".join(_select_salient_lines(ocr_lines, limit=18)))
+                ocr_text = "\n".join(_select_salient_lines(ocr_lines, limit=18))
+                outputs.append(ocr_text)
+                add_evidence_item(
+                    evidence_items,
+                    modality="ocr",
+                    source="uploaded_image_ocr",
+                    provider=ocr_cmd,
+                    text=ocr_text,
+                    confidence=0.8,
+                    is_primary=True,
+                )
         if request.raw_text:
             _add_evidence_source(metadata, "user_raw_text")
             outputs.append(request.raw_text)
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_guidance",
+                provider="user_input",
+                text=request.raw_text,
+                confidence=1.0,
+                is_primary=False,
+            )
         if warnings:
             metadata["fetch_warnings"] = _dedupe_strings(warnings, limit=20)
         text = _merge_text_blocks(*outputs)
         signals = _extract_skill_signals(text, request.source_url)
         if signals:
             metadata["signals"] = signals
-        metadata = _finalize_evidence_metadata(
-            metadata,
-            source_kind="image",
-            source_url=request.source_url,
-            text=text,
-        )
-        return EvidenceBundle(
+        return _build_structured_evidence_bundle(
             source_kind="image",
             source_url=request.source_url,
             platform_hint=request.platform_hint,
             title=None,
-            text=text,
             evidence_type="ocr",
             coverage="full" if text else "partial",
             metadata=metadata,
+            evidence_items=evidence_items,
+            capture_manifest=capture_manifest,
+            fallback_blocks=[],
         )
 
     def _from_video(self, request: IngestRequest) -> EvidenceBundle:
@@ -3020,7 +3620,9 @@ class EvidenceExtractor:
         subtitle_text = ""
         keyframes: List[str] = []
         transcript = None
+        capture_manifest = build_capture_manifest()
         metadata: Dict[str, object] = {}
+        evidence_items = []
         user_text = (request.raw_text or "").strip()
         evidence_hint_text, user_guidance = _split_user_guidance_from_evidence(
             user_text,
@@ -3031,6 +3633,15 @@ class EvidenceExtractor:
             _add_evidence_source(metadata, "user_raw_text")
         if user_guidance:
             metadata["user_guidance"] = user_guidance
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_guidance",
+                provider="user_input",
+                text=user_guidance,
+                confidence=1.0,
+                is_primary=False,
+            )
         warnings: list[str] = []
         video_url = _canonicalize_video_source_url(request.source_url)
         if request.source_url and video_url and request.source_url != video_url:
@@ -3045,17 +3656,97 @@ class EvidenceExtractor:
                 if bili_text:
                     metadata_text = "[视频元数据]\n" + bili_text
                     _add_evidence_source(metadata, "video_platform_metadata")
+                    mark_capture(capture_manifest, "page_metadata", status="ok", provider="bilibili_metadata_api")
                 if bili_meta:
                     metadata.update({key: value for key, value in bili_meta.items() if value})
             except Exception as exc:
                 warnings.append(f"video_platform_metadata_failed: {exc}")
+                mark_capture(capture_manifest, "page_metadata", status="failed", provider="bilibili_metadata_api", reason=str(exc))
         subtitle_meta: dict[str, object] = {}
         audio_meta: dict[str, object] = {}
+        provider_bundle: VideoProviderBundle | None = None
+        provider_attempts = []
+        if video_url:
+            try:
+                provider_bundle, provider_attempts = self.video_provider_router.route(
+                    url=request.source_url or video_url,
+                    platform_hint=request.platform_hint,
+                    requested_output_lang=request.requested_output_lang or "zh-CN",
+                )
+            except Exception as exc:
+                warnings.append(f"video_provider_router_failed: {exc}")
+                provider_bundle = None
+                provider_attempts = []
+        if provider_attempts:
+            metadata["video_provider_attempts"] = [attempt.to_dict() for attempt in provider_attempts]
+        provider_capabilities: dict[str, bool] = {}
+        provider_speech_chars = 0
+        if provider_bundle is not None:
+            metadata["video_provider"] = provider_bundle.provider
+            provider_capabilities = {str(key): bool(value) for key, value in provider_bundle.capabilities.items()}
+            if provider_capabilities:
+                metadata["video_provider_capabilities"] = provider_capabilities
+            if provider_bundle.metadata:
+                metadata["video_provider_metadata"] = provider_bundle.metadata
+            if provider_bundle.warnings:
+                warnings.extend([f"video_provider_warning:{item}" for item in provider_bundle.warnings[:8]])
+            provider_subtitle = (provider_bundle.subtitle_text or "").strip()
+            provider_transcript = (provider_bundle.transcript_text or "").strip()
+            provider_analysis = (provider_bundle.analysis_text or "").strip()
+            if provider_subtitle:
+                subtitle_text = provider_subtitle
+                subtitle_meta = {
+                    "provider": provider_bundle.provider,
+                    "segments": list(provider_bundle.segments[:800]),
+                    "timeline_lines": [f"[{_format_seconds_label(float(item.get('start') or 0.0))}] {str(item.get('text', '')).strip()}" for item in provider_bundle.segments[:300] if str(item.get("text", "")).strip()]
+                    if provider_bundle.segments
+                    else [],
+                }
+                _add_evidence_source(metadata, provider_bundle.provider + "_subtitle")
+                mark_capture(
+                    capture_manifest,
+                    "subtitle",
+                    status="ok",
+                    provider=provider_bundle.provider,
+                    details={"source": "video_provider_router"},
+                )
+            if provider_transcript:
+                transcript = provider_transcript
+                audio_meta = {
+                    "provider": provider_bundle.provider,
+                    "segments": list(provider_bundle.segments[:800]),
+                    "timeline_lines": [f"[{_format_seconds_label(float(item.get('start') or 0.0))}] {str(item.get('text', '')).strip()}" for item in provider_bundle.segments[:300] if str(item.get("text", "")).strip()]
+                    if provider_bundle.segments
+                    else [],
+                }
+                _add_evidence_source(metadata, provider_bundle.provider + "_transcript")
+                mark_capture(
+                    capture_manifest,
+                    "asr",
+                    status="ok",
+                    provider=provider_bundle.provider,
+                    details={"source": "video_provider_router"},
+                )
+            if provider_analysis:
+                metadata["video_provider_analysis"] = provider_analysis
+            if provider_bundle.viewer_feedback:
+                metadata["viewer_feedback"] = provider_bundle.viewer_feedback[:8]
+            provider_speech_chars = max(len(provider_subtitle), len(provider_transcript))
         probe_seconds = 0
         if request.video_probe_seconds and request.video_probe_seconds > 0:
             probe_seconds = int(request.video_probe_seconds)
         elif request.dry_run and not request.force_full_video:
-            probe_seconds = max(0, int(self.config.execution.dry_run_video_probe_seconds))
+            probe_seconds = _adaptive_video_probe_seconds(
+                request=request,
+                video_url=video_url,
+                metadata=metadata,
+                default_probe_seconds=int(self.config.execution.dry_run_video_probe_seconds),
+                title_context=str(metadata.get("page_title") or metadata.get("bilibili_title") or "").strip(),
+                description_context=str(metadata.get("bilibili_description") or "").strip(),
+            )
+            if probe_seconds > 0:
+                metadata["adaptive_probe_seconds"] = probe_seconds
+                metadata["video_probe_strategy"] = "quality_priority_auto"
         extraction_profile = "full"
         if probe_seconds > 0:
             extraction_profile = "probe"
@@ -3070,19 +3761,31 @@ class EvidenceExtractor:
                     url=video_url,
                     max_seconds=str(probe_seconds),
                 )
-                subtitle_text, subtitle_meta = _parse_video_text_output(subtitle_raw)
-                if subtitle_text.strip():
+                local_subtitle_text, local_subtitle_meta = _parse_video_text_output(subtitle_raw)
+                if local_subtitle_text.strip():
+                    if len(local_subtitle_text.strip()) >= len(subtitle_text.strip()):
+                        subtitle_text = local_subtitle_text
+                        subtitle_meta = local_subtitle_meta
                     _add_evidence_source(metadata, "video_subtitles")
+                    mark_capture(
+                        capture_manifest,
+                        "subtitle",
+                        status="ok",
+                        provider="video_subtitle_command",
+                        details={"language": local_subtitle_meta.get("language", "")},
+                    )
             except Exception as exc:
                 warnings.append(f"video_subtitle_failed: {exc}")
-                subtitle_text = ""
+                if not subtitle_text.strip():
+                    mark_capture(capture_manifest, "subtitle", status="failed", provider="video_subtitle_command", reason=str(exc))
         dry_run_quality_audio_platforms = ("bilibili.com", "xiaohongshu.com")
+        speech_seed_chars = max(len(subtitle_text.strip()), len((transcript or "").strip()), provider_speech_chars)
         should_force_audio_in_dry_run = (
             request.dry_run
             and not request.force_full_video
             and bool(video_url)
             and any(platform in (video_url or "").lower() for platform in dry_run_quality_audio_platforms)
-            and len(subtitle_text.strip()) < self.config.video_accuracy.audio_when_subtitle_short_chars
+            and speech_seed_chars < self.config.video_accuracy.audio_when_subtitle_short_chars
         )
         skip_audio_in_dry_run = (
             request.dry_run
@@ -3098,7 +3801,7 @@ class EvidenceExtractor:
             and not skip_audio_in_dry_run
             and (
                 self.config.video_accuracy.always_run_audio
-                or len(subtitle_text.strip()) < self.config.video_accuracy.audio_when_subtitle_short_chars
+                or speech_seed_chars < self.config.video_accuracy.audio_when_subtitle_short_chars
             )
         )
         if video_url and self.config.extractors.video_audio_command and should_run_audio:
@@ -3110,18 +3813,38 @@ class EvidenceExtractor:
                     api_key=self.config.summarizer.api_key,
                     api_base_url=self.config.summarizer.api_base_url,
                 )
-                transcript_text, audio_meta = _parse_video_text_output(audio_raw)
-                transcript = transcript_text
-                if (transcript or "").strip():
+                transcript_text, local_audio_meta = _parse_video_text_output(audio_raw)
+                if len(transcript_text.strip()) >= len((transcript or "").strip()):
+                    transcript = transcript_text
+                    audio_meta = local_audio_meta
+                if (transcript_text or "").strip():
                     _add_evidence_source(metadata, "video_audio_asr")
+                    mark_capture(
+                        capture_manifest,
+                        "asr",
+                        status="ok",
+                        provider="video_audio_command",
+                        details={"language": local_audio_meta.get("language", "")},
+                    )
             except Exception as exc:
                 warnings.append(f"video_audio_failed: {exc}")
-                transcript = None
+                if not (transcript or "").strip():
+                    transcript = None
+                    mark_capture(capture_manifest, "asr", status="failed", provider="video_audio_command", reason=str(exc))
         elif video_url and self.config.extractors.video_audio_command:
             if skip_audio_in_dry_run:
                 metadata["audio_skipped_reason"] = "dry_run_skip_video_audio"
+                mark_capture(capture_manifest, "asr", status="skipped", provider="video_audio_command", reason="dry_run_skip_video_audio")
             else:
-                metadata["audio_skipped_reason"] = "subtitle_sufficient"
+                metadata["audio_skipped_reason"] = "provider_sufficient" if provider_speech_chars > 0 else "subtitle_sufficient"
+                if not (transcript or "").strip():
+                    mark_capture(
+                        capture_manifest,
+                        "asr",
+                        status="skipped",
+                        provider="video_audio_command",
+                        reason=str(metadata["audio_skipped_reason"]),
+                    )
         keyframe_text_hints: list[str] = []
         dry_run_quality_keyframe_platforms = ("bilibili.com", "xiaohongshu.com")
         should_force_keyframes_in_dry_run = (
@@ -3129,7 +3852,7 @@ class EvidenceExtractor:
             and not request.force_full_video
             and bool(video_url)
             and any(platform in (video_url or "").lower() for platform in dry_run_quality_keyframe_platforms)
-            and len(subtitle_text.strip()) < self.config.video_accuracy.audio_when_subtitle_short_chars
+            and speech_seed_chars < self.config.video_accuracy.audio_when_subtitle_short_chars
         )
         skip_keyframes_in_dry_run = (
             request.dry_run
@@ -3153,11 +3876,20 @@ class EvidenceExtractor:
                     keyframes, keyframe_text_hints = _parse_keyframe_output(raw, output_dir=output_dir)
                     if keyframes:
                         _add_evidence_source(metadata, "video_keyframes")
+                        mark_capture(
+                            capture_manifest,
+                            "keyframes",
+                            status="ok",
+                            provider="video_keyframes_command",
+                            artifact_refs=keyframes,
+                        )
             except Exception as exc:
                 warnings.append(f"video_keyframes_failed: {exc}")
                 keyframes = []
+                mark_capture(capture_manifest, "keyframes", status="failed", provider="video_keyframes_command", reason=str(exc))
         elif skip_keyframes_in_dry_run:
             metadata["keyframes_skipped_reason"] = "dry_run_skip_video_keyframes"
+            mark_capture(capture_manifest, "keyframes", status="skipped", provider="video_keyframes_command", reason="dry_run_skip_video_keyframes")
         ocr_cmd = _ocr_command(self.config)
         keyframe_ocr_lines: list[str] = []
         if keyframes and ocr_cmd:
@@ -3166,6 +3898,42 @@ class EvidenceExtractor:
             keyframe_ocr_lines = _select_salient_lines(keyframe_ocr_lines, limit=16)
             if keyframe_ocr_lines:
                 _add_evidence_source(metadata, "video_keyframe_ocr")
+                mark_capture(
+                    capture_manifest,
+                    "keyframe_ocr",
+                    status="ok",
+                    provider=ocr_cmd,
+                    artifact_refs=keyframes,
+                )
+        direction_estimate = _estimate_video_direction(
+            title=str(metadata.get("page_title") or metadata.get("bilibili_title") or ""),
+            transcript_text=transcript or "",
+            subtitle_text=subtitle_text,
+            metadata=metadata,
+            keyframe_ocr_lines=keyframe_ocr_lines,
+        )
+        metadata["video_direction_estimate"] = direction_estimate
+        repair_notes: list[str] = []
+        direction_kind = str(direction_estimate.get("kind", "")).strip()
+        if direction_kind and direction_kind != "general":
+            if subtitle_text.strip():
+                metadata["raw_subtitle_text"] = subtitle_text
+                subtitle_text, subtitle_meta, applied = _repair_video_speech_track(
+                    subtitle_text,
+                    subtitle_meta,
+                    direction_kind=direction_kind,
+                )
+                repair_notes.extend(["subtitle:" + item for item in applied])
+            if (transcript or "").strip():
+                metadata["raw_transcript_text"] = transcript or ""
+                transcript, audio_meta, applied = _repair_video_speech_track(
+                    transcript or "",
+                    audio_meta,
+                    direction_kind=direction_kind,
+                )
+                repair_notes.extend(["transcript:" + item for item in applied])
+        if repair_notes:
+            metadata["video_text_repairs"] = _dedupe_strings(repair_notes, limit=20)
         include_keyframe_ocr = False
         if keyframe_ocr_lines:
             transcript_len = len((transcript or "").strip())
@@ -3180,10 +3948,12 @@ class EvidenceExtractor:
                 for line in keyframe_ocr_lines
             )
             include_keyframe_ocr = transcript_len < 160 or has_high_signal
+        snapshot_text = ""
         merged_text = _merge_text_blocks(
             metadata_text,
             subtitle_text,
             transcript or "",
+            str(metadata.get("video_provider_analysis") or "").strip(),
             evidence_hint_text,
             "\n".join(keyframe_text_hints),
             "[关键帧OCR]\n" + "\n".join(keyframe_ocr_lines) if include_keyframe_ocr else "",
@@ -3201,8 +3971,10 @@ class EvidenceExtractor:
                 if snapshot_text:
                     metadata["video_page_snapshot_used"] = True
                     _add_evidence_source(metadata, "video_page_snapshot")
+                    mark_capture(capture_manifest, "browser_render", status="ok", provider="browser_snapshot")
             except Exception as exc:
                 warnings.append(f"video_page_snapshot_failed: {exc}")
+                mark_capture(capture_manifest, "browser_render", status="failed", provider="browser_snapshot", reason=str(exc))
             if not snapshot_text:
                 try:
                     html_title, html_text = _fetch_html_document(video_url)
@@ -3212,8 +3984,10 @@ class EvidenceExtractor:
                     if snapshot_text:
                         metadata["video_html_fallback_used"] = True
                         _add_evidence_source(metadata, "video_html_fallback")
+                        mark_capture(capture_manifest, "web_html", status="ok", provider="video_html_fallback")
                 except Exception as exc:
                     warnings.append(f"video_html_fallback_failed: {exc}")
+                    mark_capture(capture_manifest, "web_html", status="failed", provider="video_html_fallback", reason=str(exc))
             if snapshot_text:
                 merged_text = _merge_text_blocks(merged_text, "[视频页面补充]\n" + snapshot_text)
         compacted_text, compact_stats = _compact_video_evidence_text(
@@ -3249,6 +4023,15 @@ class EvidenceExtractor:
         )
         if timeline_highlights:
             metadata["timeline_highlights"] = timeline_highlights
+            add_evidence_item(
+                evidence_items,
+                modality="timeline",
+                source="timeline_highlights",
+                provider="video_timeline_selector",
+                text="\n".join(timeline_highlights[:8]),
+                confidence=0.86,
+                is_primary=False,
+            )
         duration_candidates = [
             _parse_duration_seconds(metadata.get("bilibili_duration_seconds")),
             _parse_duration_seconds(subtitle_meta.get("duration_seconds")),
@@ -3266,6 +4049,28 @@ class EvidenceExtractor:
             "has_keyframe_ocr": bool(keyframe_ocr_lines),
             "audio_mode": "forced" if self.config.video_accuracy.always_run_audio else "subtitle_first",
         }
+        metadata["coverage_basis"] = {
+            "speech_sources": sorted(
+                {
+                    str(item.source)
+                    for item in evidence_items
+                    if str(item.modality) == "speech" and str(item.text or "").strip()
+                }
+            ),
+            "video_provider": str(metadata.get("video_provider") or ""),
+            "provider_capabilities": provider_capabilities,
+            "has_visual_support": bool(keyframes or keyframe_ocr_lines),
+        }
+        if not metadata_text:
+            mark_capture(capture_manifest, "page_metadata", status="empty", provider="platform_metadata")
+        if not subtitle_text and capture_manifest.items.get("subtitle", None) and capture_manifest.items["subtitle"].status == "empty":
+            mark_capture(capture_manifest, "subtitle", status="empty", provider="video_subtitle_command")
+        if not transcript and capture_manifest.items.get("asr", None) and capture_manifest.items["asr"].status == "empty":
+            mark_capture(capture_manifest, "asr", status="empty", provider="video_audio_command")
+        if not keyframes and capture_manifest.items.get("keyframes", None) and capture_manifest.items["keyframes"].status == "empty":
+            mark_capture(capture_manifest, "keyframes", status="empty", provider="video_keyframes_command")
+        if not keyframe_ocr_lines and capture_manifest.items.get("keyframe_ocr", None) and capture_manifest.items["keyframe_ocr"].status == "empty":
+            mark_capture(capture_manifest, "keyframe_ocr", status="empty", provider=ocr_cmd or "ocr")
         if warnings:
             metadata["fetch_warnings"] = _dedupe_strings(warnings, limit=20)
         signals = _extract_skill_signals(merged_text, video_url)
@@ -3273,25 +4078,191 @@ class EvidenceExtractor:
             metadata["signals"] = signals
         if timeline_highlights:
             merged_text = _merge_text_blocks(merged_text, "[视频时间线要点]\n" + "\n".join(timeline_highlights))
-        metadata = _finalize_evidence_metadata(
-            metadata,
-            source_kind="video_url",
-            source_url=video_url,
-            text=merged_text,
-        )
+        if metadata_text:
+            add_evidence_item(
+                evidence_items,
+                modality="metadata",
+                source="page_metadata",
+                provider="platform_metadata",
+                text=metadata_text,
+                confidence=0.7,
+                is_primary=False,
+            )
+        if evidence_hint_text:
+            add_evidence_item(
+                evidence_items,
+                modality="guidance",
+                source="user_raw_text",
+                provider="user_input",
+                text=evidence_hint_text,
+                confidence=1.0,
+                is_primary=False,
+            )
+        provider_has_segments = provider_bundle is not None and bool(provider_bundle.segments)
+        if provider_bundle is not None and provider_bundle.subtitle_text.strip() and not provider_has_segments:
+            add_evidence_item(
+                evidence_items,
+                modality="speech",
+                source="provider_subtitle",
+                provider=provider_bundle.provider,
+                text=provider_bundle.subtitle_text.strip(),
+                confidence=0.94,
+                is_primary=True,
+            )
+        if provider_bundle is not None and provider_bundle.transcript_text.strip() and not provider_has_segments:
+            add_evidence_item(
+                evidence_items,
+                modality="speech",
+                source="provider_transcript",
+                provider=provider_bundle.provider,
+                text=provider_bundle.transcript_text.strip(),
+                confidence=0.9,
+                is_primary=True,
+            )
+        if provider_bundle is not None and provider_bundle.segments:
+            for item in provider_bundle.segments[:800]:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                add_evidence_item(
+                    evidence_items,
+                    modality="speech",
+                    source="provider_segments",
+                    provider=provider_bundle.provider,
+                    text=text,
+                    timestamp_start=_parse_duration_seconds(item.get("start")),
+                    timestamp_end=_parse_duration_seconds(item.get("end")),
+                    confidence=0.92,
+                    is_primary=True,
+                )
+        subtitle_segments = subtitle_meta.get("segments", []) if isinstance(subtitle_meta.get("segments"), list) else []
+        if subtitle_segments:
+            for item in subtitle_segments[:1200]:
+                if not isinstance(item, dict):
+                    continue
+                add_evidence_item(
+                    evidence_items,
+                    modality="speech",
+                    source="subtitle",
+                    provider="video_subtitle_command",
+                    text=str(item.get("text", "")).strip(),
+                    timestamp_start=_parse_duration_seconds(item.get("start")),
+                    timestamp_end=_parse_duration_seconds(item.get("end")),
+                    confidence=0.95,
+                    is_primary=True,
+                )
+        elif subtitle_text.strip():
+            compact_subtitle_text, _ = _compact_video_evidence_text(
+                subtitle_text,
+                max_lines=max(24, int(self.config.video_accuracy.max_evidence_lines // 2)),
+                max_chars=max(600, int(self.config.video_accuracy.max_evidence_chars // 2)),
+            )
+            add_evidence_item(
+                evidence_items,
+                modality="speech",
+                source="subtitle",
+                provider="video_subtitle_command",
+                text=compact_subtitle_text or subtitle_text,
+                confidence=0.95,
+                is_primary=True,
+            )
+        asr_segments = audio_meta.get("segments", []) if isinstance(audio_meta.get("segments"), list) else []
+        if asr_segments:
+            for item in asr_segments[:1200]:
+                if not isinstance(item, dict):
+                    continue
+                add_evidence_item(
+                    evidence_items,
+                    modality="speech",
+                    source="asr",
+                    provider="video_audio_command",
+                    text=str(item.get("text", "")).strip(),
+                    timestamp_start=_parse_duration_seconds(item.get("start")),
+                    timestamp_end=_parse_duration_seconds(item.get("end")),
+                    confidence=0.82,
+                    is_primary=True,
+                )
+            joined_asr = "\n".join(str(item.get("text", "")).strip() for item in asr_segments if isinstance(item, dict)).strip()
+            transcript_body = (transcript or "").strip()
+            if transcript_body and transcript_body != joined_asr:
+                compact_asr_text, _ = _compact_video_evidence_text(
+                    transcript_body,
+                    max_lines=max(24, int(self.config.video_accuracy.max_evidence_lines // 2)),
+                    max_chars=max(600, int(self.config.video_accuracy.max_evidence_chars // 2)),
+                )
+                add_evidence_item(
+                    evidence_items,
+                    modality="speech",
+                    source="asr",
+                    provider="video_audio_command",
+                    text=compact_asr_text or transcript_body,
+                    confidence=0.82,
+                    is_primary=True,
+                )
+        elif (transcript or "").strip():
+            compact_asr_text, _ = _compact_video_evidence_text(
+                transcript or "",
+                max_lines=max(24, int(self.config.video_accuracy.max_evidence_lines // 2)),
+                max_chars=max(600, int(self.config.video_accuracy.max_evidence_chars // 2)),
+            )
+            add_evidence_item(
+                evidence_items,
+                modality="speech",
+                source="asr",
+                provider="video_audio_command",
+                text=compact_asr_text or transcript or "",
+                confidence=0.82,
+                is_primary=True,
+            )
+        if keyframe_text_hints:
+            add_evidence_item(
+                evidence_items,
+                modality="visual",
+                source="keyframes",
+                provider="video_keyframes_command",
+                text="\n".join(keyframe_text_hints[:20]),
+                confidence=0.62,
+                artifact_ref=keyframes[0] if keyframes else None,
+                is_primary=False,
+            )
+        if include_keyframe_ocr and keyframe_ocr_lines:
+            add_evidence_item(
+                evidence_items,
+                modality="visual_text",
+                source="keyframe_ocr",
+                provider=ocr_cmd or "ocr",
+                text="\n".join(keyframe_ocr_lines[:20]),
+                confidence=0.72,
+                artifact_ref=keyframes[0] if keyframes else None,
+                is_primary=False,
+            )
+        if snapshot_text:
+            add_evidence_item(
+                evidence_items,
+                modality="web_text",
+                source="browser_render",
+                provider="browser_snapshot",
+                text=snapshot_text,
+                confidence=0.55,
+                is_primary=False,
+            )
         evidence_type = "multimodal_video"
         video_title = str(metadata.get("page_title") or "").strip() if isinstance(metadata, dict) else ""
         return self._enrich_video_story_context(
-            EvidenceBundle(
+            _build_structured_evidence_bundle(
                 source_kind="video_url",
                 source_url=video_url,
                 platform_hint=request.platform_hint,
                 title=video_title or None,
-                text=merged_text,
                 evidence_type=evidence_type,
                 coverage="full" if merged_text else "partial",
                 transcript=transcript,
                 keyframes=keyframes,
                 metadata=metadata,
+                evidence_items=evidence_items,
+                capture_manifest=capture_manifest,
+                fallback_blocks=[],
             )
         )

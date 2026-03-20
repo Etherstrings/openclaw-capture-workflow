@@ -890,7 +890,7 @@ class ObsidianWriterTest(unittest.TestCase):
                     timeliness="high",
                     effectiveness="medium",
                     recommendation_level="recommended",
-                    reader_judgment="从大厂程序员视角看，这条内容值得收藏，适合后续试跑。",
+                    reader_judgment="这条内容值得收藏，适合后续试跑。",
                 ),
                 EvidenceBundle(
                     source_kind="url",
@@ -907,7 +907,7 @@ class ObsidianWriterTest(unittest.TestCase):
             self.assertNotIn("## 贾维斯判断", content)
             self.assertNotIn("适用身份: 大厂程序员", content)
 
-    def test_non_tutorial_rewrites_next_steps_to_jarvis_thought(self) -> None:
+    def test_non_tutorial_strips_legacy_next_steps_heading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = ObsidianConfig(
                 vault_path=tmp,
@@ -950,10 +950,11 @@ class ObsidianWriterTest(unittest.TestCase):
                 ),
             )
             content = str(preview["content"])
-            self.assertIn("### 贾维斯的思考", content)
+            self.assertNotIn("### 贾维斯的思考", content)
             self.assertNotIn("可直接做的下一步", content)
-            self.assertNotIn("- 访问项目链接了解更多信息。", content)
-            self.assertIn("如果我是你，我会先访问项目链接了解更多信息", content)
+            self.assertNotIn("如果我是你", content)
+            self.assertIn("- 访问项目链接了解更多信息。", content)
+            self.assertIn("- 评估该系统在当前项目中的适用性。", content)
 
     def test_note_frontmatter_includes_keyword_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1175,6 +1176,53 @@ class ObsidianWriterTest(unittest.TestCase):
             content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
             self.assertIn("keyword_l1: 产品体验", content)
 
+    def test_keyword_hierarchy_does_not_infer_stock_from_synthetic_video_bullets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = _writer(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["求职职场", "股票投资"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            note = writer.write(
+                SummaryResult(
+                    title="求职面试中，最常见的12个问题",
+                    primary_topic="求职面试常见问题及应对策略",
+                    secondary_topics=["职业规划", "自我介绍"],
+                    entities=["面试问题"],
+                    conclusion="内容聚焦求职面试准备。",
+                    bullets=[
+                        "1. 视频把关键流程拆成了输入、配置和运行几个环节，重点在把方案真正跑起来。",
+                        "2. 系统会结合行情、业绩和多种数据源来做判断，而不只是给一句结论。",
+                    ],
+                    evidence_quotes=[],
+                    coverage="partial",
+                    confidence="medium",
+                    note_tags=[],
+                    follow_up_actions=[],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1ggpcevEgk",
+                    platform_hint="bilibili",
+                    title="求职面试中，最常见的12个问题",
+                    text="标签: 求职 面试 职场",
+                    evidence_type="multimodal_video",
+                    coverage="partial",
+                    metadata={
+                        "bilibili_tags": ["求职", "面试", "职场"],
+                    },
+                ),
+            )
+            content = (writer.vault_path / str(note["note_path"])).read_text(encoding="utf-8")
+            self.assertIn("keyword_l1: 求职职场", content)
+            self.assertNotIn("keyword_l1: 股票投资", content)
+
     def test_blocked_video_preview_hides_raw_debug_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = ObsidianConfig(
@@ -1230,11 +1278,189 @@ class ObsidianWriterTest(unittest.TestCase):
                 ),
             )
             content = str(preview["content"])
-            self.assertIn("这条内容当前拿不到有效视频正文", content)
-            self.assertIn("## 贾维斯的思考", content)
+            self.assertIn("当前结果不能作为内容总结使用", content)
+            self.assertIn("不建议继续基于这版结果判断内容", content)
+            self.assertNotIn("## 贾维斯的思考", content)
+            self.assertNotIn("如果我是你", content)
             self.assertNotIn("Python 3.9", content)
             self.assertNotIn("Unsupported URL", content)
             self.assertNotIn("yt-dlp", content)
+
+    def test_long_finance_video_preview_uses_briefing_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = _writer(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["股票投资"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="第1143日投资记录",
+                    primary_topic="投资记录",
+                    secondary_topics=["港股"],
+                    entities=["中国食品", "海底捞"],
+                    conclusion="视频核心是在复盘当前市场判断、持仓逻辑与后续调仓计划。",
+                    bullets=[
+                        "市场赚钱效应一般，港股结构尚可。",
+                        "重点讨论海底捞、中国食品、腾讯控股等标的。",
+                    ],
+                    evidence_quotes=["市场赚钱效应一般"],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=["投资", "港股"],
+                    follow_up_actions=[],
+                    reader_judgment="适合当回看前的结构化提纲，但具体买卖仍要回到原视频复核。",
+                    timeline_sections=[
+                        {
+                            "start": 1.0,
+                            "end": 371.0,
+                            "heading": "投资哲学与策略框架",
+                            "summary": "前半段先讲投资体系、收益目标和当前对市场的基本看法。",
+                            "bullets": ["强调防御性强、市场大跌时回撤小。", "今年目标是稳住节奏，不做高波动博弈。"],
+                            "evidence": ["[00:01] 投资哲学与策略框架"],
+                        },
+                        {
+                            "start": 371.0,
+                            "end": 975.0,
+                            "heading": "持仓标的的逻辑与估值对比",
+                            "summary": "中段逐个展开海底捞、中国食品、腾讯控股等持仓或观察标的。",
+                            "bullets": ["中国食品估值更低，资金从海底捞切换至此。", "海底捞剩余 2500 股，计划冲高卖出。"],
+                            "evidence": ["[06:11] 持仓标的的逻辑与估值对比"],
+                        },
+                        {
+                            "start": 975.0,
+                            "end": 1741.0,
+                            "heading": "风险控制、业绩回顾与后续计划",
+                            "summary": "尾段总结今年收益、市场风险和接下来的调仓思路。",
+                            "bullets": ["今年组合跑赢恒指和恒科。", "后续以低频调仓为主，不追高。"],
+                            "evidence": ["[16:15] 风险控制、业绩回顾与后续计划"],
+                        },
+                    ],
+                    finance_matrix=[
+                        {
+                            "name": "海底捞",
+                            "sector": "消费/餐饮",
+                            "thesis": "估值 19 倍 PE，业绩反身性强，但估值已不便宜。",
+                            "position_change": "剩余 2500 股，计划若再涨则卖出。",
+                            "risk": "估值溢价风险，业绩反身性。",
+                        },
+                        {
+                            "name": "中国食品",
+                            "sector": "消费/饮料",
+                            "thesis": "估值 10 倍 PE 左右，现金充足，产品矩阵稳定。",
+                            "position_change": "资金从海底捞切换至此，持仓中。",
+                            "risk": "节奏偏慢，但估值优势明显。",
+                        },
+                    ],
+                    finance_snapshot={
+                        "market_view": ["市场赚钱效应一般，但港股结构尚可。"],
+                        "performance_review": ["今年组合跑赢恒指和恒科。"],
+                        "action_plan": ["后续以低频调仓为主，不追高。"],
+                    },
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.bilibili.com/video/BV1unw9zxEHF",
+                    platform_hint="bilibili",
+                    title="第1143日投资记录",
+                    text="市场赚钱效应一般，重点讨论海底捞和中国食品。",
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    metadata={
+                        "video_duration_seconds": 1741.0,
+                        "video_direction_estimate": {"kind": "finance_market"},
+                        "evidence_sources": ["video_platform_metadata", "video_audio_asr", "video_keyframe_ocr"],
+                        "tracks": {
+                            "has_subtitle": False,
+                            "has_transcript": True,
+                            "has_keyframes": True,
+                            "has_keyframe_ocr": True,
+                        },
+                    },
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("## 核心判断", content)
+            self.assertIn("## 时间线附录", content)
+            self.assertIn("## 标的矩阵", content)
+            self.assertIn("| 股票名称 | 板块 | 投资逻辑/估值情况 | 涨跌/持仓变动 | 预期/风险点 |", content)
+            self.assertIn("## 标的卡片", content)
+            self.assertIn("### 海底捞", content)
+            self.assertIn("## 市场判断与后续计划", content)
+            self.assertIn("## 可信度与证据", content)
+            self.assertNotIn("## 时间段速览", content)
+            self.assertNotIn("## 一句话总结", content)
+            self.assertNotIn("## 执行清单", content)
+            self.assertLess(content.index("## 核心判断"), content.index("## 市场判断与后续计划"))
+            self.assertLess(content.index("## 市场判断与后续计划"), content.index("## 标的矩阵"))
+            self.assertLess(content.index("## 标的卡片"), content.index("## 时间线附录"))
+            self.assertLess(content.index("## 时间线附录"), content.index("## 可信度与证据"))
+
+    def test_long_non_finance_video_preview_skips_finance_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = _writer(
+                ObsidianConfig(
+                    vault_path=tmp,
+                    inbox_root="Inbox/OpenClaw",
+                    topics_root="Topics",
+                    entities_root="Entities",
+                    auto_topic_whitelist=["求职职场"],
+                    auto_topic_blocklist=[],
+                    auto_entity_pages=False,
+                )
+            )
+            preview = writer.preview(
+                SummaryResult(
+                    title="面试后等待流程解析",
+                    primary_topic="面试流程",
+                    secondary_topics=[],
+                    entities=[],
+                    conclusion="视频按时间顺序解释了面试后等待 offer 的内部流转。",
+                    bullets=["面试官先写评价表", "之后还要经过用人部门内部对齐"],
+                    evidence_quotes=["面试官并不会告诉你HR发的结论"],
+                    coverage="full",
+                    confidence="high",
+                    note_tags=[],
+                    follow_up_actions=[],
+                    reader_judgment="适合保留作求职流程参考，但不需要财经矩阵那类结构。",
+                    timeline_sections=[
+                        {"start": 0.0, "end": 120.0, "heading": "等待期心理落差", "summary": "开头描述候选人在等待期的典型情绪。", "bullets": ["第 1-3 天在等面试官写评价。"], "evidence": []},
+                        {"start": 120.0, "end": 240.0, "heading": "面试评价表", "summary": "中段解释面试官如何写评价表以及为什么会拖延。", "bullets": ["面试官不写，HR 就推不动流程。"], "evidence": []},
+                        {"start": 240.0, "end": 360.0, "heading": "用人部门内部对齐", "summary": "后段解释多轮面试后如何内部对齐和定级。", "bullets": ["leader 可能会拉会讨论候选人排名。"], "evidence": []},
+                    ],
+                ),
+                EvidenceBundle(
+                    source_kind="video_url",
+                    source_url="https://www.xiaohongshu.com/explore/69afbf57000000001d027f5a",
+                    platform_hint="xiaohongshu",
+                    title="面试后等待流程解析",
+                    text="面试官并不会告诉你HR发的结论。",
+                    evidence_type="multimodal_video",
+                    coverage="full",
+                    metadata={
+                        "video_duration_seconds": 920.0,
+                        "video_direction_estimate": {"kind": "career_interview"},
+                        "evidence_sources": ["video_audio_asr", "video_keyframe_ocr"],
+                    },
+                ),
+            )
+            content = str(preview["content"])
+            self.assertIn("## 核心判断", content)
+            self.assertIn("## 内容主线与用途", content)
+            self.assertIn("## 适用边界与风险", content)
+            self.assertIn("## 时间线附录", content)
+            self.assertIn("## 可信度与证据", content)
+            self.assertNotIn("## 标的矩阵", content)
+            self.assertNotIn("## 标的卡片", content)
+            self.assertNotIn("## 市场判断与后续计划", content)
+            self.assertLess(content.index("## 核心判断"), content.index("## 时间线附录"))
+            self.assertLess(content.index("## 时间线附录"), content.index("## 可信度与证据"))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from .config import ObsidianConfig
 from .models import EvidenceBundle, SummaryResult
 from .note_renderer import NoteRenderEngine, build_note_materials, save_materials_file
 from .note_graph import build_structure_map, safe_name, unique_topics
-from .telegram import render_video_user_facing_text
+from .telegram import has_direct_video_note_body, render_video_note_markdown
 
 
 class ObsidianWriter:
@@ -195,7 +195,7 @@ class ObsidianWriter:
             summary.title,
         )
         if self._should_use_direct_video_body(summary, evidence, materials):
-            body = render_video_user_facing_text(summary, evidence).strip()
+            body = render_video_note_markdown(summary, evidence).strip()
             if not body:
                 return None, "video note renderer returned empty content", materials_file
             content = "\n".join(frontmatter) + body.rstrip() + "\n"
@@ -226,12 +226,7 @@ class ObsidianWriter:
             capture_status = {}
         if str(capture_status.get("kind", "normal")).strip() != "normal":
             return False
-        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
-        story_blocks = metadata.get("video_story_blocks", []) if isinstance(metadata.get("video_story_blocks"), list) else []
-        if len(story_blocks) >= 3:
-            return True
-        transcript = re.sub(r"\s+", " ", (evidence.transcript or "").strip())
-        if len(transcript) >= 400:
+        if has_direct_video_note_body(summary, evidence):
             return True
         return False
 
@@ -272,14 +267,7 @@ class ObsidianWriter:
             capture_status = context.get("capture_status", {}) if isinstance(context.get("capture_status"), dict) else {}
         if capture_status.get("kind") == "video_extract_blocked":
             return self._build_blocked_video_body(summary, evidence, capture_status)
-        text = re.sub(
-            r"(?m)^(#{2,4})\s*可直接做的下一步\s*$",
-            r"\1 贾维斯的思考",
-            text,
-        )
-        if not self._should_keep_thought_checklist(summary, evidence):
-            text = self._rewrite_thought_section_as_paragraph(text, evidence)
-        return text
+        return self._strip_legacy_template_lines(text)
 
     def _strip_debug_leaks(self, text: str) -> str:
         blocked_tokens = [
@@ -307,86 +295,37 @@ class ObsidianWriter:
         title = summary.title or evidence.title or "这条内容"
         summary_line = re.sub(r"\s+", " ", str(capture_status.get("summary", "")).strip())
         if not summary_line:
-            summary_line = "这条内容当前没拿到有效正文，继续看这版结果意义不大。"
+            summary_line = "这条内容当前拿不到正文或稳定的视频证据。"
         paragraphs = [
             f"# {title}",
             "",
-            f"{summary_line} 现在只能确认它来自平台侧受限或分享链路不可直接读取，而不是内容本身没有价值。",
+            f"{summary_line} 原因是页面或平台侧限制，当前结果不能作为内容总结使用。",
             "",
-            "如果之后能拿到正常页面、音频或画面证据，再回来看会更有意义；以目前这版结果，先别在这条上继续花时间。",
-            "",
-            "## 贾维斯的思考",
-            "",
-            "如果我是你，这条我会先放到一边，等链接能正常打开或者能拿到可读内容后再判断值不值得深挖。",
+            "如果之后能拿到正常页面、音频、字幕或画面证据，再重新处理更合适；在此之前，不建议继续基于这版结果判断内容。",
         ]
         return "\n".join(paragraphs).strip()
 
-    def _should_keep_thought_checklist(self, summary: SummaryResult, evidence: EvidenceBundle) -> bool:
-        metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
-        profile = metadata.get("content_profile", {}) if isinstance(metadata.get("content_profile"), dict) else {}
-        kind = str(profile.get("kind", "")).strip()
-        if kind in {"installation_tutorial", "skill_recommendation"}:
-            return True
-        actions = [str(item).strip() for item in summary.follow_up_actions if str(item).strip()]
-        action_corpus = "\n".join(actions).lower()
-        return any(token in action_corpus for token in ["/install-skill", "执行命令", "验证", "安装", "部署", "运行"])
-
-    def _rewrite_thought_section_as_paragraph(self, text: str, evidence: EvidenceBundle) -> str:
-        lines = text.splitlines()
-        result: List[str] = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            heading_match = re.match(r"^(#{2,4})\s*(贾维斯的思考)\s*$", line.strip())
-            if not heading_match:
-                result.append(line)
-                i += 1
+    def _strip_legacy_template_lines(self, text: str) -> str:
+        legacy_headings = {
+            "一句话总结",
+            "文字脑图",
+            "对你有什么用",
+            "贾维斯判断",
+            "贾维斯的思考",
+            "可直接做的下一步",
+            "行动清单",
+        }
+        banned_phrases = ["贾维斯", "如果我是你", "大厂程序员视角"]
+        cleaned_lines: List[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            heading_match = re.match(r"^#{2,4}\s*(.+?)\s*$", stripped)
+            if heading_match and heading_match.group(1) in legacy_headings:
                 continue
-            level = heading_match.group(1)
-            result.append(f"{level} 贾维斯的思考")
-            i += 1
-            while i < len(lines) and not lines[i].strip():
-                i += 1
-            section_lines: List[str] = []
-            while i < len(lines) and not re.match(r"^#{1,6}\s+", lines[i].strip()):
-                section_lines.append(lines[i])
-                i += 1
-            actions: List[str] = []
-            for raw in section_lines:
-                stripped = raw.strip()
-                if not stripped:
-                    continue
-                bullet_match = re.match(r"^(?:[-*]|\d+\.)\s+(.+)$", stripped)
-                if bullet_match:
-                    actions.append(bullet_match.group(1).strip().rstrip("。；;"))
-                else:
-                    actions.append(stripped.rstrip("。；;"))
-            actions = [item for item in actions if item]
-            if actions:
-                result.append("")
-                result.append(self._jarvis_thought_paragraph(actions, evidence))
-            continue
-        return "\n".join(result).strip()
-
-    def _jarvis_thought_paragraph(self, actions: List[str], evidence: EvidenceBundle) -> str:
-        picked = [self._normalize_jarvis_action(item) for item in actions[:3] if self._normalize_jarvis_action(item)]
-        if not picked:
-            return "如果我是你，我会先把这条内容留在待看清单里，等真正需要的时候再回来看。"
-        if len(picked) == 1:
-            if picked[0].startswith("如果我是你"):
-                return picked[0].rstrip("。；;") + "。"
-            return f"如果我是你，我会先{picked[0]}，然后再决定要不要继续往下投入。"
-        if len(picked) == 2:
-            return f"如果我是你，我会先{picked[0]}，再{picked[1]}，这样基本就能判断这条内容值不值得继续跟。"
-        return f"如果我是你，我会先{picked[0]}，再{picked[1]}，最后{picked[2]}；走到这一步，通常就知道这条内容该继续深挖还是先放着。"
-
-    def _normalize_jarvis_action(self, value: str) -> str:
-        text = re.sub(r"\s+", " ", str(value).strip()).strip("。；;")
-        if not text:
-            return ""
-        text = re.sub(r"^如果我是你[，,]?(?:这条我)?会先", "", text).strip(" ，,")
-        text = re.sub(r"^我会先", "", text).strip(" ，,")
-        return text
+            if any(phrase in stripped for phrase in banned_phrases):
+                continue
+            cleaned_lines.append(line.rstrip())
+        return "\n".join(cleaned_lines).strip()
 
     def _keyword_root_rel(self) -> Path:
         return Path(self.config.topics_root) / "_Keywords"
@@ -475,10 +414,7 @@ class ObsidianWriter:
             *summary.secondary_topics,
             *summary.entities,
             *summary.note_tags,
-            summary.conclusion,
-            *summary.bullets,
             evidence.title or "",
-            evidence.text or "",
         ]
         if isinstance(signals, dict):
             for key in ["skills", "skill_ids", "projects", "hashtags"]:
@@ -621,26 +557,6 @@ class ObsidianWriter:
         else:
             lines.append("先看这页，通常就能判断这条内容是该继续跟，还是先留档。")
         return lines[:2]
-
-    def _build_secretary_judgment_lines(self, summary: SummaryResult) -> List[str]:
-        timing_map = {"high": "高", "medium": "中", "low": "低"}
-        effectiveness_map = {"high": "高", "medium": "中", "low": "低"}
-        recommendation_map = {
-            "must_read": "强烈推荐",
-            "recommended": "建议看",
-            "optional": "按需看",
-            "skip": "可跳过",
-        }
-        lines = [
-            "适用身份: 大厂程序员",
-            f"时效性: {timing_map.get(summary.timeliness, '中')}",
-            f"有效程度: {effectiveness_map.get(summary.effectiveness, '中')}",
-            f"推荐等级: {recommendation_map.get(summary.recommendation_level, '按需看')}",
-        ]
-        judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
-        if judgment:
-            lines.append("判断: " + judgment)
-        return lines
 
     def _build_text_mind_map(
         self,

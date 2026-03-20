@@ -76,8 +76,11 @@ def build_note_materials(
             "title": evidence.title,
             "coverage": evidence.coverage,
             "text": evidence.text,
+            "merged_text": evidence.merged_text or evidence.text,
             "transcript": evidence.transcript or "",
             "evidence_quotes": list(summary.evidence_quotes),
+            "evidence_items": [item.to_dict() for item in evidence.evidence_items],
+            "capture_manifest": evidence.capture_manifest.to_dict(),
         },
         "fragments": {
             "commands": commands,
@@ -142,12 +145,9 @@ def _build_capture_status(evidence: EvidenceBundle, warnings: List[str]) -> Dict
     if evidence.source_kind != "video_url":
         return {"kind": "normal", "summary": ""}
     metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
-    tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
+    manifest = evidence.capture_manifest.to_dict()
     warning_summary = _summarize_warnings(warnings)
-    has_any_track = any(
-        bool(tracks.get(key))
-        for key in ["has_subtitle", "has_transcript", "has_keyframes", "has_keyframe_ocr"]
-    )
+    has_any_track = any(manifest.get(key, {}).get("status") == "ok" for key in ["subtitle", "asr", "keyframes", "keyframe_ocr"])
     title = str(evidence.title or "").strip()
     if not has_any_track:
         if "页面不见了" in title or "无法浏览" in title:

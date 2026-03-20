@@ -16,7 +16,7 @@ from .extractor import EvidenceExtractor
 from .models import EvidenceBundle, IngestRequest, SummaryResult
 from .note_renderer import OpenAICompatibleNoteRenderer
 from .obsidian import ObsidianWriter
-from .processor import _build_fallback_summary
+from .processor import _build_fallback_summary, _summary_quality_details
 from .summarizer import OpenAICompatibleSummarizer
 
 
@@ -158,6 +158,15 @@ def _summary_corpus(summary: SummaryResult) -> str:
         *summary.evidence_quotes,
     ]
     return "\n".join([str(item) for item in parts if str(item).strip()])
+
+
+def _pseudo_summary_detected(summary: SummaryResult, quality: dict[str, Any]) -> bool:
+    if summary.outcome in {"partial", "refused"}:
+        return False
+    reasons = [str(item) for item in quality.get("reasons", [])]
+    if any(item in {"conclusion_too_generic", "boundary_missing"} or item.startswith("hard_facts_lt3") for item in reasons):
+        return True
+    return False
 
 
 def _required_items(expect: EvalExpectation) -> List[Tuple[str, str]]:
@@ -491,6 +500,7 @@ def _evaluate_single_case(
 
     note_preview = writer.preview(summary, evidence)
     note_content = str(note_preview.get("content", ""))
+    quality = _summary_quality_details(summary, evidence)
 
     extract_step = evaluate_extract_step(evidence, case.expect)
     signal_step = evaluate_signal_step(evidence, case.expect)
@@ -617,6 +627,8 @@ def _evaluate_single_case(
             "evidence_type": evidence.evidence_type,
             "has_signals": bool(_collect_signals_text(evidence)),
         },
+        "first_screen_hard_fact_count": int(quality.get("hard_fact_count", 0) or 0),
+        "pseudo_summary_detected": _pseudo_summary_detected(summary, quality),
     }
     if judge_result is not None:
         result["judge"] = judge_result.to_dict()
@@ -746,12 +758,13 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## 结果总览")
     lines.append("")
-    lines.append("| case_id | pass | score | root_cause | summary_mode | cost_usd |")
-    lines.append("|---|---:|---:|---|---|---:|")
+    lines.append("| case_id | pass | score | root_cause | 首屏硬信息 | 伪总结 | summary_mode | cost_usd |")
+    lines.append("|---|---:|---:|---|---:|---:|---|---:|")
     for item in report.get("results", []):
         lines.append(
             f"| {item.get('case_id','')} | {str(item.get('passed', False)).lower()} | "
             f"{item.get('overall_score', 0)} | {item.get('root_cause','')} | "
+            f"{item.get('first_screen_hard_fact_count', 0)} | {str(item.get('pseudo_summary_detected', False)).lower()} | "
             f"{item.get('summary_mode','')} | {item.get('cost', {}).get('total_cost_usd', 0)} |"
         )
     lines.append("")
@@ -766,6 +779,8 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"- root_cause: {item.get('root_cause', '')}")
         lines.append(f"- suggestion: {item.get('fix_suggestion', '')}")
+        lines.append(f"- first_screen_hard_fact_count: {item.get('first_screen_hard_fact_count', 0)}")
+        lines.append(f"- pseudo_summary_detected: {str(item.get('pseudo_summary_detected', False)).lower()}")
         missing = item.get("missing", [])
         if missing:
             lines.append("- missing:")

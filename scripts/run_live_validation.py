@@ -153,43 +153,12 @@ def _backup_and_clear_obsidian(config: AppConfig, backup_root: Path) -> dict[str
 
 def _default_samples() -> list[SampleSpec]:
     return [
-        SampleSpec("bili_1", "video_url", "B站视频 1", ["https://www.bilibili.com/video/BV1WAcQzKEW8/"]),
-        SampleSpec("bili_2", "video_url", "B站视频 2", ["https://www.bilibili.com/video/BV1bFPMzFEnd/"]),
-        SampleSpec("xhs_video_1", "video_url", "小红书视频 1", ["https://www.xiaohongshu.com/explore/699bf9a1000000001b01d4b7"]),
-        SampleSpec("xhs_video_2", "video_url", "小红书视频 2", ["https://www.xiaohongshu.com/explore/6895cd780000000025026d99"]),
-        SampleSpec("youtube_1", "video_url", "YouTube 视频 1", ["https://www.youtube.com/watch?v=c7qJzG_swUE"]),
-        SampleSpec(
-            "youtube_2",
-            "video_url",
-            "YouTube 视频 2",
-            [
-                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                "https://www.youtube.com/watch?v=jNQXAC9IVRw",
-                "https://www.youtube.com/watch?v=M7lc1UVf-VE",
-            ],
-        ),
-        SampleSpec(
-            "xhs_note_1",
-            "url",
-            "小红书图文 1",
-            ["https://www.xiaohongshu.com/explore/68e10f380000000007008c4b"],
-        ),
-        SampleSpec(
-            "xhs_note_2",
-            "url",
-            "小红书图文 2",
-            ["https://www.xiaohongshu.com/explore/69a3032400000000150305bb"],
-        ),
-        SampleSpec(
-            "xhs_note_3",
-            "url",
-            "小红书图文 3",
-            [
-                "https://www.xiaohongshu.com/explore/69aea021000000001a028a59",
-                "https://www.xiaohongshu.com/explore/69b41a4c000000002103b520",
-            ],
-        ),
-        SampleSpec("web_1", "url", "普通图文网页", ["https://docs.openclaw.ai/"]),
+        SampleSpec("bili_finance", "video_url", "B站长财经", ["https://www.bilibili.com/video/BV1bFPMzFEnd/"]),
+        SampleSpec("bili_tutorial", "video_url", "B站长教程/职场", ["https://www.bilibili.com/video/BV1ggpcevEgk/"]),
+        SampleSpec("youtube_subtitle", "video_url", "YouTube subtitle-only", ["https://www.youtube.com/watch?v=c7qJzG_swUE"]),
+        SampleSpec("xhs_blocked", "url", "小红书 blocked 图文", ["https://www.xiaohongshu.com/explore/69a3032400000000150305bb"]),
+        SampleSpec("web_doc", "url", "普通网页文档", ["https://docs.openclaw.ai/"]),
+        SampleSpec("github_repo", "url", "GitHub 项目页", ["https://github.com/VoltAgent/awesome-openclaw-skills"]),
     ]
 
 

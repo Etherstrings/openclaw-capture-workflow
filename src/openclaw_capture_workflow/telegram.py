@@ -8,6 +8,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from .models import EvidenceBundle, IngestRequest, SummaryResult
+from .video_experiment_summarizer import _dedupe_finance_row_fields, _normalize_executive_line, _normalize_finance_fact
 
 
 def _sanitize_for_telegram(text: str) -> str:
@@ -91,24 +92,24 @@ def _brief_value_line(summary: SummaryResult) -> str:
     bullets = [re.sub(r"\s+", " ", str(item).strip()) for item in summary.bullets if str(item).strip()]
     corpus = "\n".join(bullets).lower()
     if any(token in corpus for token in ["安装方法:", "关键命令:", "/install-skill"]):
-        return "对你有用: 很快就能判断要不要装，真要动手也知道先做什么。"
+        return "用途: 可以快速判断是否需要安装，以及先做哪一步。"
     if any(token in corpus for token in ["视频链接:", "关键链接:"]) and summary.coverage == "partial":
-        return "对你有用: 先粗筛值不值得回看，别急着把它当最终结论。"
+        return "用途: 可先用于粗筛，再决定是否回看原视频。"
     if any(token in corpus for token in ["视频链接:", "关键链接:"]):
-        return "对你有用: 先判断这条视频值不值得放进待看清单。"
+        return "用途: 可快速判断是否放入待看清单。"
     if any(token in corpus for token in ["项目名称:", "github地址:"]):
-        return "对你有用: 很快就能看出这个项目是该继续跟，还是先留档。"
-    return "对你有用: 先帮你把最该记住的结论和下一步拎出来。"
+        return "用途: 可快速判断项目是否值得继续跟进。"
+    return "用途: 可快速获取主线结论和后续核验方向。"
 
 
 def _recommendation_line(summary: SummaryResult) -> str:
     mapping = {
-        "must_read": "建议：强烈推荐",
-        "recommended": "建议：值得看",
-        "optional": "建议：按需看",
-        "skip": "建议：可以先跳过",
+        "must_read": "优先级：高",
+        "recommended": "优先级：中高",
+        "optional": "优先级：中",
+        "skip": "优先级：低",
     }
-    return mapping.get(summary.recommendation_level, "建议：按需看")
+    return mapping.get(summary.recommendation_level, "优先级：中")
 
 
 def _is_videoish(summary: SummaryResult, ingest: IngestRequest) -> bool:
@@ -123,82 +124,49 @@ def _is_install_like(summary: SummaryResult, ingest: IngestRequest) -> bool:
     return any(token in corpus for token in ["安装", "部署", "onboard", "gateway", "/install-skill", "配对"])
 
 
-def _what_is_it_line(ingest: IngestRequest, summary: SummaryResult) -> str:
-    url = (ingest.source_url or "").strip().lower()
-    topic = re.sub(r"\s+", " ", (summary.primary_topic or summary.title or "这条内容").strip())
-    if "docs.openclaw.ai" in url:
-        return "OpenClaw 是一个跨平台 AI 代理网关，这条是它的官方安装文档。"
-    if "github.com" in url and "/blob/" in url:
-        return f"这是一个 GitHub 文档页，主题是 {topic}。"
-    if "github.com" in url:
-        return f"这是一个 GitHub 项目/仓库，主题是 {topic}。"
-    if _is_videoish(summary, ingest):
-        return f"这是一条关于 {topic} 的视频。"
-    if _is_install_like(summary, ingest):
-        return "这是一份安装/上手文档，重点是怎么把东西跑起来。"
-    if ingest.source_kind == "pasted_text":
-        return f"这是一段整理过的文字说明，主题是 {topic}。"
-    if ingest.source_kind == "image":
-        return f"这是一组截图，核心信息围绕 {topic}。"
-    return f"这是一条关于 {topic} 的内容。"
+def _summary_key_points_block(summary: SummaryResult, limit: int = 3) -> list[str]:
+    bullets, _ = _display_bullets_for_telegram(summary, limit=limit)
+    return bullets
 
 
-def _worth_it_line(ingest: IngestRequest, summary: SummaryResult) -> str:
-    url = (ingest.source_url or "").strip().lower()
-    if "docs.openclaw.ai" in url:
-        return "值不值得看：值得。如果你准备第一次上手，直接看官方文档最省事。"
-    mapping = {
-        "must_read": "值不值得看：值得，建议优先看。",
-        "recommended": "值不值得看：值得，有空优先看。",
-        "optional": "值不值得看：按需看，取决于你现在有没有相关需求。",
-        "skip": "值不值得看：可以先跳过，除非你正好在做这件事。",
-    }
-    return mapping.get(summary.recommendation_level, "值不值得看：按需看。")
-
-
-def _why_it_matters_line(ingest: IngestRequest, summary: SummaryResult) -> str:
-    url = (ingest.source_url or "").strip().lower()
-    if "docs.openclaw.ai" in url:
-        return "为什么值得关注：它直接告诉你 OpenClaw 是什么、怎么装、怎么开始用。"
-    bullets = [re.sub(r"\s+", " ", str(item).strip()) for item in summary.bullets if str(item).strip()]
-    corpus = "\n".join(bullets).lower()
-    if any(token in corpus for token in ["安装方法:", "关键命令:", "/install-skill"]):
-        return "为什么值得关注：可以很快判断要不要装，真要动手时也知道先做什么。"
-    if _is_videoish(summary, ingest) and summary.coverage == "partial":
-        return "为什么值得关注：现在更适合先粗筛，别急着把它当最终结论。"
-    if _is_videoish(summary, ingest):
-        return "为什么值得关注：能帮你快速判断这条视频有没有继续看的价值。"
-    if any(token in corpus for token in ["项目名称:", "github地址:"]):
-        return "为什么值得关注：能很快看出这个项目值不值得继续跟。"
-    return "为什么值得关注：先把最该记住的结论和下一步拎出来了。"
-
-
-def _jarvis_intro_line() -> str:
-    return ""
-
-
-def _jarvis_brief_line(ingest: IngestRequest, summary: SummaryResult) -> str:
-    return _what_is_it_line(ingest, summary)
-
-
-def _jarvis_judgment_line(ingest: IngestRequest, summary: SummaryResult) -> str:
-    judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
+def _non_video_judgment_lines(summary: SummaryResult) -> list[str]:
+    lines: list[str] = []
+    judgment = _simplify_reader_judgment(summary)
     if judgment:
-        return judgment
-    return _worth_it_line(ingest, summary).replace("值不值得看：", "")
-
-
-def _jarvis_action_line(summary: SummaryResult) -> str:
-    if summary.follow_up_actions:
+        lines.append(judgment.rstrip("。") + "。")
+    else:
+        lines.append("当前已提炼主线信息，可按需回看原文细节。")
+    if summary.coverage == "partial":
+        lines.append("当前只覆盖到部分证据，细节最好回原文复核。")
+    elif summary.follow_up_actions:
         action = re.sub(r"\s+", " ", str(summary.follow_up_actions[0]).strip()).strip("。；;")
         if action:
-            return action
-    return ""
+            if action.startswith(("如果", "继续", "进入", "打开", "先去")):
+                lines.append(action if action.endswith("。") else action + "。")
+            else:
+                lines.append(f"如果后续要继续用这条内容，建议先{action}。")
+    deduped: list[str] = []
+    for item in lines:
+        clean = re.sub(r"\s+", " ", item.strip())
+        if not clean or clean in deduped:
+            continue
+        deduped.append(clean)
+    return deduped[:2]
 
 
-def _jarvis_key_points_block(summary: SummaryResult, limit: int = 3) -> list[str]:
-    bullets, _ = _display_bullets_for_telegram(summary, limit=limit)
-    return [f"{idx + 1}. {item}" for idx, item in enumerate(bullets)]
+def _non_video_resource_lines(summary: SummaryResult) -> list[str]:
+    _, link_lines = _display_bullets_for_telegram(summary, limit=5)
+    project_lines = _extract_priority_project_lines(summary)
+    lines: list[str] = []
+    for item in project_lines[:2]:
+        clean = re.sub(r"\s+", " ", str(item).strip())
+        if clean and clean not in lines:
+            lines.append(clean)
+    for link in link_lines[:2]:
+        clean = re.sub(r"\s+", " ", str(link).strip())
+        if clean and clean not in lines:
+            lines.append(f"链接: {clean}")
+    return lines[:3]
 
 
 def _video_story_blocks(evidence: EvidenceBundle | None) -> list[dict]:
@@ -312,24 +280,180 @@ def _render_ranked_rant_video_reply(summary: SummaryResult, evidence: EvidenceBu
     if len(chunks) < 8:
         return ""
     lines: list[str] = [
-        "这个视频在吐槽“简中互联网里最反人类的 10 种交互设计”。核心观点是：很多设计不是为了用户体验，而是产品经理为了导流、KPI 或自我感动硬塞进去的，结果把本来顺手的操作越做越恶心。",
+        "这条视频在盘点简中互联网里最常见的 10 类糟糕交互设计，核心判断是很多设计服务的是导流、KPI 或平台利益，不是用户体验。",
         "",
-        "他大致盘点的是这 10 类，倒序是：",
+        "关键信息：",
         "",
     ]
     for rank, chunk in chunks:
         title, detail = _ranked_chunk_to_title_and_detail(rank, chunk)
-        lines.append(f"第{rank}名：{title}")
-        lines.append(detail)
-        lines.append("")
+        lines.append(f"- 第{rank}名：{title}。{detail.rstrip('。')}")
     lines.extend(
         [
-            "整体风格就是高强度吐槽，结论很明确：这些设计本质上都在拿用户习惯、注意力和时间换平台利益，而不是在认真做体验。",
             "",
-            "我这次是结合视频页信息、公开音轨转写交叉整理的；评论区这轮抓取有平台限制，但光靠音轨已经足够把主线和 10 个条目核实清楚。",
+            "边界：",
+            "- 这类内容偏观点表达，条目主线可以确认，但具体语气和例子仍建议按需回看原视频。",
         ]
     )
+    evidence_note = _video_evidence_note(evidence)
+    if evidence_note:
+        lines.append(f"- {evidence_note}")
     return "\n".join(lines).strip()
+
+
+def _video_has_any_track(evidence: EvidenceBundle | None) -> bool:
+    metadata = evidence.metadata if evidence and isinstance(evidence.metadata, dict) else {}
+    tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
+    if tracks:
+        return any(bool(tracks.get(key)) for key in ["has_subtitle", "has_transcript", "has_keyframes", "has_keyframe_ocr"])
+    manifest = evidence.capture_manifest.to_dict() if evidence else {}
+    return any(manifest.get(key, {}).get("status") == "ok" for key in ["subtitle", "asr", "keyframes", "keyframe_ocr"])
+
+
+def _is_blocked_video_capture(summary: SummaryResult, evidence: EvidenceBundle | None) -> bool:
+    if not evidence or evidence.source_kind != "video_url":
+        return False
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    title = re.sub(r"\s+", " ", str(evidence.title or summary.title or "").strip())
+    warning_text = " ".join(str(item) for item in metadata.get("fetch_warnings", [])[:4]) if isinstance(metadata.get("fetch_warnings"), list) else ""
+    if any(token in title for token in ["页面不见了", "暂时无法浏览", "无法浏览"]):
+        return True
+    if "web_blocked_notice" in (metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []):
+        return True
+    return (not _video_has_any_track(evidence)) and bool(warning_text.strip())
+
+
+def _is_degraded_video_summary(summary: SummaryResult) -> bool:
+    tags = {re.sub(r"\s+", " ", str(item).strip()) for item in summary.note_tags}
+    return bool(tags & {"video_theme_only", "video_model_unavailable", "video_refused"})
+
+
+def _video_brief_key_lines(summary: SummaryResult, evidence: EvidenceBundle | None, *, limit: int = 5) -> list[str]:
+    corpus = _video_corpus(evidence, summary).lower()
+    special_patterns = ["openclaw", "world monitor", "wordmonitor", "全球实时监控", "世界地图", "自然灾害", "情报中心"]
+    detail_first_lines: list[str] = []
+    for raw in _video_detail_lines(summary, evidence):
+        clean = _clean_video_note_fact(raw, max_len=72)
+        if clean and clean not in detail_first_lines:
+            detail_first_lines.append(clean)
+        if len(detail_first_lines) >= limit:
+            break
+    if detail_first_lines and any(token in corpus for token in special_patterns):
+        return detail_first_lines[:limit]
+    lines = _core_judgment_lines(summary, evidence, limit=limit)
+    if lines:
+        return lines[:limit]
+    if detail_first_lines:
+        return detail_first_lines[:limit]
+    for section in summary.timeline_sections[:3]:
+        if not isinstance(section, dict):
+            continue
+        heading = re.sub(r"\s+", " ", str(section.get("heading", "")).strip())
+        section_summary = _clean_video_note_fact(str(section.get("summary", "")), max_len=72)
+        if heading and section_summary:
+            candidate = f"{heading}：{section_summary}"
+        else:
+            candidate = section_summary or heading
+        if candidate and candidate not in lines:
+            lines.append(candidate)
+        if len(lines) >= limit:
+            break
+    return lines[:limit]
+
+
+def _video_boundary_lines(summary: SummaryResult, evidence: EvidenceBundle | None) -> list[str]:
+    lines: list[str] = []
+    if _is_blocked_video_capture(summary, evidence):
+        lines.extend(
+            [
+                "当前拿不到正文或稳定证据，现有结果不能当内容总结使用。",
+                "原因更像页面或平台限制，不是内容已经被成功提取。",
+            ]
+        )
+    elif summary.outcome == "refused":
+        reason = re.sub(r"\s+", " ", str(summary.refusal_reason or summary.conclusion or "").strip())
+        if reason:
+            lines.append(reason)
+    elif "video_model_unavailable" in summary.note_tags:
+        lines.append("当前拿到了部分证据，但总结模型不可用，这版结果不能给出可靠细节。")
+    elif "video_theme_only" in summary.note_tags:
+        lines.append("当前只能确认主题和大致范围，细节级结论不可靠。")
+    elif summary.coverage == "partial":
+        lines.append("当前只覆盖到部分证据，适合先看主线，不适合当完整逐段总结。")
+    if summary.uncertainties:
+        for item in summary.uncertainties[:3]:
+            clean = _clean_video_note_fact(str(item), max_len=72)
+            if clean and clean not in lines:
+                lines.append(clean)
+    evidence_note = _video_evidence_note(evidence)
+    if evidence_note and evidence_note not in lines:
+        lines.append(evidence_note)
+    deduped: list[str] = []
+    for item in lines:
+        clean = re.sub(r"\s+", " ", str(item).strip())
+        if not clean or clean in deduped:
+            continue
+        deduped.append(clean)
+    if not deduped:
+        deduped.append("主线已经能确认，但细节仍建议按需回看原视频复核。")
+    return deduped[:4]
+
+
+def _render_story_paragraph(lines: list[str], *, max_items: int = 3) -> str:
+    cleaned: list[str] = []
+    for raw in lines:
+        text = _clean_video_note_fact(raw, max_len=84)
+        if not text:
+            continue
+        text = text.rstrip("。")
+        if text in cleaned:
+            continue
+        cleaned.append(text)
+        if len(cleaned) >= max_items:
+            break
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0] + "。"
+    return "；".join(cleaned) + "。"
+
+
+def _render_story_section(title: str, lines: list[str], *, max_items: int = 3) -> str:
+    paragraph = _render_story_paragraph(lines, max_items=max_items)
+    if not paragraph:
+        return ""
+    return f"{title}\n{paragraph}"
+
+
+def _render_video_summary_tech_line(
+    evidence: EvidenceBundle | None,
+    *,
+    summary_model: str | None = None,
+) -> str:
+    if evidence is None:
+        return ""
+    metadata = evidence.metadata if isinstance(evidence.metadata, dict) else {}
+    sources = metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []
+    labels: list[str] = []
+    mapping = {
+        "video_audio_asr": "语音转写",
+        "video_subtitles": "字幕",
+        "video_keyframes": "关键帧",
+        "video_keyframe_ocr": "关键帧OCR",
+        "video_platform_metadata": "平台元数据",
+    }
+    for raw in sources:
+        label = mapping.get(str(raw), "")
+        if label and label not in labels:
+            labels.append(label)
+    model_label = re.sub(r"\s+", " ", str(summary_model or "").strip())
+    if model_label and labels:
+        return f"本次总结基于{ '、'.join(labels)}与{model_label}模型生成。"
+    if labels:
+        return f"本次总结基于{ '、'.join(labels)}生成。"
+    if model_label:
+        return f"本次总结由{model_label}模型生成。"
+    return ""
 
 
 def _video_block_summary(evidence: EvidenceBundle | None, label: str) -> str:
@@ -449,34 +573,626 @@ def _video_evidence_note(evidence: EvidenceBundle | None) -> str:
         if item not in unique_parts:
             unique_parts.append(item)
     joined = "、".join(unique_parts)
-    return f"我这次是结合{joined}交叉整理的，转写仍可能有少量口语或术语误差，但整体主题和流程已经比较明确。"
+    return f"证据主要来自{joined}，转写可能仍有少量口语或术语误差。"
 
 
 def _render_video_direct_reply(
     ingest: IngestRequest,
     summary: SummaryResult,
     evidence: EvidenceBundle | None,
+    *,
+    assistant_name: str = "Milky",
+    summary_elapsed_seconds: float | None = None,
+    summary_model: str | None = None,
 ) -> str:
-    opening = _sanitize_for_telegram(_video_opening_line(summary, evidence))
-    detail_lines = [_sanitize_for_telegram(item) for item in _video_detail_lines(summary, evidence)]
-    one_line = _sanitize_for_telegram(_video_one_line_summary(summary, evidence))
-    lines: list[str] = [opening, "", "主要讲了这几件事：", ""]
-    lines.extend(detail_lines)
-    lines.extend(["", "一句话总结：", one_line])
+    opening = _sanitize_for_telegram(_video_note_opening(summary, evidence) or _video_opening_line(summary, evidence))
+    detail_lines = [_sanitize_for_telegram(item) for item in _video_brief_key_lines(summary, evidence)]
+    boundary_lines = [_sanitize_for_telegram(item) for item in _video_boundary_lines(summary, evidence)]
+    workflow = _video_block_summary(evidence, "workflow")
+    implementation = _video_block_summary(evidence, "implementation")
+    risk = _video_block_summary(evidence, "risk")
+    feedback = _video_block_summary(evidence, "viewer_feedback")
+
+    elapsed_label = ""
+    try:
+        elapsed = float(summary_elapsed_seconds or 0.0)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if elapsed > 0:
+        elapsed_label = f"{elapsed:.2f}秒"
+    intro = (
+        f"{assistant_name} 花了 {elapsed_label} 看完了视频，为你总结如下：".replace("  ", " ").replace("  ", " ").strip()
+        if elapsed_label
+        else f"{assistant_name} 已完成视频总结，为你总结如下："
+    )
+
+    # Try to render in the requested narrative style first.
+    section_blocks: list[str] = []
+    block_top = _render_story_section("🧊 关键做法", [workflow] if workflow else detail_lines[:2], max_items=3)
+    block_mid = _render_story_section("💡 关键思路", [implementation] if implementation else detail_lines[2:5], max_items=3)
+    block_risk = _render_story_section("🔥 边界与风险", [risk] if risk else boundary_lines, max_items=3)
+    if block_top:
+        section_blocks.append(block_top)
+    if block_mid:
+        section_blocks.append(block_mid)
+    if block_risk:
+        section_blocks.append(block_risk)
+    if feedback:
+        feedback_block = _render_story_section("🗣️ 观众反馈", [feedback], max_items=2)
+        if feedback_block:
+            section_blocks.append(feedback_block)
+
+    tech_line = _render_video_summary_tech_line(evidence, summary_model=summary_model)
+    lines: list[str] = [intro, opening]
+    if section_blocks:
+        lines.extend(section_blocks)
+    else:
+        if detail_lines:
+            lines.append(_render_story_section("🧊 关键做法", detail_lines, max_items=4))
+        if boundary_lines:
+            lines.append(_render_story_section("🔥 边界与风险", boundary_lines, max_items=3))
+    if tech_line:
+        lines.append(tech_line)
+    lines.append(f"记得随时呼叫{assistant_name}哦！")
+    return "\n\n".join([item for item in lines if str(item).strip()])
+
+
+def _render_refusal_text(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+    lines = [summary.title or "视频内容不可总结", "", summary.refusal_reason or summary.conclusion or "当前没有足够证据支撑内容总结。"]
+    if summary.uncertainties:
+        lines.extend(["", "证据缺口："])
+        for item in summary.uncertainties[:4]:
+            text = re.sub(r"\s+", " ", str(item).strip())
+            if text:
+                lines.append(f"- {text}")
+    if summary.evidence_basis:
+        lines.extend(["", "当前证据："])
+        for item in summary.evidence_basis[:4]:
+            lines.append(f"- {item}")
+    source_url = (evidence.source_url if evidence else "") or ""
+    if source_url:
+        lines.extend(["", source_url])
     return "\n".join(lines)
 
 
-def render_video_user_facing_text(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+def _render_timeline_sections(summary: SummaryResult) -> str:
+    lines: list[str] = [summary.title]
+    if summary.conclusion:
+        lines.extend(["", summary.conclusion])
+    if summary.timeline_sections:
+        lines.extend(["", "时间线："])
+        for section in summary.timeline_sections[:6]:
+            if not isinstance(section, dict):
+                continue
+            start = section.get("start")
+            end = section.get("end")
+            heading = re.sub(r"\s+", " ", str(section.get("heading", "")).strip())
+            section_summary = re.sub(r"\s+", " ", str(section.get("summary", "")).strip())
+            label = heading or "时间段"
+            time_label = ""
+            if isinstance(start, (int, float)):
+                time_label = f"[{int(start // 60):02d}:{int(start % 60):02d}] "
+            if isinstance(end, (int, float)) and isinstance(start, (int, float)):
+                time_label = f"[{int(start // 60):02d}:{int(start % 60):02d}-{int(end // 60):02d}:{int(end % 60):02d}] "
+            if section_summary:
+                lines.append(f"{time_label}{label}: {section_summary}")
+            elif label:
+                lines.append(f"{time_label}{label}")
+    elif summary.bullets:
+        lines.extend(["", "主要内容："])
+        for item in summary.bullets[:5]:
+            text = re.sub(r"\s+", " ", str(item).strip())
+            if text:
+                lines.append(f"- {text}")
+    if summary.uncertainties:
+        lines.extend(["", "局限："])
+        for item in summary.uncertainties[:3]:
+            text = re.sub(r"\s+", " ", str(item).strip())
+            if text:
+                lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
+def _video_duration_seconds(evidence: EvidenceBundle | None) -> float:
+    metadata = evidence.metadata if evidence and isinstance(evidence.metadata, dict) else {}
+    for key in ["video_duration_seconds", "bilibili_duration_seconds"]:
+        try:
+            value = float(metadata.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _format_time_range_markdown(start: object, end: object) -> str:
+    if not isinstance(start, (int, float)):
+        return ""
+    start_label = f"{int(start // 60):02d}:{int(start % 60):02d}"
+    if isinstance(end, (int, float)):
+        end_label = f"{int(end // 60):02d}:{int(end % 60):02d}"
+        return f"{start_label}-{end_label}"
+    return start_label
+
+
+def _clean_video_note_fact(value: str, *, max_len: int = 88) -> str:
+    text = re.sub(r"^\d+\.\s*", "", re.sub(r"\s+", " ", str(value or "").strip())).strip("。；;")
+    if not text:
+        return ""
+    if text.startswith(("视频链接:", "关键链接:", "GitHub地址:", "仓库地址:", "文档链接:")):
+        return ""
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        return ""
+    if any(token in lowered for token in ["spm_id_from", "search-card", "vd_source"]):
+        return ""
+    if re.fullmatch(r"[0-9a-z._?&=:/+-]{12,}", lowered):
+        return ""
+    sentences = [item.strip("，,：:；;。 ") for item in re.split(r"[。；;\n]+", text) if item.strip("，,：:；;。 ")]
+    if sentences:
+        text = sentences[0]
+    if len(text) > max_len:
+        clauses = [item.strip("，,：:；;。 ") for item in re.split(r"[，,]", text) if item.strip("，,：:；;。 ")]
+        kept: list[str] = []
+        for item in clauses:
+            if len(item) < 4:
+                continue
+            kept.append(item)
+            if len("，".join(kept)) >= max_len - 8 or len(kept) >= 2:
+                break
+        if kept:
+            text = "，".join(kept)
+    if len(text) > max_len:
+        text = text[:max_len].rstrip("，,：:；; ") + "..."
+    return text
+
+
+def _normalize_finance_rows_for_display(summary: SummaryResult) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for raw in summary.finance_matrix[:10]:
+        if not isinstance(raw, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(raw.get("name", "")).strip())
+        if not name:
+            continue
+        row = _dedupe_finance_row_fields(
+            {
+                "name": name,
+                "sector": _normalize_executive_line(raw.get("sector", ""), max_len=24),
+                "thesis": _normalize_finance_fact(raw.get("thesis", ""), kind="thesis", entity_name=name, max_len=56),
+                "position_change": _normalize_finance_fact(raw.get("position_change", ""), kind="position_change", entity_name=name, max_len=48),
+                "risk": _normalize_finance_fact(raw.get("risk", ""), kind="risk", entity_name=name, max_len=48),
+            }
+        )
+        if any(row[field] for field in ["thesis", "position_change", "risk"]):
+            rows.append(row)
+    return rows
+
+
+def _normalize_finance_snapshot_for_display(summary: SummaryResult) -> dict[str, list[str]]:
+    snapshot = summary.finance_snapshot if isinstance(summary.finance_snapshot, dict) else {}
+    normalized: dict[str, list[str]] = {}
+    for key in ["market_view", "performance_review", "action_plan"]:
+        values = snapshot.get(key, [])
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        cleaned: list[str] = []
+        for item in values:
+            line = _normalize_executive_line(item, max_len=72)
+            if not line or line in cleaned:
+                continue
+            cleaned.append(line)
+            if len(cleaned) >= 4:
+                break
+        if cleaned:
+            normalized[key] = cleaned
+    return normalized
+
+
+def _strip_video_note_label_prefix(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip()).strip("。；;")
+    if not text:
+        return ""
+    return re.sub(r"^[^：:]{1,10}[：:]\s*", "", text).strip()
+
+
+def _executive_bullet_lines(summary: SummaryResult, *, limit: int = 5) -> list[str]:
+    lines: list[str] = []
+    for raw in summary.bullets:
+        clean = _clean_video_note_fact(str(raw))
+        if not clean or clean in lines:
+            continue
+        lines.append(clean)
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _simplify_reader_judgment(summary: SummaryResult) -> str:
+    judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
+    if not judgment:
+        return ""
+    replacements = {
+        "从大厂程序员视角看，这条内容更适合用来快速筛选是否值得后续回看。": "更适合先粗筛，再决定是否值得回看。",
+        "从大厂程序员视角看，这条内容有信息价值，但是否深入跟进取决于当前任务相关性。": "适合作为背景资料留档，是否继续深挖取决于当前任务。",
+        "从大厂程序员视角看，这条内容偏实用，适合直接留作后续操作参考。": "偏实用，适合直接留作后续参考。",
+        "更适合先看提炼结果，再决定是否需要回看原视频。": "更适合先看提炼结果，再决定是否需要回看原视频。",
+        "偏实用，适合作为后续操作时的参考。": "偏实用，适合作为后续操作时的参考。",
+        "有信息价值，是否继续深入取决于当前任务相关性。": "有信息价值，是否继续深入取决于当前任务相关性。",
+    }
+    return replacements.get(judgment, judgment)
+
+
+def _finance_derived_core_lines(summary: SummaryResult) -> list[str]:
+    lines: list[str] = []
+    snapshot = _normalize_finance_snapshot_for_display(summary)
+    rows = _normalize_finance_rows_for_display(summary)
+    market_view = snapshot.get("market_view", []) if isinstance(snapshot.get("market_view", []), list) else []
+    performance_review = snapshot.get("performance_review", []) if isinstance(snapshot.get("performance_review", []), list) else []
+    action_plan = snapshot.get("action_plan", []) if isinstance(snapshot.get("action_plan", []), list) else []
+    if market_view:
+        lines.append(f"市场判断：{_clean_video_note_fact(str(market_view[0]), max_len=72)}")
+    if performance_review:
+        lines.append(f"组合表现：{_clean_video_note_fact(str(performance_review[0]), max_len=72)}")
+    row_phrases: list[str] = []
+    for row in rows[:2]:
+        name = re.sub(r"\s+", " ", str(row.get("name", "")).strip())
+        thesis = _clean_video_note_fact(str(row.get("thesis", "")), max_len=52)
+        position_change = _clean_video_note_fact(str(row.get("position_change", "")), max_len=52)
+        pieces = [item for item in [thesis, position_change] if item]
+        if name and pieces:
+            row_phrases.append(f"{name}={ '，'.join(pieces[:2]) }")
+    if row_phrases:
+        lines.append(f"标的取舍：{'；'.join(row_phrases)}")
+    if action_plan:
+        plan_lines = [_clean_video_note_fact(str(item), max_len=52) for item in action_plan[:2]]
+        plan_lines = [item for item in plan_lines if item]
+        if plan_lines:
+            lines.append(f"后续计划：{'；'.join(plan_lines)}")
+    return [item for item in lines if item][:5]
+
+
+def _core_judgment_lines(summary: SummaryResult, evidence: EvidenceBundle | None, *, limit: int = 5) -> list[str]:
+    if _is_finance_video(summary, evidence):
+        finance_lines = _finance_derived_core_lines(summary)
+        if finance_lines:
+            return finance_lines[:limit]
+    lines = _executive_bullet_lines(summary, limit=limit)
+    if lines:
+        return lines[:limit]
+    return []
+
+
+def has_direct_video_note_body(summary: SummaryResult, evidence: EvidenceBundle | None) -> bool:
+    if not evidence or evidence.source_kind != "video_url":
+        return False
+    if summary.outcome == "refused" or _is_degraded_video_summary(summary):
+        return True
+    core_lines = _core_judgment_lines(summary, evidence, limit=3)
+    if _is_finance_video(summary, evidence):
+        return bool(summary.finance_matrix or summary.finance_snapshot or core_lines)
+    return len(core_lines) >= 2
+
+
+def _is_finance_video(summary: SummaryResult, evidence: EvidenceBundle | None) -> bool:
+    if summary.finance_matrix:
+        return True
+    metadata = evidence.metadata if evidence and isinstance(evidence.metadata, dict) else {}
+    estimate = metadata.get("video_direction_estimate", {})
+    if isinstance(estimate, dict) and str(estimate.get("kind", "")).strip() == "finance_market":
+        return True
+    corpus = _video_corpus(evidence, summary)
+    return any(token in corpus for token in ["股票", "持仓", "估值", "港股", "指数", "买入", "卖出"])
+
+
+def _is_long_video_note_candidate(summary: SummaryResult, evidence: EvidenceBundle | None) -> bool:
+    if summary.finance_matrix:
+        return True
+    duration_seconds = _video_duration_seconds(evidence)
+    if duration_seconds >= 600 and summary.timeline_sections:
+        return True
+    return len(summary.timeline_sections) >= 3
+
+
+def _escape_markdown_table_cell(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).replace("|", "｜")
+
+
+def _video_note_opening(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+    opening = re.sub(r"\s+", " ", _video_opening_line(summary, evidence).strip())
+    judgment = re.sub(r"\s+", " ", str(summary.reader_judgment or "").strip())
+    conclusion = re.sub(r"\s+", " ", str(summary.conclusion or "").strip())
+    if any(token in conclusion for token in ["已按时间段整理出视频主线", "视频按时间顺序讲了", "视频按时间顺序解释了", "可先用于快速筛选"]):
+        conclusion = ""
+    if any(token in opening for token in ["已按时间段整理出视频主线", "视频按时间顺序讲了", "视频按时间顺序解释了"]):
+        opening = ""
+    if not opening:
+        core_lines = _core_judgment_lines(summary, evidence, limit=2)
+        opening_bits = [_strip_video_note_label_prefix(item) for item in core_lines if _strip_video_note_label_prefix(item)]
+        if opening_bits:
+            opening = "核心在于：" + "；".join(opening_bits[:2])
+    pieces: list[str] = []
+    for item in [opening, judgment, conclusion]:
+        text = item.strip()
+        if not text:
+            continue
+        if text in pieces:
+            continue
+        pieces.append(text if text.endswith("。") else text + "。")
+        if len(pieces) >= 2:
+            break
+    return " ".join(pieces).strip()
+
+
+def _render_core_judgments_markdown(summary: SummaryResult, evidence: EvidenceBundle | None) -> list[str]:
+    lines = _core_judgment_lines(summary, evidence, limit=5)
+    if not lines:
+        return []
+    rendered: list[str] = ["## 核心判断", ""]
+    for item in lines:
+        rendered.append(f"- {item}")
+    rendered.append("")
+    return rendered
+
+
+def _render_non_finance_value_markdown(summary: SummaryResult) -> list[str]:
+    lines: list[str] = ["## 内容主线与用途", ""]
+    judgment = _simplify_reader_judgment(summary)
+    if judgment:
+        lines.append(f"- {judgment}")
+    lines.append(f"- {_recommendation_line(summary)}")
+    if summary.follow_up_actions:
+        action = _clean_video_note_fact(str(summary.follow_up_actions[0]), max_len=68)
+        if action:
+            lines.append(f"- 后续核验：{action}")
+    if len(lines) <= 2:
+        lines.append("- 适合作为后续回看或留档时的快速摘要入口。")
+    lines.append("")
+    return lines
+
+
+def _render_non_finance_boundary_markdown(summary: SummaryResult) -> list[str]:
+    lines: list[str] = ["## 适用边界与风险", ""]
+    if summary.uncertainties:
+        for item in summary.uncertainties[:3]:
+            clean = _clean_video_note_fact(str(item), max_len=68)
+            if clean:
+                lines.append(f"- {clean}")
+    elif summary.coverage == "partial":
+        lines.append("- 当前只能确认主线和部分细节，不适合当成完整逐句版。")
+    else:
+        lines.append("- 主线已经够清楚，但细节仍建议按需回看原视频复核。")
+    if summary.follow_up_actions:
+        action = _clean_video_note_fact(str(summary.follow_up_actions[0]), max_len=68)
+        if action:
+            lines.append(f"- 继续确认：{action}")
+    lines.append("")
+    return lines
+
+
+def _render_timeline_sections_markdown(summary: SummaryResult) -> list[str]:
+    lines: list[str] = ["## 时间线附录", ""]
+    for section in summary.timeline_sections[:5]:
+        if not isinstance(section, dict):
+            continue
+        heading = re.sub(r"\s+", " ", str(section.get("heading", "")).strip()) or "时间段"
+        label = _format_time_range_markdown(section.get("start"), section.get("end"))
+        section_title = f"{label} {heading}".strip() if label else heading
+        lines.append(f"### {section_title}")
+        summary_line = re.sub(r"\s+", " ", str(section.get("summary", "")).strip())
+        bullets = section.get("bullets", [])
+        if not isinstance(bullets, list):
+            bullets = []
+        detail_lines: list[str] = []
+        if summary_line:
+            clean_summary = _clean_video_note_fact(summary_line, max_len=68)
+            if clean_summary:
+                detail_lines.append(clean_summary.rstrip("。"))
+        for raw in bullets[:3]:
+            text = _clean_video_note_fact(str(raw), max_len=56)
+            if text and text not in detail_lines:
+                detail_lines.append(text)
+            if len(detail_lines) >= 3:
+                break
+        if not detail_lines:
+            detail_lines = ["当前时间段有内容，但未提炼出稳定要点"]
+        for item in detail_lines:
+            lines.append(f"- {item}")
+        lines.append("")
+    return lines
+
+
+def _render_finance_matrix_markdown(summary: SummaryResult) -> list[str]:
+    rows = _normalize_finance_rows_for_display(summary)
+    if not rows:
+        return []
+    lines = [
+        "## 标的矩阵",
+        "",
+        "| 股票名称 | 板块 | 投资逻辑/估值情况 | 涨跌/持仓变动 | 预期/风险点 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _escape_markdown_table_cell(str(row.get("name", ""))),
+                    _escape_markdown_table_cell(str(row.get("sector", ""))),
+                    _escape_markdown_table_cell(str(row.get("thesis", ""))),
+                    _escape_markdown_table_cell(str(row.get("position_change", ""))),
+                    _escape_markdown_table_cell(str(row.get("risk", ""))),
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_finance_cards_markdown(summary: SummaryResult) -> list[str]:
+    rows = _normalize_finance_rows_for_display(summary)
+    if not rows:
+        return []
+    lines = ["## 标的卡片", ""]
+    for row in rows:
+        name = re.sub(r"\s+", " ", str(row.get("name", "")).strip())
+        if not name:
+            continue
+        lines.append(f"### {name}")
+        mapping = [
+            ("板块", "sector"),
+            ("投资逻辑/估值情况", "thesis"),
+            ("涨跌/持仓变动", "position_change"),
+            ("预期/风险点", "risk"),
+        ]
+        for label, key in mapping:
+            value = re.sub(r"\s+", " ", str(row.get(key, "")).strip())
+            if value:
+                lines.append(f"- {label}：{value}")
+        lines.append("")
+    return lines
+
+
+def _render_finance_snapshot_markdown(summary: SummaryResult) -> list[str]:
+    snapshot = _normalize_finance_snapshot_for_display(summary)
+    if not snapshot:
+        return []
+    lines = ["## 市场判断与后续计划", ""]
+    for label, key in [("市场判断", "market_view"), ("业绩回顾", "performance_review"), ("后续计划", "action_plan")]:
+        values = snapshot.get(key, [])
+        cleaned = [re.sub(r"\s+", " ", str(item).strip()).strip("。；;") for item in values if str(item).strip()]
+        if not cleaned:
+            continue
+        lines.append(f"### {label}")
+        for item in cleaned[:4]:
+            lines.append(f"- {item}")
+        lines.append("")
+    return lines
+
+
+def _render_reliability_markdown(summary: SummaryResult, evidence: EvidenceBundle | None) -> list[str]:
+    metadata = evidence.metadata if evidence and isinstance(evidence.metadata, dict) else {}
+    tracks = metadata.get("tracks", {}) if isinstance(metadata.get("tracks"), dict) else {}
+    source_labels = {
+        "user_raw_text": "用户提示",
+        "video_platform_metadata": "平台元数据",
+        "video_audio_asr": "音频转写",
+        "video_subtitles": "字幕轨",
+        "video_keyframes": "关键帧",
+        "video_keyframe_ocr": "关键帧 OCR",
+        "bilibili_mcp_transcript": "Bilibili MCP 转写",
+        "xiaohongshu_mcp_transcript": "小红书 MCP 转写",
+    }
+    raw_sources = metadata.get("evidence_sources", []) if isinstance(metadata.get("evidence_sources"), list) else []
+    sources: list[str] = []
+    for item in raw_sources:
+        text = source_labels.get(str(item), str(item))
+        if text and text not in sources:
+            sources.append(text)
+    lines = ["## 可信度与证据", ""]
+    lines.append(f"- 覆盖度：{summary.coverage or 'unknown'}；置信度：{summary.confidence or 'unknown'}")
+    if sources:
+        lines.append(f"- 证据来源：{' / '.join(sources[:6])}")
+    if tracks:
+        lines.append(
+            "- 证据轨道：字幕={subtitle}，转写={transcript}，关键帧={keyframes}，OCR={ocr}".format(
+                subtitle="有" if tracks.get("has_subtitle") else "无",
+                transcript="有" if tracks.get("has_transcript") else "无",
+                keyframes="有" if tracks.get("has_keyframes") else "无",
+                ocr="有" if tracks.get("has_keyframe_ocr") else "无",
+            )
+        )
+    if evidence and evidence.source_url:
+        lines.append(f"- 来源链接：{evidence.source_url}")
+    if summary.uncertainties:
+        for item in summary.uncertainties[:4]:
+            text = re.sub(r"\s+", " ", str(item).strip())
+            if text:
+                lines.append(f"- 局限：{text}")
+    elif summary.coverage == "full":
+        lines.append("- 当前没有明显证据缺口，但细节仍建议在回看原视频时复核。")
+    return lines
+
+
+def _render_video_brief_markdown(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+    title = re.sub(r"\s+", " ", str(summary.title or evidence.title if evidence else "").strip()) or "视频简报"
+    lines: list[str] = [f"# {title}", ""]
+    opening = _video_note_opening(summary, evidence) or _video_opening_line(summary, evidence)
+    if opening:
+        lines.extend([opening, ""])
+    key_lines = _video_brief_key_lines(summary, evidence)
+    if key_lines:
+        lines.extend(["## 关键信息", ""])
+        for item in key_lines:
+            lines.append(f"- {item}")
+        lines.append("")
+    boundary_lines = _video_boundary_lines(summary, evidence)
+    if boundary_lines:
+        lines.extend(["## 边界与证据", ""])
+        for item in boundary_lines:
+            lines.append(f"- {item}")
+    return "\n".join(lines).strip()
+
+
+def render_video_note_markdown(summary: SummaryResult, evidence: EvidenceBundle | None) -> str:
+    if summary.outcome == "refused":
+        return _render_refusal_text(summary, evidence)
+    if _is_blocked_video_capture(summary, evidence) or _is_degraded_video_summary(summary) or not _is_long_video_note_candidate(summary, evidence):
+        return _render_video_brief_markdown(summary, evidence)
+    lines: list[str] = [f"# {summary.title}", ""]
+    opening = _video_note_opening(summary, evidence)
+    if opening:
+        lines.extend([opening, ""])
+    core_lines = _render_core_judgments_markdown(summary, evidence)
+    if core_lines:
+        lines.extend(core_lines)
+    if _is_finance_video(summary, evidence):
+        snapshot_lines = _render_finance_snapshot_markdown(summary)
+        if snapshot_lines:
+            lines.extend(snapshot_lines)
+        matrix_lines = _render_finance_matrix_markdown(summary)
+        if matrix_lines:
+            lines.extend(matrix_lines)
+        card_lines = _render_finance_cards_markdown(summary)
+        if card_lines:
+            lines.extend(card_lines)
+    else:
+        lines.extend(_render_non_finance_value_markdown(summary))
+        lines.extend(_render_non_finance_boundary_markdown(summary))
+    lines.extend(_render_timeline_sections_markdown(summary))
+    lines.extend(_render_reliability_markdown(summary, evidence))
+    return "\n".join(lines).strip()
+
+
+def render_video_user_facing_text(
+    summary: SummaryResult,
+    evidence: EvidenceBundle | None,
+    *,
+    assistant_name: str = "Milky",
+    summary_elapsed_seconds: float | None = None,
+    summary_model: str | None = None,
+) -> str:
+    if summary.outcome == "refused":
+        return _render_refusal_text(summary, evidence)
     return _render_ranked_rant_video_reply(summary, evidence) or _render_video_direct_reply(
         IngestRequest(chat_id="", reply_to_message_id=None, request_id="", source_kind="video_url"),
         summary,
         evidence,
+        assistant_name=assistant_name,
+        summary_elapsed_seconds=summary_elapsed_seconds,
+        summary_model=summary_model,
     )
 
 
 class TelegramNotifier:
     def __init__(self, bot_token: str) -> None:
         self.bot_token = bot_token
+
+    def build_refusal_message(self, summary: SummaryResult, evidence: EvidenceBundle | None = None) -> str:
+        return _sanitize_for_telegram(_render_refusal_text(summary, evidence))
 
     def _completion_line(self, summary_model: str | None, summary_elapsed_seconds: float | None) -> str:
         label = re.sub(r"\s+", " ", str(summary_model or "").strip())
@@ -503,31 +1219,35 @@ class TelegramNotifier:
         summary_model: str | None = None,
         summary_elapsed_seconds: float | None = None,
     ) -> dict[str, str]:
-        if _is_videoish(summary, ingest):
-            text = render_video_user_facing_text(summary, evidence)
+        if summary.outcome == "refused":
+            text = self.build_refusal_message(summary, evidence)
+        elif _is_videoish(summary, ingest):
+            text = render_video_user_facing_text(
+                summary,
+                evidence,
+                assistant_name="Milky",
+                summary_elapsed_seconds=summary_elapsed_seconds,
+                summary_model=summary_model,
+            )
         else:
             safe_note_path = _sanitize_for_telegram(note_path)
-            bullets, link_lines = _display_bullets_for_telegram(summary, limit=5)
             safe_title = _sanitize_for_telegram(summary.title)
-            project_lines = [_sanitize_for_telegram(item) for item in _extract_priority_project_lines(summary)]
             conclusion_line = _sanitize_for_telegram(re.sub(r"\s+", " ", str(summary.conclusion or "").strip()))
-            key_points = [_sanitize_for_telegram(item) for item in _jarvis_key_points_block(summary, limit=5)]
+            key_points = [_sanitize_for_telegram(item) for item in _summary_key_points_block(summary, limit=5)]
+            judgment_lines = [_sanitize_for_telegram(item) for item in _non_video_judgment_lines(summary)]
+            resource_lines = [_sanitize_for_telegram(item) for item in _non_video_resource_lines(summary)]
             lines: list[str] = [safe_title]
             if conclusion_line:
                 lines.extend(["", conclusion_line])
             if key_points:
-                lines.extend(["", "主要内容：", *key_points])
-            if summary.follow_up_actions:
-                lines.append("")
-                lines.append("下一步：")
-                for idx, item in enumerate(summary.follow_up_actions[:3], start=1):
-                    clean = _sanitize_for_telegram(re.sub(r"\s+", " ", str(item).strip()).strip("。；;"))
-                    if clean:
-                        lines.append(f"{idx}. {clean}")
-            if project_lines:
-                lines.extend(["", *project_lines[:2]])
-            if link_lines:
-                lines.extend(["", *[_sanitize_for_telegram(item) for item in link_lines[:2]]])
+                lines.extend(["", "关键信息："])
+                lines.extend([f"- {item}" for item in key_points])
+            if judgment_lines:
+                lines.extend(["", "判断："])
+                lines.extend([f"- {item}" for item in judgment_lines])
+            if resource_lines:
+                lines.extend(["", "资料："])
+                lines.extend([f"- {item}" for item in resource_lines])
             lines.extend(["", f"归档：{safe_note_path}", f"打开：{open_url}"])
             text = "\n".join(lines)
             if len(text) > 3500:
@@ -535,13 +1255,14 @@ class TelegramNotifier:
                 if conclusion_line:
                     compact_lines.extend(["", _sanitize_for_telegram(_one_line_summary(summary.conclusion, limit=160))])
                 if key_points:
-                    compact_lines.extend(["", "主要内容：", *key_points[:3]])
-                if summary.follow_up_actions:
-                    compact_lines.extend(["", "下一步："])
-                    for idx, item in enumerate(summary.follow_up_actions[:2], start=1):
-                        clean = _sanitize_for_telegram(re.sub(r"\s+", " ", str(item).strip()).strip("。；;"))
-                        if clean:
-                            compact_lines.append(f"{idx}. {clean}")
+                    compact_lines.extend(["", "关键信息："])
+                    compact_lines.extend([f"- {item}" for item in key_points[:3]])
+                if judgment_lines:
+                    compact_lines.extend(["", "判断："])
+                    compact_lines.extend([f"- {item}" for item in judgment_lines[:1]])
+                if resource_lines:
+                    compact_lines.extend(["", "资料："])
+                    compact_lines.extend([f"- {item}" for item in resource_lines[:2]])
                 compact_lines.extend(["", f"归档：{safe_note_path}", f"打开：{open_url}"])
                 text = "\n".join(compact_lines)
         completion_line = _sanitize_for_telegram(self._completion_line(summary_model, summary_elapsed_seconds))

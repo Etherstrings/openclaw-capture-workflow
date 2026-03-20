@@ -4,8 +4,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from openclaw_capture_workflow.content_profile import infer_content_profile
 from openclaw_capture_workflow.models import EvidenceBundle, SummaryResult
-from openclaw_capture_workflow.summarizer import PROMPT, _extract_explicit_video_outline, _validate_and_normalize_summary
+from openclaw_capture_workflow.summarizer import (
+    PROMPT,
+    _extract_explicit_video_outline,
+    _signal_priority_bullets,
+    _validate_and_normalize_summary,
+)
 
 
 class SummarizerPostprocessTest(unittest.TestCase):
@@ -199,6 +205,102 @@ class SummarizerPostprocessTest(unittest.TestCase):
         self.assertEqual(len(normalized.bullets), 3)
         self.assertFalse(any("评论区" in item or "观众" in item for item in normalized.bullets))
 
+    def test_full_interview_video_keeps_on_topic_bullets(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1ggpcevEgk",
+            platform_hint="bilibili",
+            title="求职面试中，最常见的12个问题",
+            text="问题一 请做自我介绍\n问题二 你的业余爱好是什么\n问题三 谈谈你的缺点",
+            transcript="问题一 请做自我介绍\n问题二 你的业余爱好是什么\n问题三 谈谈你的缺点\n问题四 为什么想进入我们公司",
+            evidence_type="multimodal_video",
+            coverage="full",
+            metadata={"video_duration_seconds": 453.0},
+        )
+        summary = SummaryResult(
+            title="求职面试中，最常见的12个问题",
+            primary_topic="求职面试常见问题及应对策略",
+            secondary_topics=["自我介绍", "职业规划"],
+            entities=[],
+            conclusion="该视频主要讲面试中的常见问题和对应回答策略。",
+            bullets=[
+                "问题一聚焦自我介绍，建议控制在三分钟内并紧扣岗位相关经验。",
+                "问题二强调业余爱好要体现积极性和个人特点，避免给面试官减分。",
+                "问题三说明缺点回答要切合岗位要求，避免把明显优点硬说成缺点。",
+            ],
+            evidence_quotes=[],
+            coverage="partial",
+            confidence="medium",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        joined = "\n".join(normalized.bullets)
+        self.assertIn("自我介绍", joined)
+        self.assertIn("业余爱好", joined)
+        self.assertNotIn("输入、配置和运行", joined)
+        self.assertNotIn("行情、业绩和多种数据源", joined)
+        self.assertNotIn("盲目跟单", joined)
+
+    def test_video_uses_timeline_sections_when_model_bullets_are_fragmented(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="video_url",
+            source_url="https://www.bilibili.com/video/BV1sMwEzmETo",
+            platform_hint="bilibili",
+            title="第1143日投资记录",
+            text="市场赚钱效应 当前系统性风险 宁德时代 中国食品 海底捞",
+            transcript="当前市场赚钱效应一般，但港股结构尚可。宁德时代估值偏离大，中国食品继续持有，海底捞等待波动。",
+            evidence_type="multimodal_video",
+            coverage="partial",
+            metadata={"quality_gate": {"expected_outline_count": 19, "outcome": "partial", "mode": "full"}},
+        )
+        summary = SummaryResult(
+            title="第1143日投资记录",
+            primary_topic="投资记录",
+            secondary_topics=[],
+            entities=[],
+            conclusion="视频记录了投资者当日的市场判断与持仓策略；当前已覆盖 6/19 项，可先用于快速判断，但不能当作完整版本。",
+            bullets=[
+                "1. 33.337.search-card.all.click&vd_source=f879",
+                "2. 3.7啊 ¥3.8是进了港五通之后的最低点",
+                "3. 4.5卖的你早已经回到 ¥4.6了",
+            ],
+            evidence_quotes=[],
+            coverage="partial",
+            confidence="medium",
+            note_tags=[],
+            follow_up_actions=[],
+            outcome="partial",
+            timeline_sections=[
+                {
+                    "start": 0.0,
+                    "end": 180.0,
+                    "heading": "市场赚钱效应与核心资产分析",
+                    "summary": "当前市场赚钱效应一般，港股结构尚可，但月线级别仍存在系统性风险。",
+                    "evidence": [],
+                },
+                {
+                    "start": 180.0,
+                    "end": 360.0,
+                    "heading": "个股逻辑与持仓操作",
+                    "summary": "视频重点讨论了宁德时代、中国食品和海底捞等标的的估值、持有逻辑和交易计划。",
+                    "evidence": [],
+                },
+            ],
+            uncertainties=["无", "仅覆盖 6/19 项，不能当作完整枚举总结。"],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertEqual(
+            normalized.bullets,
+            [
+                "市场赚钱效应与核心资产分析：当前市场赚钱效应一般，港股结构尚可，但月线级别仍存在系统性风险",
+                "个股逻辑与持仓操作：视频重点讨论了宁德时代、中国食品和海底捞等标的的估值、持有逻辑和交易计划",
+            ],
+        )
+        self.assertTrue(all("：" in item for item in normalized.bullets))
+        self.assertFalse(any("33.337" in item or "¥4.6" in item for item in normalized.bullets))
+        self.assertNotIn("无", normalized.uncertainties)
+
     def test_explicit_video_outline_does_not_use_summary_bullets_as_evidence(self) -> None:
         evidence = EvidenceBundle(
             source_kind="video_url",
@@ -252,7 +354,7 @@ class SummarizerPostprocessTest(unittest.TestCase):
         self.assertTrue(any("/install-skill" in item for item in normalized.follow_up_actions))
         self.assertTrue(any("安装方法" in item for item in normalized.bullets))
 
-    def test_default_secretary_judgment_fields_are_populated(self) -> None:
+    def test_default_reader_judgment_fields_are_populated(self) -> None:
         evidence = EvidenceBundle(
             source_kind="url",
             source_url="https://docs.openclaw.ai/",
@@ -280,7 +382,7 @@ class SummarizerPostprocessTest(unittest.TestCase):
         self.assertEqual(normalized.timeliness, "medium")
         self.assertEqual(normalized.effectiveness, "medium")
         self.assertEqual(normalized.recommendation_level, "optional")
-        self.assertIn("大厂程序员", normalized.reader_judgment)
+        self.assertEqual(normalized.reader_judgment, "适合直接当安装参考，但环境与验证步骤仍建议回原文核对。")
 
     def test_bullets_keep_long_github_links_and_key_terms(self) -> None:
         evidence = EvidenceBundle(
@@ -364,8 +466,37 @@ class SummarizerPostprocessTest(unittest.TestCase):
             follow_up_actions=[],
         )
         normalized = _validate_and_normalize_summary(summary, evidence)
-        self.assertTrue(normalized.bullets[0].startswith("项目名称: star23/Day1Global-Skills"))
-        self.assertIn("https://github.com/star23/Day1Global-Skills", normalized.bullets[1])
+        self.assertTrue(normalized.bullets[0].startswith("技能ID: tech-earnings-deepdive"))
+        self.assertTrue(any(item.startswith("项目名称: star23/Day1Global-Skills") for item in normalized.bullets))
+        self.assertTrue(any("https://github.com/star23/Day1Global-Skills" in item for item in normalized.bullets))
+
+    def test_installation_signal_bullets_prioritize_hard_facts_before_resources(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="url",
+            source_url="https://docs.openclaw.ai/",
+            platform_hint="docs",
+            title="OpenClaw 安装指南",
+            text="安装与配对说明",
+            evidence_type="visible_page_text",
+            coverage="full",
+            metadata={
+                "content_profile": {"kind": "installation_tutorial"},
+                "signals": {
+                    "prerequisites": ["前置条件: 先安装服务并准备可用账号。"],
+                    "commands": ["openclaw service install"],
+                    "validation_actions": ["验证动作: 完成 WhatsApp 配对后再启动网关。"],
+                    "supported_platforms": ["WhatsApp", "Telegram", "Discord", "iMessage"],
+                    "boundaries": ["适用边界: 没有完成配对前不能启动网关。"],
+                    "links": ["https://docs.openclaw.ai/"],
+                    "projects": ["openclaw/openclaw"],
+                },
+            },
+        )
+        bullets = _signal_priority_bullets(evidence, limit=5)
+        self.assertEqual(
+            [item.split(":", 1)[0] for item in bullets],
+            ["前置条件", "安装方法", "验证动作", "平台支持", "适用边界"],
+        )
 
     def test_non_github_video_link_is_not_labeled_as_github(self) -> None:
         evidence = EvidenceBundle(
@@ -424,6 +555,97 @@ class SummarizerPostprocessTest(unittest.TestCase):
         self.assertEqual(normalized.coverage, "partial")
         self.assertEqual(normalized.confidence, "medium")
         self.assertIn("证据不完整", normalized.conclusion)
+
+    def test_generic_non_video_conclusion_is_rewritten_from_hard_facts(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="url",
+            source_url="https://docs.openclaw.ai/",
+            platform_hint="docs",
+            title="OpenClaw 安装指南",
+            text="OpenClaw supports WhatsApp and Telegram. Install the service, pair WhatsApp, then start the gateway.",
+            evidence_type="visible_page_text",
+            coverage="full",
+            metadata={
+                "content_profile": {"kind": "installation_tutorial"},
+                "signals": {
+                    "commands": ["openclaw service install"],
+                    "validation_actions": ["完成 WhatsApp 配对后再启动网关。"],
+                    "supported_platforms": ["WhatsApp", "Telegram"],
+                    "boundaries": ["没有完成配对前不能启动网关。"],
+                },
+            },
+        )
+        summary = SummaryResult(
+            title="OpenClaw 安装指南",
+            primary_topic="OpenClaw",
+            secondary_topics=[],
+            entities=[],
+            conclusion="已提取核心事实。",
+            bullets=["支持多平台", "安装很简单", "适合作为参考"],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertNotIn("已提取核心事实", normalized.conclusion)
+        self.assertIn("关键动作", normalized.conclusion)
+        self.assertIn("不能启动网关", normalized.conclusion)
+
+    def test_docs_homepage_is_not_misclassified_as_full_install_tutorial(self) -> None:
+        profile = infer_content_profile(
+            "url",
+            "https://docs.openclaw.ai/",
+            "Any OS gateway for AI agents across WhatsApp, Telegram, Discord, iMessage, and more.\nOnboard and install the service\nPair WhatsApp and start the Gateway",
+            {
+                "signals": {"supported_platforms": ["WhatsApp", "Telegram", "Discord", "iMessage"]},
+                "step_items": [
+                    {"title": "Onboard and install the service", "detail": None, "command": None},
+                    {"title": "Pair WhatsApp and start the Gateway", "detail": None, "command": None},
+                ],
+            },
+        )
+        self.assertEqual(profile["kind"], "general_capture")
+
+    def test_docs_homepage_conclusion_admits_it_is_only_overview(self) -> None:
+        evidence = EvidenceBundle(
+            source_kind="url",
+            source_url="https://docs.openclaw.ai/",
+            platform_hint="docs",
+            title="OpenClaw - OpenClaw",
+            text="Any OS gateway for AI agents across WhatsApp, Telegram, Discord, iMessage, and more.\nOnboard and install the service\nPair WhatsApp and start the Gateway",
+            evidence_type="visible_page_text",
+            coverage="full",
+            metadata={
+                "signals": {"supported_platforms": ["WhatsApp", "Telegram", "Discord", "iMessage"]},
+                "step_items": [
+                    {"title": "Onboard and install the service", "detail": None, "command": None},
+                    {"title": "Pair WhatsApp and start the Gateway", "detail": None, "command": None},
+                ],
+            },
+        )
+        summary = SummaryResult(
+            title="OpenClaw 安装指南",
+            primary_topic="OpenClaw",
+            secondary_topics=[],
+            entities=[],
+            conclusion="已提取核心事实。",
+            bullets=["支持 WhatsApp、Telegram、Discord、iMessage 等平台", "安装服务并配对 WhatsApp 以启动网关"],
+            evidence_quotes=[],
+            coverage="full",
+            confidence="high",
+            note_tags=[],
+            follow_up_actions=[],
+        )
+        normalized = _validate_and_normalize_summary(summary, evidence)
+        self.assertIn("概览页", normalized.conclusion)
+        self.assertIn("不是完整安装文档", normalized.conclusion)
+        self.assertEqual(normalized.reader_judgment, "当前页只够判断支持范围和大致接入方向，不够直接拿来安装。")
+        self.assertEqual(
+            normalized.follow_up_actions,
+            ["如果要真正开始安装，继续进入详细安装或配对子页查看具体命令和验证步骤。"],
+        )
 
     def test_incomplete_video_prefers_evidence_backed_bullets_and_guidance_actions(self) -> None:
         evidence = EvidenceBundle(

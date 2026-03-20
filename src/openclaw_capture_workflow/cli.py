@@ -12,7 +12,6 @@ from .analyzer import analyze_url
 from .config import AppConfig
 from .processor import WorkflowProcessor
 from .server import build_server
-from .stock_pipeline import StockPipelineTrigger
 from .storage import JobStore
 from .summarizer import OpenAICompatibleSummarizer
 
@@ -34,27 +33,6 @@ def serve(args: argparse.Namespace) -> int:
     finally:
         server.server_close()
         processor.stop()
-    return 0
-
-
-def stock_trigger(args: argparse.Namespace) -> int:
-    pipeline = StockPipelineTrigger(repo=args.repo, workflow=args.workflow)
-    result = pipeline.trigger(mode=args.mode)
-    print(result.message)
-    return 0
-
-
-def stock_inspect(args: argparse.Namespace) -> int:
-    pipeline = StockPipelineTrigger(repo=args.repo, workflow=args.workflow)
-    result = pipeline.inspect()
-    print(result.message)
-    return 0
-
-
-def stock_ensure_running(args: argparse.Namespace) -> int:
-    pipeline = StockPipelineTrigger(repo=args.repo, workflow=args.workflow)
-    result = pipeline.ensure_running(mode=args.mode)
-    print(result.message)
     return 0
 
 
@@ -102,26 +80,6 @@ def main() -> int:
     serve_api_parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     serve_api_parser.add_argument("--port", type=int, default=8775, help="Bind port")
     serve_api_parser.set_defaults(func=serve_api_command)
-
-    trigger_parser = subparsers.add_parser("stock-trigger", help="Trigger the remote GitHub stock workflow")
-    trigger_parser.add_argument("--repo", default="Etherstrings/daily_stock_analysis", help="GitHub repo slug")
-    trigger_parser.add_argument("--workflow", default="daily_analysis.yml", help="Workflow file name")
-    trigger_parser.add_argument("--mode", default="full", help="Workflow mode")
-    trigger_parser.set_defaults(func=stock_trigger)
-
-    inspect_parser = subparsers.add_parser("stock-inspect", help="Inspect the remote GitHub stock workflow")
-    inspect_parser.add_argument("--repo", default="Etherstrings/daily_stock_analysis", help="GitHub repo slug")
-    inspect_parser.add_argument("--workflow", default="daily_analysis.yml", help="Workflow file name")
-    inspect_parser.set_defaults(func=stock_inspect)
-
-    ensure_parser = subparsers.add_parser(
-        "stock-ensure-running",
-        help="Inspect the remote GitHub stock workflow and trigger it when needed",
-    )
-    ensure_parser.add_argument("--repo", default="Etherstrings/daily_stock_analysis", help="GitHub repo slug")
-    ensure_parser.add_argument("--workflow", default="daily_analysis.yml", help="Workflow file name")
-    ensure_parser.add_argument("--mode", default="full", help="Workflow mode")
-    ensure_parser.set_defaults(func=stock_ensure_running)
 
     analyze_parser = subparsers.add_parser("analyze-url", help="Analyze a URL into a structured JSON document")
     analyze_parser.add_argument("--config", required=True, help="Path to config JSON")

@@ -140,6 +140,30 @@ class AccuracyEvalTest(unittest.TestCase):
         self.assertIn("## 失败明细", rendered)
         self.assertIn("keyword:tech-earnings-deepdive", rendered)
         self.assertIn("/tmp/a.md", rendered)
+        self.assertIn("首屏硬信息", rendered)
+
+    def test_markdown_report_includes_hard_fact_metrics(self) -> None:
+        report = {
+            "generated_at": "2026-03-11T20:00:00",
+            "case_count": 1,
+            "pass_count": 1,
+            "pass_rate": 1.0,
+            "total_cost_usd": 0.0,
+            "results": [
+                {
+                    "case_id": "docs",
+                    "passed": True,
+                    "overall_score": 0.88,
+                    "root_cause": "pass",
+                    "summary_mode": "model",
+                    "cost": {"total_cost_usd": 0.0},
+                    "first_screen_hard_fact_count": 4,
+                    "pseudo_summary_detected": False,
+                }
+            ],
+        }
+        rendered = render_markdown_report(report)
+        self.assertIn("| docs | true | 0.88 | pass | 4 | false | model | 0.0 |", rendered)
 
 
 if __name__ == "__main__":
