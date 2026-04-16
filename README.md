@@ -1,5 +1,21 @@
 # OpenClaw Capture Workflow
 
+<div align="center">
+
+**不是聊天机器人本体，而是机器人背后真正负责看懂链接、视频、图文和截图的内容引擎。**
+
+![Python](https://img.shields.io/badge/Python-Backend-3776AB?style=flat-square&logo=python&logoColor=white)
+![Knowledge Capture](https://img.shields.io/badge/Knowledge-Capture-1D4ED8?style=flat-square)
+![OCR](https://img.shields.io/badge/Input-OCR-0F766E?style=flat-square)
+![Video](https://img.shields.io/badge/Input-Video-C62828?style=flat-square)
+![Obsidian](https://img.shields.io/badge/Output-Obsidian-7C3AED?style=flat-square)
+
+URL / 图片 / 视频 ingest · structured summary · note writing · Telegram reply
+
+[架构文档](docs/ARCHITECTURE.md) · [赞助支持](#donate)
+
+</div>
+
 `openclaw_capture_workflow` 是 OpenClaw 机器人的本地知识采集后端。
 
 它解决的问题不是“怎么聊天”，而是：
@@ -12,6 +28,12 @@
 如果你只想一句话理解它：
 
 > OpenClaw 负责收消息，这个项目负责看懂内容、写入笔记、把结果发回去。
+
+## <a id="donate"></a>赞助支持
+
+如果这个项目对你有帮助，欢迎通过 GitHub Sponsors 支持后续维护：
+
+- GitHub Sponsors: https://github.com/sponsors/Etherstrings
 
 ---
 
